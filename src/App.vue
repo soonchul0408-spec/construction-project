@@ -1,7 +1,7 @@
 <script setup>
-import SampleTwo from './components/practices/basic/SampleTwo.vue'
+import WeatherMockup from './components/practices/basic/WeatherMockup.vue'
 </script>
 
 <template>
-  <SampleTwo />
+  <WeatherMockup />
 </template>
