@@ -17,6 +17,7 @@ const weatherList = ref([
         <h2>{{ weather.city }}</h2>
         <p>{{ weather.temperature }}°C</p>
         <p>{{ weather.condition }}</p>
+        <p v-if="weather.condition === '비'">우산을 챙기세요.</p>
       </div>
     </div>
   </div>
