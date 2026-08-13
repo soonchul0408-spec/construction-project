@@ -12,6 +12,7 @@
     "verify:drawing-pipeline": "node --experimental-strip-types scripts/verify-drawing-pipeline.ts",
     "verify:height-extraction": "node --experimental-strip-types scripts/verify-height-extraction.ts",
     "verify:cutting-optimization": "node --experimental-strip-types scripts/verify-cutting-optimization.ts",
+    "verify:inventory-cutting": "node --experimental-strip-types scripts/verify-inventory-cutting.ts",
     "lint": "run-s \"lint:*\"",
     "lint:oxlint": "oxlint . --fix",
     "lint:eslint": "eslint . --fix --cache",

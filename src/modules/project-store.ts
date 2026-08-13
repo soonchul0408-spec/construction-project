@@ -1,4 +1,4 @@
-import { emptyOptimizationState, PROJECT_STATUS_DESCRIPTIONS } from '../types/domain'
+import { emptyInventoryCuttingState, emptyOptimizationState, PROJECT_STATUS_DESCRIPTIONS } from '../types/domain'
 import { emptyHeightDiagnostics } from './height-diagnostics'
 import { emptyConsistencyValidation } from './consistency-validator'
 import type { AnalysisStage, DimensionValue, ProjectState, ProjectStatus, ProjectWorkflow } from '../types/domain'
@@ -119,6 +119,28 @@ function migrateProject(project: ProjectState): ProjectState {
             xMm: scrap.xMm ?? null,
             yMm: scrap.yMm ?? null,
           })),
+          inventory: project.optimization.inventory
+            ? {
+                ...emptyInventoryCuttingState(),
+                ...project.optimization.inventory,
+                settings: {
+                  ...emptyInventoryCuttingState().settings,
+                  ...(project.optimization.inventory.settings || {}),
+                },
+                requirements: (project.optimization.inventory.requirements || []).map((requirement) => ({
+                  ...requirement,
+                  sourceReferences: requirement.sourceReferences || [],
+                  missingFields: requirement.missingFields || [],
+                  notes: requirement.notes || [],
+                })),
+                ownedMaterials: (project.optimization.inventory.ownedMaterials || []).map((stock) => ({
+                  ...stock,
+                  reservedQuantity: stock.reservedQuantity || 0,
+                  surfaceFinish: stock.surfaceFinish || '',
+                  color: stock.color || '',
+                })),
+              }
+            : emptyInventoryCuttingState(),
         }
       : emptyOptimizationState(),
     files: (project.files || []).map((file) => ({

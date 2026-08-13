@@ -209,6 +209,8 @@ export function createCatalogItem(input: Partial<MaterialCatalogItem> = {}): Mat
     lapAllowanceMm: input.lapAllowanceMm ?? null,
     minimumReusableOffcutMm: input.minimumReusableOffcutMm ?? null,
     reworkRiskCost: input.reworkRiskCost ?? null,
+    surfaceFinish: input.surfaceFinish || '',
+    color: input.color || '',
     source: input.source || 'user',
     updatedAt: input.updatedAt || now,
   }

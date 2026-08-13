@@ -613,6 +613,9 @@ export interface MaterialCatalogItem {
   lapAllowanceMm: number | null
   minimumReusableOffcutMm: number | null
   reworkRiskCost: number | null
+  /** Optional finish/color fields used by the owned-stock cutting MVP. */
+  surfaceFinish?: string
+  color?: string
   source: 'user' | 'sample'
   updatedAt: string
 }
@@ -782,6 +785,145 @@ export interface OptimizationState {
   validation: OptimizationValidation
   scraps: ScrapPiece[]
   lastCalculatedAt: string | null
+  inventory: InventoryCuttingState
+}
+
+export type InventoryMaterialType = 'panel' | 'board'
+export type InventoryStockSource = 'new' | 'scrap'
+export type InventoryRequirementStatus = 'needs-review' | 'ready'
+export type InventoryWorkflowStatus = 'not-ready' | 'needs-review' | 'calculated' | 'approved' | 'cancelled'
+export type InventoryPlanStatus = 'calculated' | 'approved' | 'cancelled'
+
+export interface InventoryPlannerSettings {
+  kerfMm: number | null
+  minimumCutAllowanceMm: number | null
+  minimumReusableOffcutMm: number | null
+  /** Optional user-entered reference for the old, one-piece-per-order baseline. */
+  baselineStockLengthMm: number | null
+}
+
+export interface InventoryRequirement {
+  id: string
+  zone: string
+  location: string
+  materialType: InventoryMaterialType
+  materialName: string
+  thicknessMm: number | null
+  widthMm: number | null
+  requiredLengthMm: number | null
+  heightMm: number | null
+  quantity: number
+  surfaceFinish: string
+  color: string
+  drawingScale: string
+  sourceReferences: Evidence[]
+  confidence: ConfidenceLevel
+  status: InventoryRequirementStatus
+  confirmedAt: string | null
+  confirmedBy: string | null
+  missingFields: string[]
+  source: 'drawing' | 'manual' | 'sample'
+  notes: string[]
+}
+
+export interface OwnedMaterial {
+  id: string
+  materialType: InventoryMaterialType
+  materialName: string
+  thicknessMm: number | null
+  widthMm: number | null
+  lengthMm: number | null
+  surfaceFinish: string
+  color: string
+  quantity: number
+  reservedQuantity: number
+  source: InventoryStockSource
+  usable: boolean
+  location: string
+  addedAt: string
+  note: string
+}
+
+export interface InventoryCut {
+  id: string
+  requirementId: string
+  requirementUnit: number
+  zone: string
+  location: string
+  cutOrder: number
+  requiredLengthMm: number
+  kerfMm: number
+  actualUsedLengthMm: number
+  stockLengthBeforeMm: number
+  remainingLengthMm: number
+}
+
+export interface InventoryStockUsage {
+  id: string
+  ownedMaterialId: string
+  unitIndex: number
+  source: InventoryStockSource
+  materialName: string
+  thicknessMm: number
+  widthMm: number
+  lengthMm: number
+  surfaceFinish: string
+  color: string
+  cuts: InventoryCut[]
+  usedLengthMm: number
+  remainingLengthMm: number
+  reusableRemainingLengthMm: number
+  wasteRemainingLengthMm: number
+}
+
+export interface InventoryNewOrder {
+  id: string
+  materialType: InventoryMaterialType
+  materialName: string
+  thicknessMm: number
+  widthMm: number
+  lengthMm: number
+  surfaceFinish: string
+  color: string
+  quantity: number
+  requirementIds: string[]
+  reason: string
+}
+
+export interface InventoryExcludedMaterial {
+  ownedMaterialId: string
+  label: string
+  reasons: string[]
+}
+
+export interface InventoryCutPlan {
+  id: string
+  createdAt: string
+  status: InventoryPlanStatus
+  usages: InventoryStockUsage[]
+  newOrders: InventoryNewOrder[]
+  excludedMaterials: InventoryExcludedMaterial[]
+  requiredPieceCount: number
+  ownedPieceCount: number
+  newOrderPieceCount: number
+  baselineOrderPieceCount: number | null
+  orderReductionPieceCount: number | null
+  plannedWasteLengthMm: number
+  reusableLengthMm: number
+  baselineWasteLengthMm: number | null
+  wasteReductionLengthMm: number | null
+  approvedAt: string | null
+  cancelledAt: string | null
+}
+
+export interface InventoryCuttingState {
+  settings: InventoryPlannerSettings
+  requirements: InventoryRequirement[]
+  ownedMaterials: OwnedMaterial[]
+  plan: InventoryCutPlan | null
+  status: InventoryWorkflowStatus
+  missingFields: string[]
+  lastCalculatedAt: string | null
 }
 
 export function emptyOptimizationValidation(): OptimizationValidation {
@@ -811,6 +953,24 @@ export function emptyOptimizationState(): OptimizationState {
     status: 'not-ready',
     validation: emptyOptimizationValidation(),
     scraps: [],
+    lastCalculatedAt: null,
+    inventory: emptyInventoryCuttingState(),
+  }
+}
+
+export function emptyInventoryCuttingState(): InventoryCuttingState {
+  return {
+    settings: {
+      kerfMm: null,
+      minimumCutAllowanceMm: null,
+      minimumReusableOffcutMm: null,
+      baselineStockLengthMm: null,
+    },
+    requirements: [],
+    ownedMaterials: [],
+    plan: null,
+    status: 'not-ready',
+    missingFields: [],
     lastCalculatedAt: null,
   }
 }

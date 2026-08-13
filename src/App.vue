@@ -32,8 +32,18 @@ import {
   createCatalogItem,
   optimizeCuttingPlan,
 } from './modules/cutting-optimization-engine'
+import {
+  approveInventoryCutPlan,
+  buildInventoryRequirementsFromMembers,
+  calculateInventoryCutPlan,
+  cancelInventoryCutPlan,
+  createInventorySampleData,
+  getInventoryRequirementMissingFields,
+  mergeInventoryRequirements,
+  normalizeInventoryRequirement,
+} from './modules/inventory-cutting-engine'
 import { assessProjectWorkflow, statusForAnalysisStage } from './modules/project-workflow'
-import { CONSISTENCY_TOLERANCES, emptyConsistencyValidation, validateConsistency } from './modules/consistency-validator'
+import { emptyConsistencyValidation, validateConsistency } from './modules/consistency-validator'
 import { clearProject, loadProject, saveProject } from './modules/project-store'
 import {
   downloadCsv,
@@ -52,19 +62,22 @@ import {
   CONFIDENCE_LABELS,
   DEFAULT_MATERIAL_SETTINGS,
   DRAWING_KIND_LABELS,
+  emptyInventoryCuttingState,
   PROJECT_STATUS_DESCRIPTIONS,
   PROJECT_STATUS_LABELS,
 } from './types/domain'
 import type {
   AnalyzedFile,
   CostSummary,
-  ConsistencyStatus,
   CuttingPlacement,
   DimensionValue,
   DrawingKind,
   DrawingPage,
   HeightCandidate,
   HeightReviewAction,
+  InventoryRequirement,
+  InventoryStockSource,
+  OwnedMaterial,
   MaterialCatalogItem,
   MaterialSettings,
   OptimizationReviewItem,
@@ -166,6 +179,21 @@ const scrapDraft = reactive({
   generatedAt: '',
   plannedUseAt: '',
 })
+const inventoryStockFormOpen = ref(false)
+const inventoryStockDraft = reactive({
+  materialType: 'panel' as 'panel' | 'board',
+  materialName: '',
+  thicknessMm: '',
+  widthMm: '',
+  lengthMm: '',
+  surfaceFinish: '',
+  color: '',
+  quantity: '1',
+  source: 'new' as InventoryStockSource,
+  usable: true,
+  location: '',
+  note: '',
+})
 const catalogDraft = reactive({
   name: '',
   materialType: 'panel' as 'panel' | 'profile',
@@ -191,6 +219,8 @@ const catalogDraft = reactive({
   lapAllowanceMm: '',
   minimumReusableOffcutMm: '',
   reworkRiskCost: '',
+  surfaceFinish: '',
+  color: '',
 })
 
 const allPages = computed(() => project.value.files.flatMap((file) => file.pages))
@@ -300,7 +330,7 @@ const workflowSteps = [
   { id: 'optimization', label: '절단 최적화' },
 ]
 const workflowProgressIndex = computed(() => {
-  if (project.value.workflow.optimizationCalculated) return 4
+  if (project.value.workflow.optimizationCalculated || ['calculated', 'approved'].includes(project.value.optimization.inventory?.status || '')) return 4
   if (project.value.status === 'completed' || project.value.workflow.takeoffCalculated) return 3
   if (project.value.workflow.modelBuilt || project.value.status === 'building-3d') return 2
   if (project.value.files.length && (project.value.status === 'needs-review' || project.value.status === 'partial' || project.value.workflow.reviewConfirmed)) return 1
@@ -314,6 +344,17 @@ const optimizationCatalogPanels = computed(() => project.value.optimization.cata
 const optimizationCatalogProfiles = computed(() => project.value.optimization.catalog.filter((item) => item.materialType === 'profile'))
 const optimizationNeedsReview = computed(() => project.value.optimization.reviews.filter((item) => !item.resolved))
 const optimizationCanRun = computed(() => project.value.workflow.takeoffCalculated && project.value.optimization.catalog.length > 0 && !isAnalyzing.value && !isOptimizing.value && !isCalculating.value)
+const inventoryState = computed(() => project.value.optimization.inventory || emptyInventoryCuttingState())
+const inventoryPlan = computed(() => inventoryState.value.plan)
+const inventoryRequirementsNeedingReview = computed(() => inventoryState.value.requirements.filter((requirement) => requirement.status !== 'ready' || requirement.missingFields.length))
+const inventoryStatusLabel = computed(() => {
+  if (inventoryState.value.status === 'approved') return '승인·재고 예약 완료'
+  if (inventoryState.value.status === 'calculated') return '계산 결과 확인 필요'
+  if (inventoryState.value.status === 'cancelled') return '계획 취소됨'
+  if (inventoryState.value.status === 'needs-review') return '확인 필요'
+  return '계산 전'
+})
+const inventoryLocked = computed(() => inventoryState.value.status === 'approved')
 const optimizationStatusLabel = computed(() => {
   if (project.value.optimization.status === 'calculated') return '최적화 결과 준비됨'
   if (project.value.optimization.status === 'needs-review') return '확인 후 다시 계산'
@@ -346,12 +387,21 @@ function resetWorkflow() {
     optimizationCalculated: false,
   }
   const existingScraps = project.value.optimization?.scraps?.filter((scrap) => scrap.source === 'existing') || []
+  const existingInventory = project.value.optimization?.inventory || emptyInventoryCuttingState()
   project.value.optimization = {
     ...emptyOptimizationState(),
     catalog: project.value.optimization?.catalog || [],
     selectedPanelMaterialId: project.value.optimization?.selectedPanelMaterialId || '',
     selectedProfileMaterialId: project.value.optimization?.selectedProfileMaterialId || '',
     scraps: existingScraps,
+    inventory: existingInventory.status === 'approved'
+      ? existingInventory
+      : {
+          ...existingInventory,
+          plan: null,
+          status: existingInventory.requirements.length ? 'needs-review' : 'not-ready',
+          lastCalculatedAt: null,
+        },
   }
 }
 
@@ -369,7 +419,7 @@ function workflowStepEnabled(id: string) {
   // model generation instead of hiding the diagnostic component.
   if (id === 'model') return true
   if (id === 'takeoff') return project.value.workflow.modelBuilt
-  if (id === 'optimization') return project.value.workflow.takeoffCalculated
+  if (id === 'optimization') return true
   return false
 }
 
@@ -416,6 +466,8 @@ function resetCatalogDraft() {
     lapAllowanceMm: '',
     minimumReusableOffcutMm: '',
     reworkRiskCost: '',
+    surfaceFinish: '',
+    color: '',
   })
   editingCatalogId.value = ''
 }
@@ -459,6 +511,8 @@ function editCatalogItem(item: MaterialCatalogItem) {
     lapAllowanceMm: item.lapAllowanceMm === null ? '' : String(item.lapAllowanceMm),
     minimumReusableOffcutMm: item.minimumReusableOffcutMm === null ? '' : String(item.minimumReusableOffcutMm),
     reworkRiskCost: item.reworkRiskCost === null ? '' : String(item.reworkRiskCost),
+    surfaceFinish: item.surfaceFinish || '',
+    color: item.color || '',
   })
   editingCatalogId.value = item.id
   catalogFormOpen.value = true
@@ -496,6 +550,8 @@ function saveCatalogItem() {
     lapAllowanceMm: optionalNumber(catalogDraft.lapAllowanceMm),
     minimumReusableOffcutMm: optionalNumber(catalogDraft.minimumReusableOffcutMm),
     reworkRiskCost: optionalNumber(catalogDraft.reworkRiskCost),
+    surfaceFinish: catalogDraft.surfaceFinish.trim(),
+    color: catalogDraft.color.trim(),
   })
   const catalog = [...project.value.optimization.catalog]
   const index = catalog.findIndex((candidate) => candidate.id === item.id)
@@ -527,14 +583,257 @@ function selectOptimizationMaterial(type: 'panel' | 'profile', id: string) {
 function invalidateOptimizationPlan() {
   const current = project.value.optimization || emptyOptimizationState()
   const existingScraps = current.scraps?.filter((scrap) => scrap.source === 'existing') || []
+  const currentInventory = current.inventory || emptyInventoryCuttingState()
   project.value.optimization = {
     ...emptyOptimizationState(),
     catalog: current.catalog || [],
     selectedPanelMaterialId: current.selectedPanelMaterialId || '',
     selectedProfileMaterialId: current.selectedProfileMaterialId || '',
     scraps: existingScraps,
+    inventory: currentInventory.status === 'approved'
+      ? currentInventory
+      : {
+          ...currentInventory,
+          plan: null,
+          status: currentInventory.requirements.length ? 'needs-review' : 'not-ready',
+          lastCalculatedAt: null,
+        },
   }
   project.value.workflow.optimizationCalculated = false
+}
+
+function ensureInventoryState() {
+  if (!project.value.optimization.inventory) project.value.optimization.inventory = emptyInventoryCuttingState()
+  return project.value.optimization.inventory
+}
+
+function invalidateInventoryPlan() {
+  const inventory = ensureInventoryState()
+  if (inventory.status === 'approved') return
+  inventory.plan = null
+  inventory.status = inventory.requirements.length ? 'needs-review' : 'not-ready'
+  inventory.missingFields = []
+  inventory.lastCalculatedAt = null
+}
+
+function refreshInventoryRequirements(members = project.value.optimization.members) {
+  const inventory = ensureInventoryState()
+  if (inventory.status === 'approved') {
+    setNotice('이미 승인된 보유 자재 예약은 변경하지 않았습니다. 새 계획은 기존 예약을 먼저 처리한 뒤 계산하세요.')
+    return
+  }
+  const sourceMembers = members.length
+    ? members
+    : buildOptimizationMembers(
+        project.value.walls,
+        project.value.settings,
+        project.value.optimization.selectedPanelMaterialId,
+        project.value.optimization.catalog.find((item) => item.id === project.value.optimization.selectedPanelMaterialId) || null,
+      ).members
+  const generated = buildInventoryRequirementsFromMembers(
+    sourceMembers,
+    project.value.optimization.catalog,
+    allPages.value,
+  )
+  inventory.requirements = mergeInventoryRequirements(inventory.requirements, generated)
+  invalidateInventoryPlan()
+}
+
+function loadInventorySample() {
+  if (inventoryLocked.value) {
+    setNotice('승인된 계획이 있어 예제 데이터로 바꾸지 않았습니다.')
+    return
+  }
+  project.value.optimization.inventory = createInventorySampleData()
+  project.value.workflow.optimizationCalculated = false
+  saveProject(project.value)
+  setNotice('기본 예제를 불러왔습니다. 계산 후 2,800mm 자재가 먼저 사용되는지 확인하세요.')
+}
+
+function updateInventoryRequirement(requirement: InventoryRequirement) {
+  if (inventoryLocked.value) return
+  const normalized = normalizeInventoryRequirement({ ...requirement, status: 'needs-review', confirmedAt: null, confirmedBy: null })
+  Object.assign(requirement, normalized)
+  invalidateInventoryPlan()
+}
+
+function confirmInventoryRequirement(requirement: InventoryRequirement) {
+  if (inventoryLocked.value) return
+  const normalized = normalizeInventoryRequirement(requirement)
+  if (normalized.missingFields.length) {
+    requirement.missingFields = normalized.missingFields
+    requirement.status = 'needs-review'
+    setNotice(`${requirement.zone} · ${requirement.location}: ${normalized.missingFields.join(', ')}를 입력한 뒤 확인하세요.`)
+    return
+  }
+  Object.assign(requirement, normalized, {
+    status: 'ready' as const,
+    confirmedAt: new Date().toISOString(),
+    confirmedBy: '사용자 확인',
+  })
+  invalidateInventoryPlan()
+  setNotice(`${requirement.zone} · ${requirement.location} 정보를 확인했습니다.`)
+}
+
+function confirmAllInventoryRequirements() {
+  if (inventoryLocked.value) return
+  const requirements = ensureInventoryState().requirements
+  let missingCount = 0
+  for (const requirement of requirements) {
+    const normalized = normalizeInventoryRequirement(requirement)
+    if (normalized.missingFields.length) {
+      Object.assign(requirement, normalized, { status: 'needs-review' as const })
+      missingCount += 1
+    } else {
+      Object.assign(requirement, normalized, {
+        status: 'ready' as const,
+        confirmedAt: new Date().toISOString(),
+        confirmedBy: '사용자 일괄 확인',
+      })
+    }
+  }
+  invalidateInventoryPlan()
+  setNotice(missingCount ? `${missingCount}개 필요 조각에 확인할 정보가 남아 있습니다.` : '필요 조각을 모두 사용자 확인 상태로 바꿨습니다.')
+}
+
+function resetInventoryStockDraft() {
+  Object.assign(inventoryStockDraft, {
+    materialType: 'panel',
+    materialName: '',
+    thicknessMm: '',
+    widthMm: '',
+    lengthMm: '',
+    surfaceFinish: '',
+    color: '',
+    quantity: '1',
+    source: 'new',
+    usable: true,
+    location: '',
+    note: '',
+  })
+}
+
+function addInventoryStock() {
+  if (inventoryLocked.value) {
+    setNotice('승인된 계획의 보유 자재는 예약을 해제하기 전까지 수정할 수 없습니다.')
+    return
+  }
+  const thicknessMm = optionalNumber(inventoryStockDraft.thicknessMm)
+  const widthMm = optionalNumber(inventoryStockDraft.widthMm)
+  const lengthMm = optionalNumber(inventoryStockDraft.lengthMm)
+  const quantity = optionalNumber(inventoryStockDraft.quantity)
+  if (!inventoryStockDraft.materialName.trim() || !thicknessMm || !widthMm || !lengthMm || !quantity || quantity < 1 || !inventoryStockDraft.surfaceFinish.trim() || !inventoryStockDraft.color.trim() || !inventoryStockDraft.location.trim()) {
+    setNotice('자재 종류·두께·폭·길이·마감·색상·수량·보관 위치를 모두 입력하세요.')
+    return
+  }
+  const stock: OwnedMaterial = {
+    id: `owned-material-${Date.now()}`,
+    materialType: inventoryStockDraft.materialType,
+    materialName: inventoryStockDraft.materialName.trim(),
+    thicknessMm,
+    widthMm,
+    lengthMm,
+    surfaceFinish: inventoryStockDraft.surfaceFinish.trim(),
+    color: inventoryStockDraft.color.trim(),
+    quantity: Math.floor(quantity),
+    reservedQuantity: 0,
+    source: inventoryStockDraft.source,
+    usable: inventoryStockDraft.usable,
+    location: inventoryStockDraft.location.trim(),
+    addedAt: new Date().toISOString(),
+    note: inventoryStockDraft.note.trim(),
+  }
+  const inventory = ensureInventoryState()
+  inventory.ownedMaterials = [...inventory.ownedMaterials, stock]
+  invalidateInventoryPlan()
+  resetInventoryStockDraft()
+  inventoryStockFormOpen.value = false
+  saveProject(project.value)
+  setNotice(`${stock.materialName} 보유 자재를 등록했습니다.`)
+}
+
+function removeInventoryStock(stock: OwnedMaterial) {
+  if (stock.reservedQuantity > 0) {
+    setNotice('예약 처리된 자재는 삭제하지 않습니다. 실제 현장 재고를 확인한 뒤 별도 처리하세요.')
+    return
+  }
+  const inventory = ensureInventoryState()
+  inventory.ownedMaterials = inventory.ownedMaterials.filter((candidate) => candidate.id !== stock.id)
+  invalidateInventoryPlan()
+  saveProject(project.value)
+}
+
+function calculateInventoryPlanForProject() {
+  if (inventoryLocked.value) {
+    setNotice('이미 승인된 계획입니다. 재고 예약을 변경하지 않고 결과만 확인합니다.')
+    return
+  }
+  const inventory = ensureInventoryState()
+  const result = calculateInventoryCutPlan({
+    requirements: inventory.requirements,
+    ownedMaterials: inventory.ownedMaterials,
+    settings: inventory.settings,
+  })
+  inventory.plan = result.plan
+  inventory.status = result.status
+  inventory.missingFields = result.missingFields
+  inventory.lastCalculatedAt = new Date().toISOString()
+  saveProject(project.value)
+  if (result.status === 'calculated') setNotice('보유 자재 우선 절단 계획을 계산했습니다. 승인 전에는 실제 재고가 차감되지 않습니다.')
+  else setNotice('확인 필요 정보가 있어 절단 계획을 확정하지 않았습니다.')
+}
+
+function approveInventoryPlanForProject() {
+  const inventory = ensureInventoryState()
+  if (!inventory.plan) {
+    setNotice('먼저 보유 자재 기반 절단 계획을 계산하세요.')
+    return
+  }
+  const result = approveInventoryCutPlan(inventory.plan, inventory.ownedMaterials)
+  if (!result.ok) {
+    setNotice(result.message)
+    return
+  }
+  inventory.plan = result.plan
+  inventory.ownedMaterials = result.ownedMaterials
+  inventory.status = 'approved'
+  saveProject(project.value)
+  setNotice(result.message)
+}
+
+function cancelInventoryPlanForProject() {
+  const inventory = ensureInventoryState()
+  if (!inventory.plan || inventory.plan.status !== 'calculated') {
+    setNotice('계산 완료 상태의 계획만 취소할 수 있습니다.')
+    return
+  }
+  inventory.plan = cancelInventoryCutPlan(inventory.plan)
+  inventory.status = 'cancelled'
+  saveProject(project.value)
+  setNotice('절단 계획을 취소했습니다. 실제 재고 예약은 변경하지 않았습니다.')
+}
+
+function inventorySourceLabel(source: InventoryStockSource) {
+  return source === 'scrap' ? '자투리' : '신규 보유'
+}
+
+function inventoryRequirementSourceLabel(requirement: InventoryRequirement) {
+  const source = requirement.sourceReferences[0]
+  return source ? `${source.fileName} · ${source.pageNumber}페이지` : requirement.source === 'sample' ? 'MVP 기본 예제' : '도면 근거 확인 필요'
+}
+
+function inventoryRequirementMissingLabels(requirement: InventoryRequirement) {
+  return getInventoryRequirementMissingFields(requirement)
+}
+
+function inventoryCutStatusLabel(status: string) {
+  if (status === 'approved') return '승인·예약'
+  if (status === 'cancelled') return '취소'
+  return '예상 사용'
+}
+
+function inventoryNumber(value: number | null | undefined) {
+  return value === null || value === undefined ? '확인 필요' : value.toLocaleString('ko-KR')
 }
 
 function runOptimization() {
@@ -563,6 +862,7 @@ function runOptimization() {
     project.value.optimization.validation = result.validation
     project.value.optimization.scraps = result.scraps
     project.value.optimization.lastCalculatedAt = new Date().toISOString()
+    refreshInventoryRequirements(result.members)
     project.value.workflow.optimizationCalculated = true
     selectedOptimizationPlanId.value = ''
     project.value.status = result.status === 'calculated' ? 'completed' : 'partial'
@@ -1861,7 +2161,7 @@ onMounted(() => {
             </div>
           </section>
 
-          <section v-if="project.files.length && activeSection === 'optimization'" id="optimization" class="section-block optimization-section">
+          <section v-if="activeSection === 'optimization'" id="optimization" class="section-block optimization-section">
             <div class="section-heading">
               <div><p class="eyebrow">다섯째 단계 · 현장 절단 최적화</p><h2>설계는 그대로, 낭비와 비용 비교</h2><p>벽 길이·높이·개구부·구역은 도면 값 그대로 고정하고, 원자재 규격·절단 순서·현재 현장 자투리 사용 순서만 비교합니다.</p></div>
               <div class="section-heading-actions"><span :class="['orderability-badge', { ready: project.optimization.status === 'calculated' }]">{{ optimizationStatusLabel }}</span></div>
@@ -1869,6 +2169,99 @@ onMounted(() => {
             <button type="button" class="back-button" @click="scrollToSection('takeoff')">← 발주 산출표로 돌아가기</button>
 
             <div class="optimization-notice panel-card"><strong>설계 변경 없음</strong><span>도면의 벽체·개구부·구역 형태를 최적화 대상으로 바꾸지 않습니다. 가격·규격·절단폭이 없는 값은 비용 또는 배치 확정에서 제외하고 확인 필요로 표시합니다.</span><small>프로젝트가 끝난 뒤 자투리를 장기 재고로 저장하지 않습니다. 사용처와 사용 시점이 없는 자투리는 폐기·고철·업체 반납 대상으로 분류합니다.</small></div>
+
+            <section class="inventory-mvp-card panel-card">
+              <div class="panel-heading inventory-mvp-heading">
+                <div><span class="panel-kicker">소규모 현장 MVP · 동일 폭 길이 절단</span><h3>보유 자재 기반 절단 계획</h3><p>직사각형 패널·보드의 폭은 그대로 비교하고, 길이 방향만 한 자재씩 절단합니다. 복잡한 2차원 네스팅이나 도면 수정은 하지 않습니다.</p></div>
+                <span :class="['orderability-badge', { ready: inventoryState.status === 'calculated' || inventoryState.status === 'approved' }]">{{ inventoryStatusLabel }}</span>
+              </div>
+
+              <div class="inventory-mvp-actions">
+                <div><strong>시작 방법</strong><span>도면 부재를 가져오거나 아래 기본 예제로 계산 흐름을 확인하세요.</span></div>
+                <div class="inventory-mvp-action-buttons"><button type="button" class="outline-button" @click="refreshInventoryRequirements()">도면 부재 가져오기</button><button type="button" class="outline-button" @click="loadInventorySample">기본 예제 불러오기</button></div>
+              </div>
+
+              <div class="inventory-scope-grid">
+                <div><b>계산 대상</b><span>동일 폭 직사각형 패널·보드의 길이 절단</span></div>
+                <div><b>자동 제외</b><span>곡선·불규칙 형상·규격 불일치 자재·손상 판정</span></div>
+                <div><b>재고 처리</b><span>계산 중 예상 사용 · 승인 후 예약 · 취소 시 변경 없음</span></div>
+              </div>
+
+              <section class="inventory-settings-card">
+                <div class="inventory-subheading"><div><span class="panel-kicker">1단계</span><h4>절단 기준</h4></div><small>비어 있으면 계획을 확정하지 않습니다.</small></div>
+                <div class="inventory-settings-grid">
+                  <label>톱날 절단폭(mm)<input v-model.number="inventoryState.settings.kerfMm" type="number" min="0" step="0.1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
+                  <label>최소 절단 여유(mm)<input v-model.number="inventoryState.settings.minimumCutAllowanceMm" type="number" min="0" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
+                  <label>재사용 최소 잔량(mm)<input v-model.number="inventoryState.settings.minimumReusableOffcutMm" type="number" min="1" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
+                  <label>기존 방식 비교용 원자재 길이(mm)<input v-model.number="inventoryState.settings.baselineStockLengthMm" type="number" min="1" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /><small>입력하지 않으면 폐기량 비교는 확인 필요로 남습니다.</small></label>
+                </div>
+              </section>
+
+              <section class="inventory-requirements-card">
+                <div class="inventory-subheading"><div><span class="panel-kicker">2단계</span><h4>필요 조각 목록</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.requirements.length }}개 · 확인 필요 {{ inventoryRequirementsNeedingReview.length }}개</span><button type="button" class="outline-button" :disabled="!inventoryState.requirements.length || inventoryLocked" @click="confirmAllInventoryRequirements">모두 확인</button></div></div>
+                <p class="inventory-help">도면에서 가져온 값은 자동으로 확정하지 않습니다. 높이·폭·두께·표면 마감·도면 축척을 직접 확인한 뒤 조각별로 확인하세요.</p>
+                <div v-if="inventoryState.requirements.length" class="inventory-requirement-list">
+                  <article v-for="requirement in inventoryState.requirements" :key="requirement.id" class="inventory-requirement-card" :class="{ confirmed: requirement.status === 'ready' && !requirement.missingFields.length }">
+                    <div class="inventory-card-title"><div><strong>{{ requirement.zone }} · {{ requirement.location }}</strong><small>{{ inventoryRequirementSourceLabel(requirement) }} · {{ requirement.source === 'sample' ? '예제' : '도면/사용자 입력' }} · 신뢰도 {{ CONFIDENCE_LABELS[requirement.confidence] }}</small></div><span :class="['review-pill', requirement.status === 'ready' && !requirement.missingFields.length ? 'confirmed' : 'blocked']">{{ requirement.status === 'ready' && !requirement.missingFields.length ? '사용자 확인' : '확인 필요' }}</span></div>
+                    <div class="inventory-field-grid">
+                      <label>자재 종류<input v-model="requirement.materialName" type="text" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>두께(mm)<input v-model.number="requirement.thicknessMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>폭(mm)<input v-model.number="requirement.widthMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>필요 길이(mm)<input v-model.number="requirement.requiredLengthMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>높이(mm)<input v-model.number="requirement.heightMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>수량<input v-model.number="requirement.quantity" type="number" min="1" step="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>표면 마감<input v-model="requirement.surfaceFinish" type="text" placeholder="예: 평판 도장" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>색상<input v-model="requirement.color" type="text" placeholder="예: 아이보리" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>도면 축척<input v-model="requirement.drawingScale" type="text" placeholder="예: 1:50" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                    </div>
+                    <div class="inventory-requirement-footer"><span v-if="inventoryRequirementMissingLabels(requirement).length" class="inventory-missing-fields">빠진 정보: {{ inventoryRequirementMissingLabels(requirement).join(' · ') }}</span><span v-else class="inventory-ready-note">필수 정보가 입력됐지만 사용자 확인 전에는 계산하지 않습니다.</span><button type="button" class="primary-button" :disabled="inventoryLocked || requirement.status === 'ready' && !requirement.missingFields.length" @click="confirmInventoryRequirement(requirement)">{{ requirement.status === 'ready' && !requirement.missingFields.length ? '확인 완료' : '정보 확인' }}</button></div>
+                  </article>
+                </div>
+                <div v-else class="inventory-empty"><strong>필요 조각이 없습니다.</strong><span>도면 분석 후 ‘도면 부재 가져오기’를 누르거나 기본 예제를 불러오세요.</span></div>
+              </section>
+
+              <section class="inventory-owned-card">
+                <div class="inventory-subheading"><div><span class="panel-kicker">3단계</span><h4>보유 자재</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.ownedMaterials.length }}종</span><button type="button" class="outline-button" :disabled="inventoryLocked" @click="inventoryStockFormOpen = !inventoryStockFormOpen">{{ inventoryStockFormOpen ? '입력 닫기' : '보유 자재 추가' }}</button></div></div>
+                <div v-if="inventoryState.ownedMaterials.length" class="inventory-owned-list">
+                  <article v-for="stock in inventoryState.ownedMaterials" :key="stock.id" class="inventory-owned-card-row" :class="{ unusable: !stock.usable }"><div><strong>{{ stock.materialName }} · {{ stock.thicknessMm }}T · {{ inventorySourceLabel(stock.source) }}</strong><small>폭 {{ inventoryNumber(stock.widthMm) }}mm · 길이 {{ inventoryNumber(stock.lengthMm) }}mm · {{ stock.surfaceFinish }} · {{ stock.color }}</small><small>{{ stock.location }} · {{ stock.usable ? '사용 가능' : '사용 안 함' }} · 예약 {{ stock.reservedQuantity }}/{{ stock.quantity }}</small></div><button type="button" class="icon-button danger" :disabled="stock.reservedQuantity > 0 || inventoryLocked" aria-label="보유 자재 삭제" @click="removeInventoryStock(stock)">×</button></article>
+                </div>
+                <div v-else class="inventory-empty"><strong>등록된 보유 자재가 없습니다.</strong><span>현장에 있는 자재와 자투리를 먼저 입력하세요. 길이·폭·두께·마감·색상이 맞지 않으면 자동 사용하지 않습니다.</span></div>
+                <div v-if="inventoryStockFormOpen" class="inventory-stock-form">
+                  <label>자재 종류<select v-model="inventoryStockDraft.materialType"><option value="panel">샌드위치패널</option><option value="board">보드</option></select></label>
+                  <label>자재 이름<input v-model="inventoryStockDraft.materialName" type="text" placeholder="예: 50T 샌드위치패널" /></label>
+                  <label>두께(mm)<input v-model="inventoryStockDraft.thicknessMm" type="number" min="1" /></label>
+                  <label>폭(mm)<input v-model="inventoryStockDraft.widthMm" type="number" min="1" /></label>
+                  <label>길이(mm)<input v-model="inventoryStockDraft.lengthMm" type="number" min="1" /></label>
+                  <label>표면 마감<input v-model="inventoryStockDraft.surfaceFinish" type="text" placeholder="예: 평판 도장" /></label>
+                  <label>색상<input v-model="inventoryStockDraft.color" type="text" placeholder="예: 아이보리" /></label>
+                  <label>수량<input v-model="inventoryStockDraft.quantity" type="number" min="1" step="1" /></label>
+                  <label>구분<select v-model="inventoryStockDraft.source"><option value="new">신규 자재</option><option value="scrap">자투리 자재</option></select></label>
+                  <label>보관 위치<input v-model="inventoryStockDraft.location" type="text" placeholder="예: 1층 자재장" /></label>
+                  <label class="checkbox-label"><input v-model="inventoryStockDraft.usable" type="checkbox" /><span>사용 가능</span></label>
+                  <label>메모<input v-model="inventoryStockDraft.note" type="text" placeholder="현장 메모" /></label>
+                  <div class="inventory-stock-form-actions"><button type="button" class="outline-button" @click="inventoryStockFormOpen = false; resetInventoryStockDraft()">취소</button><button type="button" class="primary-button" @click="addInventoryStock">보유 자재 저장</button></div>
+                </div>
+              </section>
+
+              <section class="inventory-calculation-card">
+                <div><span class="panel-kicker">4단계</span><h4>계산·승인</h4><p>계산은 예상 사용만 만들며 실제 재고를 바꾸지 않습니다. 사용자가 승인한 뒤에만 예약 수량을 올립니다.</p></div>
+                <div class="inventory-calculation-actions"><button type="button" class="primary-button" :disabled="inventoryLocked" @click="calculateInventoryPlanForProject">보유 자재 기반 계산</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="outline-button" @click="cancelInventoryPlanForProject">계획 취소</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="primary-button" @click="approveInventoryPlanForProject">승인·재고 예약</button></div>
+              </section>
+
+              <section v-if="inventoryState.missingFields.length" class="inventory-missing-panel"><strong>확인 필요 — 계획을 확정하지 않았습니다.</strong><ul><li v-for="item in inventoryState.missingFields" :key="item">{{ item }}</li></ul></section>
+
+              <section v-if="inventoryPlan" class="inventory-plan-result">
+                <div class="inventory-subheading"><div><span class="panel-kicker">계산 결과</span><h4>현장 절단 계획 · {{ inventoryCutStatusLabel(inventoryPlan.status) }}</h4></div><small>계산 시각 {{ inventoryPlan.createdAt }}</small></div>
+                <div class="inventory-result-summary"><div><b>{{ inventoryPlan.requiredPieceCount }}</b><span>필요 조각</span></div><div><b>{{ inventoryPlan.ownedPieceCount }}</b><span>보유 자재 사용</span></div><div><b>{{ inventoryPlan.newOrderPieceCount }}</b><span>신규 발주</span></div><div><b>{{ inventoryPlan.orderReductionPieceCount === null ? '확인 필요' : inventoryPlan.orderReductionPieceCount }}</b><span>기존 대비 발주 감소</span></div><div><b>{{ inventoryNumber(inventoryPlan.reusableLengthMm) }}mm</b><span>재사용 가능 잔량</span></div><div><b>{{ inventoryNumber(inventoryPlan.plannedWasteLengthMm) }}mm</b><span>폐기 예상 잔량</span></div></div>
+                <div class="inventory-comparison-note">기존 방식 대비 발주 감소: <strong>{{ inventoryPlan.orderReductionPieceCount === null ? '비교 기준 입력 필요' : `${inventoryPlan.orderReductionPieceCount}개` }}</strong> · 폐기량 감소: <strong>{{ inventoryPlan.wasteReductionLengthMm === null ? '비교 기준 입력 필요' : `${inventoryPlan.wasteReductionLengthMm.toLocaleString('ko-KR')}mm` }}</strong></div>
+
+                <div class="inventory-usage-list"><article v-for="usage in inventoryPlan.usages" :key="usage.id" class="inventory-usage-card"><div class="inventory-card-title"><div><strong>{{ usage.materialName }} · {{ usage.lengthMm.toLocaleString('ko-KR') }} × {{ usage.widthMm.toLocaleString('ko-KR') }}mm</strong><small>{{ usage.source === 'scrap' ? '자투리 자재 우선 사용' : '보유 신규 자재 사용' }} · {{ inventoryCutStatusLabel(inventoryPlan.status) }}</small></div><span class="inventory-usage-remainder">잔량 {{ usage.remainingLengthMm.toLocaleString('ko-KR') }}mm</span></div><ol class="inventory-cut-list"><li v-for="cut in usage.cuts" :key="cut.id"><span class="cut-order-number">{{ cut.cutOrder }}</span><div><strong>{{ cut.zone }} · {{ cut.location }}</strong><small>필요 {{ cut.requiredLengthMm.toLocaleString('ko-KR') }}mm · 실제 사용 {{ cut.actualUsedLengthMm.toLocaleString('ko-KR') }}mm · 톱날 {{ cut.kerfMm }}mm</small><small>절단 전 {{ cut.stockLengthBeforeMm.toLocaleString('ko-KR') }}mm → 절단 후 {{ cut.remainingLengthMm.toLocaleString('ko-KR') }}mm</small></div></li></ol><div class="inventory-usage-footer"><span>실제 사용 {{ usage.usedLengthMm.toLocaleString('ko-KR') }}mm</span><span>재사용 가능 {{ usage.reusableRemainingLengthMm.toLocaleString('ko-KR') }}mm</span><span>폐기 예상 {{ usage.wasteRemainingLengthMm.toLocaleString('ko-KR') }}mm</span></div></article></div>
+
+                <div v-if="inventoryPlan.newOrders.length" class="inventory-new-order-list"><h5>신규 발주 필요 자재</h5><article v-for="order in inventoryPlan.newOrders" :key="order.id"><strong>{{ order.materialName }} · {{ order.thicknessMm }}T · 폭 {{ order.widthMm }}mm · 길이 {{ order.lengthMm }}mm × {{ order.quantity }}개</strong><span>{{ order.surfaceFinish }} · {{ order.color }} · {{ order.reason }}</span></article></div><div v-else class="inventory-success-note">보유 자재만으로 필요한 조각을 모두 배정했습니다. 신규 발주가 없습니다.</div>
+
+                <div v-if="inventoryPlan.excludedMaterials.length" class="inventory-excluded-list"><h5>사용 대상에서 제외한 보유 자재</h5><article v-for="item in inventoryPlan.excludedMaterials" :key="item.ownedMaterialId"><strong>{{ item.label }}</strong><span>{{ item.reasons.join(' · ') }}</span></article></div>
+              </section>
+            </section>
 
             <section class="optimization-catalog panel-card">
               <div class="panel-heading"><div><span class="panel-kicker">첫 번째 확인</span><h3>자재 카탈로그</h3></div><button type="button" class="outline-button" @click="catalogFormOpen = !catalogFormOpen; resetCatalogDraft()">{{ catalogFormOpen ? '입력 닫기' : '자재 기준 입력' }}</button></div>
@@ -1881,7 +2274,7 @@ onMounted(() => {
                   <div v-if="!project.optimization.catalog.length" class="optimization-empty"><strong>등록된 실제 자재 기준이 없습니다.</strong><span>샘플 단가와 규격을 자동으로 만들지 않습니다. 자재 기준 입력 버튼에서 업체 자료를 넣어주세요.</span></div>
                 <div v-else class="catalog-list">
                 <article v-for="item in project.optimization.catalog" :key="item.id" class="catalog-item" :class="{ selected: item.id === project.optimization.selectedPanelMaterialId || item.id === project.optimization.selectedProfileMaterialId }">
-                  <div class="catalog-item__main"><strong>{{ item.name || '이름 없음' }} <em v-if="item.source === 'sample'" class="sample-data-label">샘플 데이터</em></strong><span>{{ item.materialType === 'panel' ? '판재' : '프로파일' }} · {{ item.material || '재질 확인 필요' }}</span><small>{{ catalogSpec(item) }}</small></div>
+                  <div class="catalog-item__main"><strong>{{ item.name || '이름 없음' }} <em v-if="item.source === 'sample'" class="sample-data-label">샘플 데이터</em></strong><span>{{ item.materialType === 'panel' ? '판재' : '프로파일' }} · {{ item.material || '재질 확인 필요' }}</span><small>{{ catalogSpec(item) }}</small><small>{{ item.surfaceFinish || '표면 마감 확인 필요' }} · {{ item.color || '색상 확인 필요' }}</small></div>
                   <div class="catalog-item__meta"><b>{{ item.unitPrice === null ? '단가 확인 필요' : `${item.unitPrice.toLocaleString('ko-KR')}원/${item.unitLabel}` }}</b><span>{{ catalogMissingLabel(item) }}</span></div>
                   <div class="catalog-item__actions"><button type="button" class="text-button" @click="editCatalogItem(item)">수정</button><button type="button" class="icon-button danger" aria-label="자재 기준 삭제" @click="removeCatalogItem(item)">×</button></div>
                 </article>
@@ -1912,6 +2305,8 @@ onMounted(() => {
                   <label>허용 이음·겹침(mm)<input v-model="catalogDraft.lapAllowanceMm" type="number" min="0" /></label>
                   <label>최소 재사용 자투리(mm)<input v-model="catalogDraft.minimumReusableOffcutMm" type="number" min="1" /></label>
                   <label>재작업 위험 비용(원)<input v-model="catalogDraft.reworkRiskCost" type="number" min="0" /></label>
+                  <label>표면 마감<input v-model="catalogDraft.surfaceFinish" type="text" placeholder="예: 평판 도장" /></label>
+                  <label>색상<input v-model="catalogDraft.color" type="text" placeholder="예: 아이보리" /></label>
                   <label class="checkbox-label"><input v-model="catalogDraft.rotatable" type="checkbox" /><span>회전 가능</span></label>
                   <label>도장·무늬 방향<select v-model="catalogDraft.grainDirection"><option value="fixed">방향 고정</option><option value="free">회전 가능 방향</option></select></label>
                 </div>

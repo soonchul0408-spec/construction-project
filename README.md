@@ -19,6 +19,7 @@ npm run dev
 npm run lint
 npx tsc --noEmit
 npm run build
+npm run verify:inventory-cutting
 ```
 
 ## 현재 자동 분석 지원
@@ -52,6 +53,7 @@ src/
     dimension-normalizer.ts       # 숫자·단위 → mm와 근거
     drawing-geometry-model.ts     # 벽체·구역·높이·개구부·지붕 geometry
     material-takeoff-engine.ts    # 벽체별 배치 기반 자재 계산
+    inventory-cutting-engine.ts   # 보유 자재 우선 동일 폭 길이 절단 MVP
     export-report.ts              # CSV 및 인쇄/PDF 보고서
     cost-summary-parser.ts        # 비용표 전용 추출·마스킹
     project-store.ts              # localStorage 복원
@@ -70,6 +72,8 @@ src/
 - PDF 텍스트 직접 추출은 높은 신뢰도, OCR·단위 불명확 값은 중간/낮은 신뢰도로 표시합니다. 사용자가 확인한 값은 `사용자 확인값`으로 저장합니다.
 - 판넬은 전체 면적 나눗셈만 쓰지 않고 벽체별 길이·높이, 시공 방향, 유효 폭, 표준 길이, 개구부, 여유율, 절단 잔재를 반영합니다.
 - 입력 파일은 외부 AI API로 전송하지 않습니다. 현재 AI 서버 연동은 없으며, AI 분석을 사용하려면 별도 서버 환경변수가 필요하다는 안내만 표시합니다.
+
+절단 최적화 화면에는 소규모 현장용 `보유 자재 기반 절단 계획 MVP`가 포함됩니다. 직사각형 샌드위치패널·보드처럼 폭이 동일한 자재를 길이 방향으로만 비교하며, 도면의 필요 조각을 수정하거나 2차원 네스팅·곡선 자재·손상 판정을 자동화하지 않습니다. 높이·폭·두께·표면 마감·색상·도면 축척을 사람이 확인하기 전에는 계획을 만들지 않고, 계산 중에는 보유 재고를 변경하지 않으며 승인 후 보유 수량을 예약합니다. 화면의 `기본 예제 불러오기`에서 2,800mm 자재 우선 절단 흐름을 확인할 수 있습니다.
 
 ## 실제 발주 전 확인
 
