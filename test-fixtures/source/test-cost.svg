@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="white"/>
+  <g fill="none" stroke="#111" stroke-width="3">
+    <rect x="180" y="180" width="1240" height="570"/>
+    <line x1="180" y1="280" x2="1420" y2="280"/><line x1="180" y1="380" x2="1420" y2="380"/><line x1="180" y1="480" x2="1420" y2="480"/><line x1="180" y1="580" x2="1420" y2="580"/><line x1="180" y1="680" x2="1420" y2="680"/>
+    <line x1="420" y1="180" x2="420" y2="750"/><line x1="760" y1="180" x2="760" y2="750"/><line x1="1080" y1="180" x2="1080" y2="750"/>
+  </g>
+  <g fill="#111" font-family="Arial, sans-serif" font-size="30">
+    <text x="70" y="70">CONSTRUCTION COST SUMMARY</text>
+    <text x="70" y="115">월별 공사비 집계표 업체명 품명 금액 누계금액</text>
+    <text x="230" y="245">월</text><text x="480" y="245">업체명</text><text x="820" y="245">품명</text><text x="1130" y="245">금액</text>
+    <text x="230" y="345">1월</text><text x="480" y="345">테스트업체</text><text x="820" y="345">판넬</text><text x="1130" y="345">1000000</text>
+    <text x="230" y="445">2월</text><text x="480" y="445">테스트업체</text><text x="820" y="445">인건비</text><text x="1130" y="445">500000</text>
+    <text x="230" y="645">합계</text><text x="1130" y="645">1500000</text>
+  </g>
+</svg>

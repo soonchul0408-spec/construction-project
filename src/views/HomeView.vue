@@ -1,9 +1,7 @@
 <script setup>
-import TheWelcome from '../components/TheWelcome.vue'
+import WeatherMockup from '../components/practices/basic/WeatherMockup.vue'
 </script>
 
 <template>
-  <main>
-    <TheWelcome />
-  </main>
+  <WeatherMockup />
 </template>

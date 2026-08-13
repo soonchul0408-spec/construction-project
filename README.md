@@ -1,44 +1,76 @@
-# skala-vue
+# drawing-material-calculator
 
-This template should help get you started developing with Vue 3 in Vite.
+도면 파일에서 치수·높이·구역·개구부 근거를 추출하고, 벽체별 자재 산출표와 계산 가능한 개략 3D geometry를 만드는 Vue 3 + TypeScript 웹앱입니다.
 
-## Recommended IDE Setup
+## 통합 작업 흐름
 
-[VS Code](https://code.visualstudio.com/) + [Vue (Official)](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
+프로젝트는 `empty → uploading → classifying → extracting → linking → needs-review → building-3d → calculating → completed/partial` 상태를 저장합니다. 검토가 끝나기 전에는 3D 모델을 확정하지 않고, 3D 모델 검토가 끝나기 전에는 자재 산출표와 CSV/PDF 다운로드를 열지 않습니다. 높이 누락, 신뢰도 미확인, 개구부 위치 미확인, 벽체별 검토 상태가 남아 있으면 `partial`로 유지되어 발주 가능으로 표시하지 않습니다.
 
-## Recommended Browser Setup
-
-- Chromium-based browsers (Chrome, Edge, Brave, etc.):
-  - [Vue.js devtools](https://chromewebstore.google.com/detail/vuejs-devtools/nhdogjmejiglipccpnnnanhbledajbpd)
-  - [Turn on Custom Object Formatter in Chrome DevTools](http://bit.ly/object-formatters)
-- Firefox:
-  - [Vue.js devtools](https://addons.mozilla.org/en-US/firefox/addon/vue-js-devtools/)
-  - [Turn on Custom Object Formatter in Firefox DevTools](https://fxdx.dev/firefox-devtools-custom-object-formatters/)
-
-## Customize configuration
-
-See [Vite Configuration Reference](https://vite.dev/config/).
-
-## Project Setup
+## 실행
 
 ```sh
 npm install
-```
-
-### Compile and Hot-Reload for Development
-
-```sh
 npm run dev
 ```
 
-### Compile and Minify for Production
-
-```sh
-npm run build
-```
-
-### Lint with [ESLint](https://eslint.org/)
+검증 명령:
 
 ```sh
 npm run lint
+npx tsc --noEmit
+npm run build
 ```
+
+## 현재 자동 분석 지원
+
+- PDF: 페이지별 PDF.js 텍스트 추출, 숫자·단위 정규화, 텍스트 위치 보존, 스캔 페이지의 로컬 OCR fallback
+- JPG / JPEG / PNG: 브라우저 전처리(그레이스케일·선명도 보정) 후 한국어+영어 Tesseract.js OCR, 단어별 위치와 신뢰도 보존
+- 여러 파일 및 여러 페이지 PDF: 프로젝트 단위로 묶어 평면도·입면도·단면도 근거 연결
+- 공사비 집계표: 월별 금액·합계 추출 및 개인정보 비식별화 후 비용 참고자료로만 저장
+
+파일별 분석 단계는 `업로드 중 → 파일 종류 확인 중 → 도면 유형 분석 중 → 치수 추출 중 → 높이 정보 확인 중 → 분석 완료/일부 정보 확인 필요/분석 실패`로 표시됩니다.
+
+추출 치수는 `value`, `unit`, `normalizedValueMm`, `sourceFile`, `pageNumber`, `drawingType`, `sourceText`, `sourcePosition`, `confidence`, `sourceType` 필드를 가지며, PDF 텍스트와 OCR 모두 원본 위치를 근거로 남깁니다. PDF 텍스트에 단위가 없으면 숫자 형식만으로 단위를 확정하지 않고 중간/낮은 신뢰도로 남깁니다.
+
+도면 페이지에는 구역명, 방 이름, 축 번호, 축척, 단위 후보도 별도 메타데이터로 저장합니다. 인식되지 않은 항목은 성공으로 위장하지 않고 검토 필요 상태로 유지합니다.
+
+DWG, DXF, IFC는 `src/modules/cad-parser-adapter.ts`에 어댑터 경계를 준비했지만 현재 파서는 연결하지 않았습니다. 업로드 시 성공으로 처리하지 않고 “현재 이 파일 형식은 자동 분석을 지원하지 않습니다.”라고 표시합니다.
+
+## 구조
+
+```text
+src/
+  components/
+    Building3DViewer.vue          # Three.js 기반 회전·확대·벽체 선택 뷰어
+    ConfidenceReviewPanel.vue     # 신뢰도·근거·사용자 확인값
+  modules/
+    file-loader.ts                # 형식 판별 및 파일 상태
+    document-classifier.ts        # 평면도/입면도/단면도/비용표 분류
+    pdf-extractor.ts              # PDF 텍스트·페이지 렌더·OCR fallback
+    ocr-analyzer.ts               # 이미지 전처리·Tesseract OCR
+    cad-parser-adapter.ts         # DWG/DXF/IFC 미지원 경계
+    dimension-normalizer.ts       # 숫자·단위 → mm와 근거
+    drawing-geometry-model.ts     # 벽체·구역·높이·개구부·지붕 geometry
+    material-takeoff-engine.ts    # 벽체별 배치 기반 자재 계산
+    export-report.ts              # CSV 및 인쇄/PDF 보고서
+    cost-summary-parser.ts        # 비용표 전용 추출·마스킹
+    project-store.ts              # localStorage 복원
+    project-workflow.ts           # 업로드부터 발주 가능 판정까지 단계 전이
+  types/domain.ts                 # 분석·근거·프로젝트 타입
+```
+
+## 안전한 계산 원칙
+
+3D 뷰어는 Three.js의 실제 `BoxGeometry`를 사용합니다. 벽체 시작점·끝점은 PDF에 축척과 벡터 선분이 함께 있으면 PDF 벡터에서 가져오고, 그렇지 않으면 추출된 치수의 실제 길이를 유지한 순차 배치로 생성합니다. 후자의 경우 화면에 `치수 순서 기반 개략 배치`를 명시하며, 임의의 도면 좌표인 것처럼 표시하지 않습니다. 벽체 두께는 프로젝트의 판넬 두께 기준을 사용합니다.
+
+문·창호는 폭·높이·벽체 시작점으로부터의 offset·창대 높이가 모두 확인된 경우에만 벽체 geometry를 분할해 실제 개구부를 만듭니다. 위치 근거가 없는 개구부는 면적 산출에는 확인된 규격만 반영하고, 3D 벽체를 임의로 뚫지 않으며 검토 대상으로 표시합니다. 평지붕 표기가 확인된 경우에만 roof slab을 생성하고, 박공·경사지붕은 경사도와 능선 위치가 없으면 생성하지 않습니다.
+
+- 높이는 같은 도면 → 입면도 → 단면도 → 다른 페이지의 같은 구역 순으로 연결하며, 찾지 못하면 임의의 숫자를 넣지 않습니다.
+- 높이가 없으면 3D geometry와 발주 수량을 차단하고 “높이 정보 없음 / 입면도 또는 단면도 필요” 상태를 표시합니다.
+- PDF 텍스트 직접 추출은 높은 신뢰도, OCR·단위 불명확 값은 중간/낮은 신뢰도로 표시합니다. 사용자가 확인한 값은 `사용자 확인값`으로 저장합니다.
+- 판넬은 전체 면적 나눗셈만 쓰지 않고 벽체별 길이·높이, 시공 방향, 유효 폭, 표준 길이, 개구부, 여유율, 절단 잔재를 반영합니다.
+- 입력 파일은 외부 AI API로 전송하지 않습니다. 현재 AI 서버 연동은 없으며, AI 분석을 사용하려면 별도 서버 환경변수가 필요하다는 안내만 표시합니다.
+
+## 실제 발주 전 확인
+
+원본 도면의 치수·축척·개구부 규격, 구역별 층고, 현장 실측, 제조사 판넬 규격·부속품 시방, 절단·운반·시공 상세와 구조검토를 사람이 확인해야 합니다. 이 결과는 자재 산출용 개략 결과이며 구조검토나 설계 승인을 대신하지 않습니다.

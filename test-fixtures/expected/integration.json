@@ -1,0 +1,38 @@
+{
+  "project": {
+    "name": "test-floor-plan",
+    "drawingKinds": ["평면도", "입면도", "단면도", "상세도", "공사비 집계표"],
+    "costSummaryExcludedFromGeometry": true
+  },
+  "dimensionsMm": {
+    "wallA": 12000,
+    "wallB": 8000,
+    "heightA": 3200,
+    "heightB": 4800,
+    "doorD1Width": 900,
+    "doorD1Height": 2100,
+    "doorD1Offset": 2400,
+    "windowW1Width": 1800,
+    "windowW1Height": 1200,
+    "windowW1Offset": 5200,
+    "windowW1Sill": 900
+  },
+  "geometry": {
+    "isReady": true,
+    "zones": {
+      "ZONE A": 3200,
+      "ZONE B": 4800
+    }
+  },
+  "takeoff": {
+    "wallAOpeningAreaM2": 1.89,
+    "wallBOpeningAreaM2": 2.16,
+    "wallANetAreaM2": 36.51,
+    "wallBNetAreaM2": 36.24
+  },
+  "workflow": {
+    "withoutReview": "needs-review",
+    "withoutHeight": "needs-review",
+    "withConfirmedResults": "completed"
+  }
+}

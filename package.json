@@ -1,24 +1,36 @@
 {
-  "name": "skala-vue",
+  "name": "drawing-material-calculator",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "api": "node --env-file-if-exists=.env.local server/index.js",
     "build": "vite build",
     "preview": "vite preview",
+    "verify:3d-model": "node --experimental-strip-types scripts/verify-3d-model.ts",
+    "verify:drawing-pipeline": "node --experimental-strip-types scripts/verify-drawing-pipeline.ts",
+    "verify:height-extraction": "node --experimental-strip-types scripts/verify-height-extraction.ts",
+    "verify:cutting-optimization": "node --experimental-strip-types scripts/verify-cutting-optimization.ts",
     "lint": "run-s \"lint:*\"",
     "lint:oxlint": "oxlint . --fix",
     "lint:eslint": "eslint . --fix --cache",
     "format": "prettier --write --experimental-cli src/"
   },
   "dependencies": {
+    "axios": "^1.19.0",
+    "element-plus": "^2.14.3",
+    "fast-xml-parser": "^5.10.1",
+    "pdfjs-dist": "^6.2.108",
     "pinia": "^4.0.2",
+    "tesseract.js": "^7.0.0",
+    "three": "^0.185.1",
     "vue": "^3.5.40",
     "vue-router": "^5.2.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@typescript-eslint/parser": "^8.67.0",
     "@vitejs/plugin-vue": "^6.0.8",
     "eslint": "^10.7.0",
     "eslint-config-prettier": "^10.1.8",

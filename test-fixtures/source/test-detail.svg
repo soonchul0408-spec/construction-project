@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="white"/>
+  <g fill="none" stroke="#111" stroke-width="6">
+    <rect x="250" y="250" width="330" height="450"/>
+    <rect x="850" y="250" width="420" height="300"/>
+  </g>
+  <g fill="#111" font-family="Arial, sans-serif" font-size="30">
+    <text x="70" y="70">TEST BUILDING - DETAIL</text>
+    <text x="70" y="115">DOOR DETAIL D1 WIDTH 900 mm HEIGHT 2100 mm</text>
+    <text x="700" y="650">WINDOW DETAIL W1 WIDTH 1800 mm HEIGHT 1200 mm SILL 900 mm</text>
+    <text x="700" y="710">DETAIL / DOOR DETAIL / WINDOW DETAIL</text>
+  </g>
+</svg>

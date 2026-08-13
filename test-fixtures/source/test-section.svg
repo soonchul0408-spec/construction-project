@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="white"/>
+  <g fill="none" stroke="#111" stroke-width="6">
+    <path d="M300 760 L300 260 L1150 260 L1150 760"/>
+    <line x1="300" y1="760" x2="1150" y2="760"/>
+    <line x1="260" y1="760" x2="260" y2="260" stroke-dasharray="12 10"/>
+  </g>
+  <g fill="#111" font-family="Arial, sans-serif" font-size="30">
+    <text x="70" y="70">TEST BUILDING - SECTION</text>
+    <text x="70" y="115">SECTION A-A / LEVEL +0.000 / FLOOR TO CEILING 3200 mm</text>
+    <text x="1180" y="260">TOP LEVEL +4800 mm</text>
+    <text x="1180" y="320">ZONE B FLOOR TO CEILING 4800 mm</text>
+    <text x="1180" y="380">SCALE 1:100 UNIT mm</text>
+  </g>
+</svg>
