@@ -10,7 +10,6 @@ export function getProviderStatus() {
       provider,
       {
         configured: envKeys.every((envKey) => Boolean(process.env[envKey])),
-        requiredEnvironmentVariables: envKeys,
       },
     ]),
   )

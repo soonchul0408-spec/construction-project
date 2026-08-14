@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, reactive, ref, watch } from 'vue'
 
-import Building3DViewer from './components/Building3DViewer.vue'
 import ConfidenceReviewPanel from './components/ConfidenceReviewPanel.vue'
 import { analyzeCadFile } from './modules/cad-parser-adapter'
-import { parseCostSummaries } from './modules/cost-summary-parser'
+import { isCostSummaryPage, parseCostSummaries } from './modules/cost-summary-parser'
 import { classifyDocument, guessBuildingName } from './modules/document-classifier'
 import { buildBuildingGeometry, buildWalls, extractRoofGeometry, listMissingGeometryItems } from './modules/drawing-geometry-model'
 import { buildHeightCandidates, deriveLevelHeightDimensions } from './modules/height-candidate-extractor'
@@ -17,8 +16,6 @@ import {
   HEIGHT_DIAGNOSTIC_STATUS_LABELS,
 } from './modules/height-diagnostics'
 import { createTestBuildingGeometry } from './modules/test-building-model'
-import { extractPdfDocument } from './modules/pdf-extractor'
-import { analyzeImage } from './modules/ocr-analyzer'
 import {
   createQueuedFile,
   extensionOf,
@@ -41,6 +38,7 @@ import {
   getInventoryRequirementMissingFields,
   mergeInventoryRequirements,
   normalizeInventoryRequirement,
+  releaseInventoryCutPlanReservation,
 } from './modules/inventory-cutting-engine'
 import { assessProjectWorkflow, statusForAnalysisStage } from './modules/project-workflow'
 import { emptyConsistencyValidation, validateConsistency } from './modules/consistency-validator'
@@ -49,6 +47,8 @@ import {
   downloadCsv,
   downloadCuttingMembersCsv,
   downloadCuttingPlansCsv,
+  downloadInventoryCutPlanCsv,
+  downloadInventoryOrderCsv,
   downloadOptimizationInputsCsv,
   downloadOptimizationOrderCsv,
   downloadScrapsCsv,
@@ -86,6 +86,8 @@ import type {
   ProjectState,
 } from './types/domain'
 import { emptyOptimizationState } from './types/domain'
+
+const Building3DViewer = defineAsyncComponent(() => import('./components/Building3DViewer.vue'))
 
 const emptyCostSummary = (): CostSummary => ({
   rows: [],
@@ -143,12 +145,15 @@ function makeProject(): ProjectState {
 const project = ref<ProjectState>(makeProject())
 const fileInput = ref<HTMLInputElement | null>(null)
 const sourceFiles = new Map<string, File>()
+type WorkflowSection = 'upload' | 'analysis' | 'model' | 'takeoff' | 'optimization'
+
 const isDragging = ref(false)
 const isAnalyzing = ref(false)
 const isBuilding3D = ref(false)
 const isCalculating = ref(false)
 const isOptimizing = ref(false)
-const activeSection = ref('upload')
+const isWorkflowBusy = computed(() => isAnalyzing.value || isBuilding3D.value || isCalculating.value || isOptimizing.value)
+const activeSection = ref<WorkflowSection>('upload')
 const selectedWallId = ref('')
 const selectedPageId = ref('')
 const selectedHeightCandidateId = ref('')
@@ -157,6 +162,7 @@ const testBuildingModel = createTestBuildingGeometry()
 const notice = ref('')
 const showAllDimensions = ref(false)
 const settingsDraft = reactive<MaterialSettings>({ ...DEFAULT_MATERIAL_SETTINGS })
+const settingsError = ref('')
 const editingCatalogId = ref('')
 const catalogFormOpen = ref(false)
 const selectedOptimizationPlanId = ref('')
@@ -229,7 +235,7 @@ const currentPage = computed<DrawingPage | null>(() => {
 })
 const selectedWall = computed(() => project.value.walls.find((wall) => wall.id === selectedWallId.value) || null)
 const supportedFiles = computed(() => project.value.files.filter((file) => file.status !== 'failed' || file.pages.length))
-const costFiles = computed(() => project.value.files.filter((file) => file.kind === 'cost-summary'))
+const costFiles = computed(() => project.value.files.filter((file) => file.pages.some((page) => isCostSummaryPage(file, page))))
 const drawingDimensions = computed(() => project.value.dimensions.filter((dimension) => dimension.evidence[0]?.drawingKind !== 'cost-summary'))
 const activeDimensions = computed(() => {
   const values = drawingDimensions.value
@@ -301,17 +307,21 @@ const selectedPageWalls = computed(() => {
   return project.value.walls.filter((wall) => wall.evidence.some((evidence) => evidence.fileId === fileId && evidence.pageNumber === currentPage.value?.pageNumber))
 })
 const selectedPageOpenings = computed(() => selectedPageWalls.value.flatMap((wall) => wall.openings.map((opening) => ({ opening, wall }))))
-const workflowAssessment = computed(() => assessProjectWorkflow({
-  files: project.value.files,
-  workflow: project.value.workflow,
-  model: project.value.model,
-  takeoffs: project.value.takeoffs,
-  missingItems: project.value.missingItems,
-  reviewItems: project.value.reviewItems,
-  consistency: project.value.consistencyValidation,
-  isAnalyzing: isAnalyzing.value,
-  currentStatus: project.value.status,
-}))
+function assessCurrentProject(analysisBusy = isAnalyzing.value, currentStatus = project.value.status) {
+  return assessProjectWorkflow({
+    files: project.value.files,
+    workflow: project.value.workflow,
+    model: project.value.model,
+    takeoffs: project.value.takeoffs,
+    missingItems: project.value.missingItems,
+    reviewItems: project.value.reviewItems,
+    consistency: project.value.consistencyValidation,
+    isAnalyzing: analysisBusy,
+    currentStatus,
+  })
+}
+
+const workflowAssessment = computed(() => assessCurrentProject())
 const projectStatusLabel = computed(() => PROJECT_STATUS_LABELS[project.value.status])
 const projectStatusDescription = computed(() => project.value.statusMessage || PROJECT_STATUS_DESCRIPTIONS[project.value.status])
 const reviewBlockers = computed(() => [...new Set([...project.value.missingItems, ...project.value.reviewItems])])
@@ -320,8 +330,22 @@ const reviewBlockers = computed(() => [...new Set([...project.value.missingItems
 // The actual gate is therefore whether at least one verified wall geometry
 // exists; issuance remains blocked by the workflow review state.
 const canBuild3D = computed(() => !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value && project.value.files.length > 0 && project.value.walls.length > 0 && project.value.model.isReady)
-const canCalculateMaterials = computed(() => project.value.workflow.modelBuilt && project.value.model.isReady && !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value)
-const canDownloadReports = computed(() => !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value && workflowAssessment.value.canIssue && project.value.workflow.takeoffCalculated && project.value.takeoffs.length > 0)
+const canConfirmReview = computed(() => canBuild3D.value
+  && !project.value.model.partial
+  && project.value.reviewItems.length === 0
+  && project.value.walls.every((wall) => wall.reviewStatus === 'verified' && !(wall.conflicts || []).length))
+const canCalculateMaterials = computed(() => project.value.workflow.reviewConfirmed && project.value.workflow.modelBuilt && project.value.model.isReady && !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value)
+const canDownloadReports = computed(() => !isAnalyzing.value
+  && !isBuilding3D.value
+  && !isCalculating.value
+  && workflowAssessment.value.canIssue
+  && project.value.workflow.takeoffCalculated
+  && project.value.workflow.optimizationCalculated
+  && project.value.takeoffs.length > 0
+  && optimizationResultsAreCurrent()
+  && inventoryPlanIsCurrent()
+  && project.value.optimization.inventory?.status !== 'calculated'
+  && project.value.consistencyValidation.canFinalize)
 const workflowSteps = [
   { id: 'upload', label: '파일 업로드' },
   { id: 'analysis', label: '도면 분석' },
@@ -340,12 +364,119 @@ const workflowProgressIndex = computed(() => {
 })
 const optimizationScenario = computed(() => project.value.optimization.scenarios.find((scenario) => scenario.id === project.value.optimization.selectedScenarioId) || project.value.optimization.scenarios[0] || null)
 const selectedOptimizationPlan = computed(() => optimizationScenario.value?.stockPlans.find((plan) => plan.id === selectedOptimizationPlanId.value) || optimizationScenario.value?.stockPlans[0] || null)
+
+function optimizationInputFingerprint() {
+  const selectedMaterial = project.value.optimization.catalog.find((item) => item.id === project.value.optimization.selectedPanelMaterialId) || null
+  return JSON.stringify({
+    version: 1,
+    settings: project.value.settings,
+    selectedPanelMaterialId: project.value.optimization.selectedPanelMaterialId,
+    material: selectedMaterial,
+    walls: [...project.value.walls].sort((left, right) => left.id.localeCompare(right.id)).map((wall) => ({
+      id: wall.id,
+      zone: wall.zone,
+      wallNumber: wall.wallNumber,
+      lengthMm: wall.lengthMm,
+      heightMm: wall.heightMm,
+      reviewStatus: wall.reviewStatus,
+      sourceDimensionIds: wall.sourceDimensionIds,
+      openings: [...wall.openings].sort((left, right) => left.id.localeCompare(right.id)).map((opening) => ({
+        id: opening.id,
+        type: opening.type,
+        widthMm: opening.widthMm,
+        heightMm: opening.heightMm,
+        sillHeightMm: opening.sillHeightMm,
+        offsetMm: opening.offsetMm,
+        excludedFromAutomaticTakeoff: opening.excludedFromAutomaticTakeoff,
+      })),
+    })),
+    existingScraps: project.value.optimization.scraps.filter((scrap) => scrap.source === 'existing')
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((scrap) => ({
+        id: scrap.id,
+        materialId: scrap.materialId,
+        lengthMm: scrap.lengthMm,
+        widthMm: scrap.widthMm,
+        thicknessMm: scrap.thicknessMm,
+        available: scrap.available,
+        status: scrap.status,
+        usableZones: scrap.usableZones,
+        plannedUseMemberId: scrap.plannedUseMemberId,
+        plannedUseAt: scrap.plannedUseAt,
+      })),
+  })
+}
+
+function inventoryInputFingerprint() {
+  const inventory = project.value.optimization.inventory || emptyInventoryCuttingState()
+  return JSON.stringify({
+    version: 1,
+    settings: inventory.settings,
+    requirements: [...inventory.requirements].sort((left, right) => left.id.localeCompare(right.id)).map((requirement) => ({
+      id: requirement.id,
+      materialType: requirement.materialType,
+      materialName: requirement.materialName,
+      thicknessMm: requirement.thicknessMm,
+      widthMm: requirement.widthMm,
+      requiredLengthMm: requirement.requiredLengthMm,
+      heightMm: requirement.heightMm,
+      quantity: requirement.quantity,
+      surfaceFinish: requirement.surfaceFinish,
+      color: requirement.color,
+      drawingScale: requirement.drawingScale,
+      status: requirement.status,
+      generatedFingerprint: requirement.generatedFingerprint,
+    })),
+    ownedMaterials: [...inventory.ownedMaterials].sort((left, right) => left.id.localeCompare(right.id)).map((stock) => ({
+      id: stock.id,
+      materialType: stock.materialType,
+      materialName: stock.materialName,
+      thicknessMm: stock.thicknessMm,
+      widthMm: stock.widthMm,
+      lengthMm: stock.lengthMm,
+      surfaceFinish: stock.surfaceFinish,
+      color: stock.color,
+      quantity: stock.quantity,
+      source: stock.source,
+      usable: stock.usable,
+      location: stock.location,
+    })),
+  })
+}
+
+function optimizationResultsAreCurrent() {
+  return Boolean(project.value.optimization.sourceFingerprint && project.value.optimization.sourceFingerprint === optimizationInputFingerprint())
+}
+
+function inventoryPlanIsCurrent() {
+  const plan = project.value.optimization.inventory?.plan
+  return !plan || plan.status === 'cancelled' || Boolean(plan.sourceFingerprint && plan.sourceFingerprint === inventoryInputFingerprint())
+}
+
+const canDownloadOptimization = computed(() => Boolean(
+  optimizationScenario.value &&
+  optimizationScenario.value.available &&
+  optimizationScenario.value.validation.passed &&
+  project.value.optimization.status === 'calculated' &&
+  project.value.optimization.validation.passed &&
+  project.value.workflow.optimizationCalculated &&
+  optimizationResultsAreCurrent() &&
+  inventoryPlanIsCurrent() &&
+  workflowAssessment.value.canIssue &&
+  project.value.consistencyValidation.canFinalize &&
+  !isAnalyzing.value &&
+  !isCalculating.value &&
+  !isOptimizing.value,
+))
 const optimizationCatalogPanels = computed(() => project.value.optimization.catalog.filter((item) => item.materialType === 'panel'))
-const optimizationCatalogProfiles = computed(() => project.value.optimization.catalog.filter((item) => item.materialType === 'profile'))
 const optimizationNeedsReview = computed(() => project.value.optimization.reviews.filter((item) => !item.resolved))
-const optimizationCanRun = computed(() => project.value.workflow.takeoffCalculated && project.value.optimization.catalog.length > 0 && !isAnalyzing.value && !isOptimizing.value && !isCalculating.value)
+const optimizationCanRun = computed(() => project.value.workflow.takeoffCalculated && project.value.optimization.catalog.length > 0 && project.value.optimization.inventory?.status !== 'approved' && !isAnalyzing.value && !isOptimizing.value && !isCalculating.value)
 const inventoryState = computed(() => project.value.optimization.inventory || emptyInventoryCuttingState())
 const inventoryPlan = computed(() => inventoryState.value.plan)
+const canDownloadOptimizationOrders = computed(() => canDownloadOptimization.value && inventoryPlan.value?.status !== 'calculated')
+const inventoryPlanControlsFieldOutputs = computed(() => ['calculated', 'approved'].includes(inventoryPlan.value?.status || ''))
+const canDownloadOptimizationFieldPlan = computed(() => canDownloadOptimization.value && inventoryPlan.value?.status !== 'calculated')
+const canDownloadRawOptimizationArtifacts = computed(() => canDownloadOptimization.value && !inventoryPlanControlsFieldOutputs.value)
 const inventoryRequirementsNeedingReview = computed(() => inventoryState.value.requirements.filter((requirement) => requirement.status !== 'ready' || requirement.missingFields.length))
 const inventoryStatusLabel = computed(() => {
   if (inventoryState.value.status === 'approved') return '승인·재고 예약 완료'
@@ -379,7 +510,42 @@ function setProjectStatus(status: ProjectStatus, message = PROJECT_STATUS_DESCRI
   project.value.updatedAt = new Date().toISOString()
 }
 
-function resetWorkflow() {
+function invalidatedInventory(reason: string) {
+  const existing = project.value.optimization?.inventory || emptyInventoryCuttingState()
+  const empty = emptyInventoryCuttingState()
+  const hadDerivedPlan = Boolean(existing.plan || existing.requirements.length || existing.status !== 'not-ready')
+  if (existing.plan?.status === 'approved') {
+    // Never release an approved reservation as a side effect of an unrelated
+    // edit. The explicit release action preserves user intent and its cancelled
+    // plan record before derived inputs are changed.
+    return {
+      ...existing,
+      missingFields: [...new Set([...existing.missingFields, reason, '예약 해제·계획 취소 후 입력값을 변경하세요.'])],
+    }
+  }
+  return {
+    ...empty,
+    settings: { ...empty.settings, ...existing.settings },
+    ownedMaterials: existing.ownedMaterials || [],
+    plan: existing.plan?.status === 'cancelled' ? existing.plan : null,
+    status: hadDerivedPlan ? 'needs-review' as const : 'not-ready' as const,
+    missingFields: hadDerivedPlan ? [reason] : [],
+  }
+}
+
+function approvedInventoryBlocks(action: string) {
+  if (project.value.optimization?.inventory?.plan?.status !== 'approved') return false
+  setNotice(`승인된 보유 자재 예약이 있어 ${action}할 수 없습니다. 절단 최적화 화면에서 예약 해제·계획 취소를 먼저 실행하세요.`)
+  return true
+}
+
+function workflowBusyBlocks(action: string) {
+  if (!isWorkflowBusy.value) return false
+  setNotice(`현재 분석 또는 계산이 끝난 뒤 ${action}해 주세요.`)
+  return true
+}
+
+function resetWorkflow(reason = '도면 또는 입력값이 변경되어 이전 절단 계획을 무효화했습니다. 필요 조각을 다시 가져오세요.') {
   project.value.workflow = {
     reviewConfirmed: false,
     modelBuilt: false,
@@ -387,21 +553,13 @@ function resetWorkflow() {
     optimizationCalculated: false,
   }
   const existingScraps = project.value.optimization?.scraps?.filter((scrap) => scrap.source === 'existing') || []
-  const existingInventory = project.value.optimization?.inventory || emptyInventoryCuttingState()
   project.value.optimization = {
     ...emptyOptimizationState(),
     catalog: project.value.optimization?.catalog || [],
     selectedPanelMaterialId: project.value.optimization?.selectedPanelMaterialId || '',
     selectedProfileMaterialId: project.value.optimization?.selectedProfileMaterialId || '',
     scraps: existingScraps,
-    inventory: existingInventory.status === 'approved'
-      ? existingInventory
-      : {
-          ...existingInventory,
-          plan: null,
-          status: existingInventory.requirements.length ? 'needs-review' : 'not-ready',
-          lastCalculatedAt: null,
-        },
+    inventory: invalidatedInventory(reason),
   }
 }
 
@@ -417,19 +575,56 @@ function workflowStepEnabled(id: string) {
   // The 3D screen is also the place where a missing height, failed WebGL
   // setup, or partial model is explained. Keep it reachable before and after
   // model generation instead of hiding the diagnostic component.
-  if (id === 'model') return true
+  if (id === 'model') return project.value.files.length > 0
   if (id === 'takeoff') return project.value.workflow.modelBuilt
-  if (id === 'optimization') return true
+  if (id === 'optimization') return project.value.workflow.takeoffCalculated
   return false
 }
 
 function updateSettings() {
-  if (isCalculating.value || isOptimizing.value) return
+  if (approvedInventoryBlocks('자재 기준을 변경')) {
+    syncSettingsDraft(project.value.settings)
+    return
+  }
+  if (workflowBusyBlocks('자재 기준을 변경')) {
+    syncSettingsDraft(project.value.settings)
+    return
+  }
+  if (isCalculating.value || isOptimizing.value) {
+    syncSettingsDraft(project.value.settings)
+    setNotice('계산이 끝난 뒤 자재 기준을 변경하세요.')
+    return
+  }
+  const positiveFields: Array<[keyof MaterialSettings, string]> = [
+    ['panelEffectiveWidthMm', '판넬 유효 폭'],
+    ['panelStandardLengthMm', '판넬 표준 길이'],
+    ['panelThicknessMm', '판넬 두께'],
+    ['sealantLengthM', '실란트 1본당 길이'],
+    ['cornerLengthM', '코너재 1본당 길이'],
+    ['finishLengthM', '마감재 1본당 길이'],
+  ]
+  const invalidPositive = positiveFields.find(([field]) => typeof settingsDraft[field] !== 'number' || !Number.isFinite(settingsDraft[field] as number) || (settingsDraft[field] as number) <= 0)
+  if (invalidPositive) {
+    settingsError.value = `${invalidPositive[1]}은 0보다 큰 숫자로 입력하세요.`
+  } else if (!Number.isFinite(settingsDraft.panelWasteRate) || settingsDraft.panelWasteRate < 0 || settingsDraft.panelWasteRate > 100) {
+    settingsError.value = '판넬 여유율은 0% 이상 100% 이하로 입력하세요.'
+  } else if (!Number.isInteger(settingsDraft.fastenersPerPanel) || settingsDraft.fastenersPerPanel < 0) {
+    settingsError.value = '판넬당 고정 피스는 0 이상의 정수로 입력하세요.'
+  } else if (!['vertical', 'horizontal'].includes(settingsDraft.panelDirection)) {
+    settingsError.value = '판넬 시공 방향을 다시 선택하세요.'
+  } else {
+    settingsError.value = ''
+  }
+  if (settingsError.value) {
+    syncSettingsDraft(project.value.settings)
+    setNotice(settingsError.value)
+    return
+  }
   Object.assign(project.value.settings, settingsDraft)
   const shouldRecalculate = project.value.workflow.modelBuilt
+  invalidateOptimizationPlan('자재 기준이 변경되어 이전 절단·재고 계획을 무효화했습니다.')
   if (shouldRecalculate) {
     project.value.workflow.takeoffCalculated = false
-    project.value.workflow.optimizationCalculated = false
     setProjectStatus('calculating', '판넬 기준이 변경되어 벽체별 자재 수량을 다시 계산해야 합니다.')
   }
   recompute()
@@ -519,6 +714,8 @@ function editCatalogItem(item: MaterialCatalogItem) {
 }
 
 function saveCatalogItem() {
+  if (approvedInventoryBlocks('자재 카탈로그를 저장')) return
+  if (workflowBusyBlocks('자재 카탈로그를 저장')) return
   if (!catalogDraft.name.trim() || !catalogDraft.material.trim()) {
     setNotice('자재 종류와 재질을 입력하세요.')
     return
@@ -558,46 +755,65 @@ function saveCatalogItem() {
   if (index >= 0) catalog.splice(index, 1, item)
   else catalog.push(item)
   project.value.optimization.catalog = catalog
+  if (project.value.optimization.selectedPanelMaterialId === item.id && item.materialType !== 'panel') project.value.optimization.selectedPanelMaterialId = ''
+  if (project.value.optimization.selectedProfileMaterialId === item.id && item.materialType !== 'profile') project.value.optimization.selectedProfileMaterialId = ''
   if (item.materialType === 'panel' && !project.value.optimization.selectedPanelMaterialId) project.value.optimization.selectedPanelMaterialId = item.id
   if (item.materialType === 'profile' && !project.value.optimization.selectedProfileMaterialId) project.value.optimization.selectedProfileMaterialId = item.id
   invalidateOptimizationPlan()
   resetCatalogDraft()
   catalogFormOpen.value = false
+  saveProject(project.value)
   setNotice(`${item.name} 자재 기준을 저장했습니다. 가격·규격이 비어 있으면 비용 계산은 보류됩니다.`)
 }
 
 function removeCatalogItem(item: MaterialCatalogItem) {
+  if (approvedInventoryBlocks('자재 카탈로그를 삭제')) return
+  if (workflowBusyBlocks('자재 카탈로그를 삭제')) return
   if (!window.confirm(`${item.name || '이 자재'} 기준을 삭제할까요?`)) return
   project.value.optimization.catalog = project.value.optimization.catalog.filter((candidate) => candidate.id !== item.id)
   if (project.value.optimization.selectedPanelMaterialId === item.id) project.value.optimization.selectedPanelMaterialId = ''
   if (project.value.optimization.selectedProfileMaterialId === item.id) project.value.optimization.selectedProfileMaterialId = ''
   invalidateOptimizationPlan()
+  saveProject(project.value)
 }
 
 function selectOptimizationMaterial(type: 'panel' | 'profile', id: string) {
+  if (approvedInventoryBlocks('계산 자재를 변경')) return
+  if (workflowBusyBlocks('계산 자재를 변경')) return
+  if (!id) {
+    if (type === 'panel') project.value.optimization.selectedPanelMaterialId = ''
+    else project.value.optimization.selectedProfileMaterialId = ''
+    invalidateOptimizationPlan('계산 자재 선택이 해제되어 이전 절단·재고 계획을 무효화했습니다.')
+    recompute()
+    setNotice('계산 자재 선택을 해제했습니다. 자재를 다시 선택한 뒤 계산하세요.')
+    return
+  }
+  const material = project.value.optimization.catalog.find((item) => item.id === id)
+  if (!material || material.materialType !== type) {
+    setNotice('부재 형태와 같은 종류의 자재만 선택할 수 있습니다.')
+    return
+  }
   if (type === 'panel') project.value.optimization.selectedPanelMaterialId = id
   else project.value.optimization.selectedProfileMaterialId = id
   invalidateOptimizationPlan()
+  saveProject(project.value)
 }
 
-function invalidateOptimizationPlan() {
+function handleOptimizationMaterialChange(type: 'panel' | 'profile', event: Event) {
+  selectOptimizationMaterial(type, (event.target as HTMLSelectElement).value)
+}
+
+function invalidateOptimizationPlan(reason = '절단 계산 입력이 변경되어 이전 절단·재고 계획을 무효화했습니다.') {
   const current = project.value.optimization || emptyOptimizationState()
   const existingScraps = current.scraps?.filter((scrap) => scrap.source === 'existing') || []
-  const currentInventory = current.inventory || emptyInventoryCuttingState()
+  const inventory = invalidatedInventory(reason)
   project.value.optimization = {
     ...emptyOptimizationState(),
     catalog: current.catalog || [],
     selectedPanelMaterialId: current.selectedPanelMaterialId || '',
     selectedProfileMaterialId: current.selectedProfileMaterialId || '',
     scraps: existingScraps,
-    inventory: currentInventory.status === 'approved'
-      ? currentInventory
-      : {
-          ...currentInventory,
-          plan: null,
-          status: currentInventory.requirements.length ? 'needs-review' : 'not-ready',
-          lastCalculatedAt: null,
-        },
+    inventory,
   }
   project.value.workflow.optimizationCalculated = false
 }
@@ -616,7 +832,8 @@ function invalidateInventoryPlan() {
   inventory.lastCalculatedAt = null
 }
 
-function refreshInventoryRequirements(members = project.value.optimization.members) {
+function refreshInventoryRequirements(members = project.value.optimization.members, internalOptimization = false) {
+  if (!internalOptimization && workflowBusyBlocks('보유 자재 요구사항을 갱신')) return
   const inventory = ensureInventoryState()
   if (inventory.status === 'approved') {
     setNotice('이미 승인된 보유 자재 예약은 변경하지 않았습니다. 새 계획은 기존 예약을 먼저 처리한 뒤 계산하세요.')
@@ -640,29 +857,39 @@ function refreshInventoryRequirements(members = project.value.optimization.membe
 }
 
 function loadInventorySample() {
+  if (workflowBusyBlocks('보유 자재 예제를 불러오기')) return
   if (inventoryLocked.value) {
     setNotice('승인된 계획이 있어 예제 데이터로 바꾸지 않았습니다.')
     return
   }
+  const currentInventory = ensureInventoryState()
+  if ((currentInventory.requirements.length || currentInventory.ownedMaterials.length || currentInventory.plan) && !window.confirm('현재 입력한 필요 조각·보유 자재·미승인 계획을 지우고 기본 예제로 바꿀까요?')) return
+  invalidateOptimizationPlan('보유 자재 예제를 불러와 이전 절단 최적화 결과를 무효화했습니다.')
   project.value.optimization.inventory = createInventorySampleData()
-  project.value.workflow.optimizationCalculated = false
+  recompute()
+  const assessment = assessCurrentProject(false)
+  setProjectStatus(assessment.status)
   saveProject(project.value)
   setNotice('기본 예제를 불러왔습니다. 계산 후 2,800mm 자재가 먼저 사용되는지 확인하세요.')
 }
 
 function updateInventoryRequirement(requirement: InventoryRequirement) {
+  if (workflowBusyBlocks('보유 자재 요구사항을 변경')) return
   if (inventoryLocked.value) return
   const normalized = normalizeInventoryRequirement({ ...requirement, status: 'needs-review', confirmedAt: null, confirmedBy: null })
   Object.assign(requirement, normalized)
   invalidateInventoryPlan()
+  saveProject(project.value)
 }
 
 function confirmInventoryRequirement(requirement: InventoryRequirement) {
+  if (workflowBusyBlocks('보유 자재 요구사항을 확인')) return
   if (inventoryLocked.value) return
   const normalized = normalizeInventoryRequirement(requirement)
   if (normalized.missingFields.length) {
     requirement.missingFields = normalized.missingFields
     requirement.status = 'needs-review'
+    saveProject(project.value)
     setNotice(`${requirement.zone} · ${requirement.location}: ${normalized.missingFields.join(', ')}를 입력한 뒤 확인하세요.`)
     return
   }
@@ -672,10 +899,12 @@ function confirmInventoryRequirement(requirement: InventoryRequirement) {
     confirmedBy: '사용자 확인',
   })
   invalidateInventoryPlan()
+  saveProject(project.value)
   setNotice(`${requirement.zone} · ${requirement.location} 정보를 확인했습니다.`)
 }
 
 function confirmAllInventoryRequirements() {
+  if (workflowBusyBlocks('보유 자재 요구사항을 일괄 확인')) return
   if (inventoryLocked.value) return
   const requirements = ensureInventoryState().requirements
   let missingCount = 0
@@ -693,6 +922,7 @@ function confirmAllInventoryRequirements() {
     }
   }
   invalidateInventoryPlan()
+  saveProject(project.value)
   setNotice(missingCount ? `${missingCount}개 필요 조각에 확인할 정보가 남아 있습니다.` : '필요 조각을 모두 사용자 확인 상태로 바꿨습니다.')
 }
 
@@ -714,6 +944,7 @@ function resetInventoryStockDraft() {
 }
 
 function addInventoryStock() {
+  if (workflowBusyBlocks('보유 자재를 등록')) return
   if (inventoryLocked.value) {
     setNotice('승인된 계획의 보유 자재는 예약을 해제하기 전까지 수정할 수 없습니다.')
     return
@@ -722,8 +953,8 @@ function addInventoryStock() {
   const widthMm = optionalNumber(inventoryStockDraft.widthMm)
   const lengthMm = optionalNumber(inventoryStockDraft.lengthMm)
   const quantity = optionalNumber(inventoryStockDraft.quantity)
-  if (!inventoryStockDraft.materialName.trim() || !thicknessMm || !widthMm || !lengthMm || !quantity || quantity < 1 || !inventoryStockDraft.surfaceFinish.trim() || !inventoryStockDraft.color.trim() || !inventoryStockDraft.location.trim()) {
-    setNotice('자재 종류·두께·폭·길이·마감·색상·수량·보관 위치를 모두 입력하세요.')
+  if (!inventoryStockDraft.materialName.trim() || !thicknessMm || !widthMm || !lengthMm || !Number.isInteger(quantity) || (quantity as number) < 1 || !inventoryStockDraft.surfaceFinish.trim() || !inventoryStockDraft.color.trim() || !inventoryStockDraft.location.trim()) {
+    setNotice('자재 종류·두께·폭·길이·마감·색상·1 이상의 정수 수량·보관 위치를 모두 입력하세요.')
     return
   }
   const stock: OwnedMaterial = {
@@ -735,7 +966,7 @@ function addInventoryStock() {
     lengthMm,
     surfaceFinish: inventoryStockDraft.surfaceFinish.trim(),
     color: inventoryStockDraft.color.trim(),
-    quantity: Math.floor(quantity),
+    quantity: quantity as number,
     reservedQuantity: 0,
     source: inventoryStockDraft.source,
     usable: inventoryStockDraft.usable,
@@ -753,6 +984,11 @@ function addInventoryStock() {
 }
 
 function removeInventoryStock(stock: OwnedMaterial) {
+  if (workflowBusyBlocks('보유 자재를 삭제')) return
+  if (inventoryLocked.value) {
+    setNotice('승인된 계획의 보유 자재는 예약을 해제하기 전까지 수정할 수 없습니다.')
+    return
+  }
   if (stock.reservedQuantity > 0) {
     setNotice('예약 처리된 자재는 삭제하지 않습니다. 실제 현장 재고를 확인한 뒤 별도 처리하세요.')
     return
@@ -764,6 +1000,7 @@ function removeInventoryStock(stock: OwnedMaterial) {
 }
 
 function calculateInventoryPlanForProject() {
+  if (workflowBusyBlocks('보유 자재 절단 계획을 계산')) return
   if (inventoryLocked.value) {
     setNotice('이미 승인된 계획입니다. 재고 예약을 변경하지 않고 결과만 확인합니다.')
     return
@@ -775,6 +1012,7 @@ function calculateInventoryPlanForProject() {
     settings: inventory.settings,
   })
   inventory.plan = result.plan
+  if (inventory.plan) inventory.plan.sourceFingerprint = inventoryInputFingerprint()
   inventory.status = result.status
   inventory.missingFields = result.missingFields
   inventory.lastCalculatedAt = new Date().toISOString()
@@ -784,9 +1022,14 @@ function calculateInventoryPlanForProject() {
 }
 
 function approveInventoryPlanForProject() {
+  if (workflowBusyBlocks('보유 자재 계획을 승인')) return
   const inventory = ensureInventoryState()
   if (!inventory.plan) {
     setNotice('먼저 보유 자재 기반 절단 계획을 계산하세요.')
+    return
+  }
+  if (!inventory.plan.sourceFingerprint || inventory.plan.sourceFingerprint !== inventoryInputFingerprint()) {
+    setNotice('계획 계산 뒤 요구사항·재고·절단 기준이 달라졌습니다. 다시 계산한 뒤 승인하세요.')
     return
   }
   const result = approveInventoryCutPlan(inventory.plan, inventory.ownedMaterials)
@@ -802,6 +1045,7 @@ function approveInventoryPlanForProject() {
 }
 
 function cancelInventoryPlanForProject() {
+  if (workflowBusyBlocks('보유 자재 계획을 취소')) return
   const inventory = ensureInventoryState()
   if (!inventory.plan || inventory.plan.status !== 'calculated') {
     setNotice('계산 완료 상태의 계획만 취소할 수 있습니다.')
@@ -811,6 +1055,33 @@ function cancelInventoryPlanForProject() {
   inventory.status = 'cancelled'
   saveProject(project.value)
   setNotice('절단 계획을 취소했습니다. 실제 재고 예약은 변경하지 않았습니다.')
+}
+
+function releaseApprovedInventoryPlanForProject() {
+  if (workflowBusyBlocks('재고 예약을 해제')) return
+  const inventory = ensureInventoryState()
+  if (!inventory.plan || inventory.plan.status !== 'approved') {
+    setNotice('승인되어 재고가 예약된 계획만 해제할 수 있습니다.')
+    return
+  }
+  if (!window.confirm('예약 수량을 되돌리고 이 절단 계획을 취소할까요?')) return
+  const result = releaseInventoryCutPlanReservation(inventory.plan, inventory.ownedMaterials)
+  if (!result.ok) {
+    setNotice(result.message)
+    return
+  }
+  inventory.plan = result.plan
+  inventory.ownedMaterials = result.ownedMaterials
+  inventory.status = 'cancelled'
+  saveProject(project.value)
+  setNotice(result.message)
+}
+
+function updateInventorySettings() {
+  if (workflowBusyBlocks('보유 자재 절단 기준을 변경')) return
+  if (inventoryLocked.value) return
+  invalidateInventoryPlan()
+  saveProject(project.value)
 }
 
 function inventorySourceLabel(source: InventoryStockSource) {
@@ -838,6 +1109,10 @@ function inventoryNumber(value: number | null | undefined) {
 
 function runOptimization() {
   if (isOptimizing.value) return
+  if (inventoryLocked.value) {
+    setNotice('승인된 보유 자재 계획의 예약을 해제한 뒤 절단 최적화를 다시 계산하세요.')
+    return
+  }
   if (!project.value.workflow.takeoffCalculated) {
     setNotice('먼저 벽체별 자재 수량을 계산하세요.')
     scrollToSection('takeoff')
@@ -845,8 +1120,8 @@ function runOptimization() {
   }
   isOptimizing.value = true
   try {
-    const panelMaterial = project.value.optimization.catalog.find((item) => item.id === project.value.optimization.selectedPanelMaterialId) || null
-    const membersResult = buildOptimizationMembers(project.value.walls, project.value.settings, project.value.optimization.selectedPanelMaterialId, panelMaterial)
+    const panelMaterial = project.value.optimization.catalog.find((item) => item.id === project.value.optimization.selectedPanelMaterialId && item.materialType === 'panel') || null
+    const membersResult = buildOptimizationMembers(project.value.walls, project.value.settings, panelMaterial?.id || '', panelMaterial)
     const result = optimizeCuttingPlan({
       walls: project.value.walls,
       members: membersResult.members,
@@ -862,23 +1137,39 @@ function runOptimization() {
     project.value.optimization.validation = result.validation
     project.value.optimization.scraps = result.scraps
     project.value.optimization.lastCalculatedAt = new Date().toISOString()
-    refreshInventoryRequirements(result.members)
-    project.value.workflow.optimizationCalculated = true
+    project.value.optimization.sourceFingerprint = optimizationInputFingerprint()
+    refreshInventoryRequirements(result.members, true)
+    const optimizationReady = result.status === 'calculated' && result.validation.passed
+    project.value.workflow.optimizationCalculated = optimizationReady
     selectedOptimizationPlanId.value = ''
-    project.value.status = result.status === 'calculated' ? 'completed' : 'partial'
-    project.value.statusMessage = result.status === 'calculated'
-      ? '절단 배치와 비용 비교가 완료되었습니다.'
-      : '절단 배치는 계산했지만 가격·규격·도면 근거 확인이 필요합니다.'
+    recompute()
+    const assessment = assessCurrentProject(false)
+    const statusMessage = optimizationReady
+      ? (assessment.status === 'completed'
+          ? '절단 배치 검증과 프로젝트 발주 검증이 모두 완료되었습니다.'
+          : '절단 배치는 검증했지만 프로젝트 발주 요건에 확인할 항목이 남아 있습니다.')
+      : (result.status === 'calculated'
+          ? '절단 결과에 검증 오류가 있어 발주용 출력을 잠금 처리했습니다.'
+          : '절단 배치는 계산했지만 가격·규격·도면 근거 확인이 필요합니다.')
+    setProjectStatus(assessment.status, statusMessage)
     saveProject(project.value)
-    setNotice(result.status === 'calculated' ? '총비용·폐기량·작업 단순안을 비교했습니다.' : '계산 결과에 확인 필요 항목이 있습니다. 임의의 비용은 표시하지 않았습니다.')
+    setNotice(optimizationReady
+      ? (assessment.status === 'completed' ? '검증을 통과한 총비용·폐기량·작업 단순안을 비교했습니다.' : '절단 배치는 검증했습니다. 발주 전 남은 프로젝트 확인 항목을 처리하세요.')
+      : '계산 결과에 확인 필요 또는 검증 오류가 있어 발주용 출력을 생성하지 않습니다.')
   } finally {
     isOptimizing.value = false
   }
 }
 
 function chooseOptimizationScenario(id: 'cost' | 'waste' | 'simple') {
+  if (workflowBusyBlocks('최적화 시나리오를 변경')) return
+  if (!project.value.optimization.scenarios.some((scenario) => scenario.id === id)) return
   project.value.optimization.selectedScenarioId = id
   selectedOptimizationPlanId.value = ''
+  recompute()
+  const assessment = assessCurrentProject(false)
+  setProjectStatus(assessment.status)
+  saveProject(project.value)
 }
 
 function formatOptimizationCost(value: number | null) {
@@ -890,6 +1181,8 @@ function formatOptimizationMm(value: number | null) {
 }
 
 function addExistingScrap() {
+  if (approvedInventoryBlocks('현장 자투리를 추가')) return
+  if (workflowBusyBlocks('현장 자투리를 추가')) return
   const material = project.value.optimization.catalog.find((item) => item.id === scrapDraft.materialId)
   const lengthMm = optionalNumber(scrapDraft.lengthMm)
   if (!material || lengthMm === null || lengthMm <= 0) {
@@ -926,14 +1219,20 @@ function addExistingScrap() {
   invalidateOptimizationPlan()
   Object.assign(scrapDraft, { materialId: '', widthMm: '', lengthMm: '', currentLocation: '', originZone: '', usableZones: '', plannedUseMemberId: '', generatedAt: '', plannedUseAt: '' })
   scrapFormOpen.value = false
+  saveProject(project.value)
 }
 
 function removeExistingScrap(id: string) {
+  if (approvedInventoryBlocks('현장 자투리를 삭제')) return
+  if (workflowBusyBlocks('현장 자투리를 삭제')) return
   project.value.optimization.scraps = project.value.optimization.scraps.filter((scrap) => scrap.id !== id)
   invalidateOptimizationPlan()
+  saveProject(project.value)
 }
 
 function saveOptimizationReviewValue(item: OptimizationReviewItem) {
+  if (approvedInventoryBlocks('최적화 확인값을 변경')) return
+  if (workflowBusyBlocks('최적화 확인값을 변경')) return
   const value = optimizationReviewDrafts[item.id]?.trim()
   if (!value) {
     setNotice('수정할 값을 입력하거나 원본 분석·자재 카탈로그에서 값을 먼저 수정하세요.')
@@ -951,6 +1250,19 @@ function saveOptimizationReviewValue(item: OptimizationReviewItem) {
       'disposalCostPerM2', 'disposalCostPerM', 'temporaryStorageCostPerDay',
       'lapAllowanceMm', 'minimumReusableOffcutMm', 'reworkRiskCost',
     ]
+    if (item.targetField === 'stockLengthOptionsMm') {
+      const parsedOptions = numberList(value)
+      if (!parsedOptions.length) {
+        setNotice('비교 원자재 길이는 0보다 큰 숫자로 입력하세요.')
+        return
+      }
+      material.stockLengthOptionsMm = parsedOptions
+      item.editableValue = value
+      optimizationReviewDrafts[item.id] = ''
+      setNotice('비교 원자재 길이를 반영하고 절단 배치를 다시 계산합니다.')
+      runOptimization()
+      return
+    }
     const parsed = Number(value.replace(/,/g, ''))
     if (numericFields.includes(item.targetField) && (!Number.isFinite(parsed) || parsed < 0)) {
       setNotice('수정값은 0 이상의 숫자로 입력하세요.')
@@ -966,6 +1278,7 @@ function saveOptimizationReviewValue(item: OptimizationReviewItem) {
   item.editableValue = value
   item.reason = `${item.reason} 확인 요청값: ${value}`
   optimizationReviewDrafts[item.id] = ''
+  saveProject(project.value)
   setNotice('확인 요청값을 기록했습니다. 원본 분석값 또는 자재 카탈로그를 수정한 뒤 다시 계산하세요.')
 }
 
@@ -1039,20 +1352,52 @@ function optimizationValidationMessages() {
 }
 
 function exportSelectedOptimization(kind: 'plans' | 'members' | 'orders' | 'scraps' | 'comparison' | 'inputs') {
+  if (!canDownloadOptimization.value) {
+    setNotice('절단 최적화 계산과 배치 검증을 통과한 뒤에만 발주용 파일을 내려받을 수 있습니다.')
+    return
+  }
   const scenario = optimizationScenario.value
   if (!scenario) {
     setNotice('먼저 절단 최적화를 계산하세요.')
     return
   }
-  if (kind === 'plans') downloadCuttingPlansCsv(scenario)
+  if (kind === 'plans') {
+    if (inventoryPlan.value?.status === 'calculated') {
+      setNotice('보유 자재 계획을 승인하거나 취소한 뒤 현장 절단 계획을 내려받으세요.')
+      return
+    }
+    if (inventoryPlan.value?.status === 'approved') downloadInventoryCutPlanCsv(inventoryPlan.value)
+    else downloadCuttingPlansCsv(scenario)
+  }
   if (kind === 'members') downloadCuttingMembersCsv(project.value.optimization.members)
-  if (kind === 'orders') downloadOptimizationOrderCsv(scenario, project.value.optimization.catalog)
-  if (kind === 'scraps') downloadScrapsCsv(scenario.scraps)
+  if (kind === 'orders') {
+    if (inventoryPlan.value?.status === 'calculated') {
+      setNotice('보유 자재 계획을 승인하거나 취소한 뒤 발주서를 내려받으세요.')
+      return
+    }
+    if (inventoryPlan.value?.status === 'approved') downloadInventoryOrderCsv(inventoryPlan.value)
+    else downloadOptimizationOrderCsv(scenario, project.value.optimization.catalog)
+  }
+  if (kind === 'scraps') {
+    if (inventoryPlanControlsFieldOutputs.value) {
+      setNotice('보유 자재 계획 사용 중에는 재고를 반영하지 않은 최적화 자투리 목록을 현장 출력으로 제공하지 않습니다.')
+      return
+    }
+    downloadScrapsCsv(scenario.scraps)
+  }
   if (kind === 'comparison') downloadScenarioComparisonCsv(project.value.optimization.scenarios)
   if (kind === 'inputs') downloadOptimizationInputsCsv(project.value.optimization.catalog, project.value.optimization.members)
 }
 
 function printSelectedCuttingPlans() {
+  if (!canDownloadOptimization.value) {
+    setNotice('절단 최적화 계산과 배치 검증을 통과한 뒤에만 배치도를 인쇄할 수 있습니다.')
+    return
+  }
+  if (inventoryPlanControlsFieldOutputs.value) {
+    setNotice('보유 자재 계획 사용 중에는 재고를 반영하지 않은 원자재 비교 배치도를 현장 작업용으로 인쇄하지 않습니다. 승인 재고 절단 계획 CSV를 사용하세요.')
+    return
+  }
   const scenario = optimizationScenario.value
   if (!scenario) {
     setNotice('먼저 절단 최적화를 계산하세요.')
@@ -1062,7 +1407,12 @@ function printSelectedCuttingPlans() {
 }
 
 function recompute() {
-  const extractedDimensions = project.value.files.flatMap((file) => file.pages.flatMap((page) => page.dimensions))
+  // Cost-table numbers are parsed only by the cost summary module. Keeping
+  // phone/account-like numbers in the geometry dimension graph would both
+  // pollute wall inference and duplicate sensitive source text in storage.
+  const extractedDimensions = project.value.files.flatMap((file) => file.pages
+    .filter((page) => !isCostSummaryPage(file, page))
+    .flatMap((page) => page.dimensions))
   // User-confirmed values are the source of truth when a previous review edited one.
   const userValues = new Map(project.value.dimensions.filter((dimension) => dimension.userEdited).map((dimension) => [dimension.id, dimension]))
   const dimensions = extractedDimensions.map((dimension) => {
@@ -1077,6 +1427,20 @@ function recompute() {
     project.value.dimensions = project.value.dimensions.map((dimension) => conflictDimensionIds.has(dimension.id) && !dimension.userEdited
       ? { ...dimension, confidence: 'low' }
       : dimension)
+  }
+  const hasOptimizationResult = project.value.optimization.scenarios.length > 0 || project.value.workflow.optimizationCalculated
+  if (hasOptimizationResult && !optimizationResultsAreCurrent()) {
+    invalidateOptimizationPlan('현재 도면·자재 입력과 저장된 절단안의 생성 근거가 달라 이전 결과를 무효화했습니다.')
+  }
+  const currentInventory = ensureInventoryState()
+  if (currentInventory.plan && ['calculated', 'approved'].includes(currentInventory.plan.status) && !inventoryPlanIsCurrent()) {
+    if (currentInventory.plan.status === 'approved') {
+      currentInventory.missingFields = [...new Set([...currentInventory.missingFields, '승인된 예약 계획의 생성 근거가 현재 입력과 다릅니다. 예약 해제 후 다시 계산하세요.'])]
+    } else {
+      currentInventory.plan = null
+      currentInventory.status = currentInventory.requirements.length ? 'needs-review' : 'not-ready'
+      currentInventory.missingFields = ['현재 요구사항·재고·절단 기준과 저장된 계획의 생성 근거가 달라 다시 계산해야 합니다.']
+    }
   }
   project.value.model = buildBuildingGeometry(project.value.walls, project.value.settings.panelThicknessMm, extractRoofGeometry(project.value.files, project.value.walls))
   project.value.heightCandidates = buildHeightCandidates(project.value.files, project.value.dimensions, project.value.walls)
@@ -1096,7 +1460,7 @@ function recompute() {
     takeoffs: project.value.takeoffs,
     optimization: project.value.optimization,
     workflow: project.value.workflow,
-    actualData: project.value.files.some((file) => file.pages.length > 0 && file.kind !== 'cost-summary'),
+    actualData: project.value.files.some((file) => file.pages.some((page) => !isCostSummaryPage(file, page))),
     testData: false,
   })
   const wallValidation = new Map(project.value.consistencyValidation.wallResults.map((result) => [result.wallId, result.status]))
@@ -1123,9 +1487,9 @@ function recompute() {
   }))
   project.value.reviewItems = [...new Set([...dimensionReviewItems, ...conflictReviewItems])]
   project.value.costSummary = parseCostSummaries(project.value.files)
-  const firstSource = project.value.files.find((file) => file.pages.length && file.kind !== 'cost-summary') || project.value.files.find((file) => file.pages.length)
+  const firstSource = project.value.files.find((file) => file.pages.some((page) => !isCostSummaryPage(file, page))) || project.value.files.find((file) => file.pages.length)
   if (firstSource) {
-    const sourcePage = firstSource.pages[0]
+    const sourcePage = firstSource.pages.find((page) => !isCostSummaryPage(firstSource, page)) || firstSource.pages[0]
     project.value.buildingName = guessBuildingName(sourcePage?.text || '', firstSource.name)
   } else if (!project.value.files.length) {
     project.value.buildingName = '아직 도면을 올리지 않았습니다'
@@ -1140,7 +1504,10 @@ function classifyFile(file: AnalyzedFile, pages: DrawingPage[]) {
   const text = pages.map((page) => page.text).join('\n')
   const pageKinds = pages.map((page) => page.kind)
   const classification = classifyDocument(text, file.name)
-  const priority: DrawingKind[] = ['cost-summary', 'floor-plan', 'elevation', 'section', 'detail', 'structural', 'material-schedule', 'unknown']
+  // A bound PDF can contain drawings and a cost appendix. Keep page kinds as
+  // the source of truth and present a drawing kind at file level when both
+  // are present, so legacy file-level UI does not hide the usable pages.
+  const priority: DrawingKind[] = ['floor-plan', 'elevation', 'section', 'detail', 'structural', 'material-schedule', 'cost-summary', 'unknown']
   const strongestKind = priority.find((kind) => pageKinds.includes(kind)) || classification.kind
   const selectedPage = pages.find((page) => page.kind === strongestKind) || pages[0]
   file.kind = strongestKind
@@ -1150,6 +1517,29 @@ function classifyFile(file: AnalyzedFile, pages: DrawingPage[]) {
 
 function nextUiTick() {
   return new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+}
+
+function preferredScrollBehavior(): 'auto' | 'smooth' {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'
+}
+
+async function withAnalysisGuard(task: () => Promise<void>) {
+  if (isAnalyzing.value) {
+    setNotice('현재 파일 분석이 끝난 뒤 다시 시도해 주세요.')
+    return
+  }
+  isAnalyzing.value = true
+  try {
+    await task()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '파일 분석 중 예상하지 못한 오류가 발생했습니다.'
+    setProjectStatus('failed', message)
+    saveProject(project.value)
+    setNotice(message)
+  } finally {
+    isAnalyzing.value = false
+    isDragging.value = false
+  }
 }
 
 function setAnalysisStage(meta: AnalyzedFile, stage: AnalyzedFile['stage'], progress?: number) {
@@ -1169,7 +1559,6 @@ function needsReview(meta: AnalyzedFile) {
 }
 
 async function analyzeOne(file: File, meta: AnalyzedFile) {
-  resetWorkflow()
   meta.status = 'analyzing'
   setAnalysisStage(meta, 'uploading', 1)
   meta.error = ''
@@ -1188,12 +1577,14 @@ async function analyzeOne(file: File, meta: AnalyzedFile) {
     }
     setAnalysisStage(meta, 'extracting', 10)
     if (extensionOf(file.name) === 'pdf') {
+      const { extractPdfDocument } = await import('./modules/pdf-extractor')
       const result = await extractPdfDocument(file, meta.id, (progress) => { meta.progress = progress })
       meta.pages = result.pages
       meta.previewUrl = result.pages[0]?.previewUrl || ''
       setAnalysisStage(meta, 'classifying', 94)
       classifyFile(meta, result.pages)
     } else {
+      const { analyzeImage } = await import('./modules/ocr-analyzer')
       const result = await analyzeImage(file, meta.id, (progress) => { meta.progress = progress })
       meta.pages = [result.page]
       meta.previewUrl = result.page.previewUrl
@@ -1223,33 +1614,32 @@ async function analyzeOne(file: File, meta: AnalyzedFile) {
 }
 
 async function analyzeFiles(files: File[]) {
-  if (isAnalyzing.value) {
-    setNotice('현재 파일 분석이 끝난 뒤 추가 파일을 올려주세요.')
-    return
-  }
-  const queued = files.map((file) => {
-    const meta = createQueuedFile(file)
-    sourceFiles.set(meta.id, file)
-    project.value.files.push(meta)
-    return { file, meta }
+  if (!files.length) return
+  if (approvedInventoryBlocks('도면 파일을 추가')) return
+  if (workflowBusyBlocks('도면 파일을 추가')) return
+  await withAnalysisGuard(async () => {
+    const queued = files.map((file) => {
+      const meta = createQueuedFile(file)
+      sourceFiles.set(meta.id, file)
+      project.value.files.push(meta)
+      return { file, meta }
+    })
+    resetWorkflow()
+    setProjectStatus('uploading', '업로드한 파일을 프로젝트에 등록했습니다.')
+    recompute()
+    for (const item of queued) {
+      if (item.meta.status === 'failed') continue
+      await analyzeOne(item.file, item.meta)
+    }
+    setProjectStatus('linking', '모든 파일의 분석 결과를 하나의 프로젝트로 연결하고 있습니다.')
+    await nextUiTick()
+    recompute()
+    const assessment = assessCurrentProject(false)
+    setProjectStatus(assessment.status === 'failed' ? 'failed' : 'needs-review', assessment.status === 'failed' ? '처리 가능한 설계도 파일이 없습니다.' : PROJECT_STATUS_DESCRIPTIONS['needs-review'])
+    saveProject(project.value)
+    const analyzedCount = queued.filter((item) => item.meta.status !== 'failed').length
+    if (analyzedCount) setNotice(`${analyzedCount}개 파일의 분석이 완료되었습니다. 근거와 경고를 확인하세요.`)
   })
-  resetWorkflow()
-  setProjectStatus('uploading', '업로드한 파일을 프로젝트에 등록했습니다.')
-  recompute()
-  isAnalyzing.value = true
-  for (const item of queued) {
-    if (item.meta.status === 'failed') continue
-    await analyzeOne(item.file, item.meta)
-  }
-  isAnalyzing.value = false
-  setProjectStatus('linking', '모든 파일의 분석 결과를 하나의 프로젝트로 연결하고 있습니다.')
-  await nextUiTick()
-  recompute()
-  const assessment = workflowAssessment.value
-  setProjectStatus(assessment.status === 'failed' ? 'failed' : 'needs-review', assessment.status === 'failed' ? '처리 가능한 설계도 파일이 없습니다.' : PROJECT_STATUS_DESCRIPTIONS['needs-review'])
-  saveProject(project.value)
-  const analyzedCount = queued.filter((item) => item.meta.status !== 'failed').length
-  if (analyzedCount) setNotice(`${analyzedCount}개 파일의 분석이 완료되었습니다. 근거와 경고를 확인하세요.`)
 }
 
 function handleInput(event: Event) {
@@ -1260,15 +1650,25 @@ function handleInput(event: Event) {
 
 function handleDrop(event: DragEvent) {
   isDragging.value = false
+  if (isWorkflowBusy.value) {
+    setNotice('현재 분석 또는 계산이 끝난 뒤 추가 파일을 올려주세요.')
+    return
+  }
   const files = event.dataTransfer?.files
   if (files?.length) void analyzeFiles(Array.from(files))
 }
 
 function triggerFileInput() {
+  if (isWorkflowBusy.value) {
+    setNotice('현재 분석 또는 계산이 끝난 뒤 추가 파일을 올려주세요.')
+    return
+  }
   fileInput.value?.click()
 }
 
 function removeFile(fileId: string) {
+  if (approvedInventoryBlocks('도면 파일을 삭제')) return
+  if (workflowBusyBlocks('도면 파일을 삭제')) return
   const file = project.value.files.find((item) => item.id === fileId)
   if (!file) return
   project.value.files = project.value.files.filter((item) => item.id !== fileId)
@@ -1277,27 +1677,36 @@ function removeFile(fileId: string) {
   if (selectedPageId.value.startsWith(fileId)) selectedPageId.value = ''
   if (selectedHeightCandidateId.value && !project.value.heightCandidates.some((candidate) => candidate.candidateId === selectedHeightCandidateId.value)) selectedHeightCandidateId.value = ''
   recompute()
-  if (!project.value.files.length) setProjectStatus('empty')
+  if (!project.value.files.length) {
+    setProjectStatus('empty')
+    showTestModel.value = false
+    scrollToSection('upload')
+  }
   else setProjectStatus('needs-review', '파일이 변경되었습니다. 연결 결과와 신뢰도를 다시 확인하세요.')
   saveProject(project.value)
   setNotice(`${file.name} 파일을 프로젝트에서 제거했습니다.`)
 }
 
 async function reanalyze(fileId: string) {
-  const file = sourceFiles.get(fileId)
-  const meta = project.value.files.find((item) => item.id === fileId)
-  if (!file || !meta) {
-    setNotice('새로고침 후에는 원본 파일을 다시 올려야 재분석할 수 있습니다.')
-    return
-  }
-  resetWorkflow()
-  setProjectStatus('uploading', `${meta.name} 파일을 다시 분석하고 있습니다.`)
-  await analyzeOne(file, meta)
-  setProjectStatus('linking', '다시 분석한 결과를 기존 프로젝트와 연결하고 있습니다.')
-  recompute()
-  const assessment = workflowAssessment.value
-  setProjectStatus(assessment.status === 'failed' ? 'failed' : 'needs-review', assessment.status === 'failed' ? '처리 가능한 설계도 파일이 없습니다.' : PROJECT_STATUS_DESCRIPTIONS['needs-review'])
-  saveProject(project.value)
+  if (approvedInventoryBlocks('도면을 다시 분석')) return
+  if (workflowBusyBlocks('도면을 다시 분석')) return
+  await withAnalysisGuard(async () => {
+    const file = sourceFiles.get(fileId)
+    const meta = project.value.files.find((item) => item.id === fileId)
+    if (!file || !meta) {
+      setNotice('새로고침 후에는 원본 파일을 다시 올려야 재분석할 수 있습니다.')
+      return
+    }
+    resetWorkflow()
+    setProjectStatus('uploading', `${meta.name} 파일을 다시 분석하고 있습니다.`)
+    await analyzeOne(file, meta)
+    setProjectStatus('linking', '다시 분석한 결과를 기존 프로젝트와 연결하고 있습니다.')
+    await nextUiTick()
+    recompute()
+    const assessment = assessCurrentProject(false)
+    setProjectStatus(assessment.status === 'failed' ? 'failed' : 'needs-review', assessment.status === 'failed' ? '처리 가능한 설계도 파일이 없습니다.' : PROJECT_STATUS_DESCRIPTIONS['needs-review'])
+    saveProject(project.value)
+  })
 }
 
 function syncDimensionToPages(dimension: DimensionValue) {
@@ -1336,7 +1745,7 @@ function selectHeightCandidate(candidateOrId: HeightCandidate | string) {
   if (page) selectedPageId.value = page.id
   activeSection.value = 'analysis'
   void nextTick(() => {
-    document.querySelector('.source-panel')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    document.querySelector('.source-panel')?.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'center' })
   })
 }
 
@@ -1353,6 +1762,8 @@ function heightReviewActionLabel(action: HeightReviewAction) {
 }
 
 function reviewHeightCandidate(candidateOrId: HeightCandidate | string, action: HeightReviewAction, overrideValueMm?: number) {
+  if (approvedInventoryBlocks('높이 검토값을 변경')) return
+  if (workflowBusyBlocks('높이 후보를 검토')) return
   const candidate = heightCandidateForEntry(candidateOrId)
   if (!candidate) return
   const existing = project.value.dimensions.find((dimension) => dimension.id === candidate.candidateId)
@@ -1394,6 +1805,10 @@ function reviewHeightCandidate(candidateOrId: HeightCandidate | string, action: 
       project.value.takeoffs = calculateTakeoffs(project.value.walls, project.value.settings)
       project.value.workflow.takeoffCalculated = true
     }
+    // Rebuild consistency and workflow gates after restoring the derived
+    // model/takeoff flags. Otherwise the first recompute's "takeoff missing"
+    // result would be persisted even though fresh rows now exist.
+    recompute()
   }
   const recalculated = project.value.dimensions.find((dimension) => dimension.id === next.id)
   if (recalculated) {
@@ -1407,6 +1822,8 @@ function reviewHeightCandidate(candidateOrId: HeightCandidate | string, action: 
 }
 
 function updateDimension(payload: { id: string; valueMm: number; displayValue: string }) {
+  if (approvedInventoryBlocks('도면 치수를 변경')) return
+  if (workflowBusyBlocks('도면 치수를 수정')) return
   const candidate = heightCandidateForEntry(payload.id)
   if (candidate) {
     const draft = heightReviewDraft(candidate)
@@ -1447,6 +1864,7 @@ function updateDimension(payload: { id: string; valueMm: number; displayValue: s
 }
 
 async function build3DModel() {
+  if (approvedInventoryBlocks('3차원 모델을 다시 생성')) return
   if (isBuilding3D.value) return
   if (!canBuild3D.value) {
     setProjectStatus('needs-review', project.value.heightDiagnostics.message || '높이·벽체 길이를 확인해야 3차원 모델을 만들 수 있습니다.')
@@ -1454,7 +1872,9 @@ async function build3DModel() {
     scrollToSection('analysis')
     return
   }
-  project.value.workflow.reviewConfirmed = true
+  invalidateOptimizationPlan('3차원 모델을 다시 만들어 이전 절단·재고 계획을 무효화했습니다.')
+  const reviewConfirmed = canConfirmReview.value
+  project.value.workflow.reviewConfirmed = reviewConfirmed
   project.value.workflow.modelBuilt = false
   project.value.workflow.takeoffCalculated = false
   isBuilding3D.value = true
@@ -1468,7 +1888,9 @@ async function build3DModel() {
       return
     }
     project.value.workflow.modelBuilt = true
-    setProjectStatus('partial', project.value.model.partial ? '높이가 확인된 벽체만 부분 3차원 모델로 만들었습니다. 누락 벽체는 높이 확인 후 추가됩니다.' : '3차원 모델이 생성되었습니다. 벽체를 검토한 뒤 자재 계산을 시작하세요.')
+    setProjectStatus('partial', reviewConfirmed
+      ? '3차원 모델이 생성되었습니다. 벽체를 검토한 뒤 자재 계산을 시작하세요.'
+      : '확인 가능한 벽체만 부분 모델로 표시했습니다. 검토 항목을 해결하기 전에는 자재 계산과 발주 출력을 진행할 수 없습니다.')
     saveProject(project.value)
     scrollToSection('model')
   } finally {
@@ -1477,29 +1899,22 @@ async function build3DModel() {
 }
 
 async function calculateMaterials() {
+  if (approvedInventoryBlocks('자재 수량을 다시 계산')) return
   if (isCalculating.value) return
   if (!canCalculateMaterials.value) {
     setNotice('먼저 검토를 완료하고 3차원 모델을 생성하세요.')
     scrollToSection('model')
     return
   }
+  invalidateOptimizationPlan('자재 수량을 다시 계산해 이전 절단·재고 계획을 무효화했습니다.')
   isCalculating.value = true
   try {
     setProjectStatus('calculating', '벽체별 실제 배치 기준으로 판넬과 부자재 수량을 계산하고 있습니다.')
     await nextUiTick()
     project.value.takeoffs = calculateTakeoffs(project.value.walls, project.value.settings)
     project.value.workflow.takeoffCalculated = true
-    const assessment = assessProjectWorkflow({
-      files: project.value.files,
-      workflow: project.value.workflow,
-      model: project.value.model,
-      takeoffs: project.value.takeoffs,
-      missingItems: project.value.missingItems,
-      reviewItems: project.value.reviewItems,
-      consistency: project.value.consistencyValidation,
-      isAnalyzing: false,
-      currentStatus: 'calculating',
-    })
+    recompute()
+    const assessment = assessCurrentProject(false, 'calculating')
     setProjectStatus(assessment.status, assessment.status === 'completed'
       ? PROJECT_STATUS_DESCRIPTIONS.completed
       : '수량은 계산됐지만 일부 벽체 또는 근거는 발주 전 검토가 필요합니다.')
@@ -1517,11 +1932,12 @@ function selectWall(wallId: string) {
   selectedWallId.value = wallId
   if (activeSection.value !== 'model') {
     activeSection.value = 'model'
-    window.scrollTo({ top: 0, behavior: 'smooth' })
+    window.scrollTo({ top: 0, behavior: preferredScrollBehavior() })
   }
   void nextTick(() => {
     const element = document.getElementById('wall-detail')
-    element?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (element instanceof HTMLElement) element.focus({ preventScroll: true })
+    element?.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'center' })
   })
 }
 
@@ -1533,8 +1949,22 @@ function toggleTestModel() {
     : '실제 설계도 분석 모델로 돌아왔습니다.')
 }
 
-function scrollToSection(section: string) {
+function focusSectionHeading(section: WorkflowSection) {
+  void nextTick(() => {
+    const sectionElement = document.getElementById(section)
+    const heading = sectionElement?.querySelector('h1, h2')
+    if (!(heading instanceof HTMLElement)) return
+    heading.tabIndex = -1
+    heading.focus({ preventScroll: true })
+  })
+}
+
+function scrollToSection(section: WorkflowSection) {
   if (section === 'analysis' && !workflowStepEnabled('analysis')) {
+    setNotice('먼저 파일을 업로드하세요.')
+    return
+  }
+  if (section === 'model' && !workflowStepEnabled('model')) {
     setNotice('먼저 파일을 업로드하세요.')
     return
   }
@@ -1547,11 +1977,16 @@ function scrollToSection(section: string) {
     return
   }
   activeSection.value = section
-  window.scrollTo({ top: 0, behavior: 'smooth' })
+  window.scrollTo({ top: 0, behavior: preferredScrollBehavior() })
+  focusSectionHeading(section)
 }
 
 function resetProject() {
-  if (!window.confirm('현재 프로젝트와 로컬 저장 결과를 지울까요?')) return
+  if (workflowBusyBlocks('프로젝트를 초기화')) return
+  const resetMessage = inventoryLocked.value
+    ? '승인된 재고 예약 기록을 포함해 현재 프로젝트와 로컬 저장 결과를 모두 지울까요? 이 작업은 되돌릴 수 없습니다.'
+    : '현재 프로젝트와 로컬 저장 결과를 지울까요?'
+  if (!window.confirm(resetMessage)) return
   clearProject()
   sourceFiles.clear()
   project.value = makeProject()
@@ -1559,6 +1994,11 @@ function resetProject() {
   selectedPageId.value = ''
   selectedWallId.value = ''
   selectedHeightCandidateId.value = ''
+  selectedOptimizationPlanId.value = ''
+  showTestModel.value = false
+  showFileList.value = false
+  settingsError.value = ''
+  scrollToSection('upload')
   setNotice('새 프로젝트를 시작했습니다.')
 }
 
@@ -1670,9 +2110,13 @@ function fileAnalysisSummary(file: AnalyzedFile) {
     autoLinked: autoLinked.length,
     reviewCount,
     ocr: ocrUnavailable ? '사용 불가' : ocrExecuted ? '실행됨' : file.extension === 'pdf' ? '필요 없음 · PDF 글자' : '결과 없음',
-    can3d: file.kind !== 'cost-summary' && [...pageWallIds].some((wallId) => modelWallIds.has(wallId)),
+    can3d: file.pages.some((page) => !isCostSummaryPage(file, page)) && [...pageWallIds].some((wallId) => modelWallIds.has(wallId)),
     canMaterial: [...pageWallIds].some((wallId) => takeoffWallIds.has(wallId)),
   }
+}
+
+function fileIsCostOnly(file: AnalyzedFile) {
+  return file.pages.length ? file.pages.every((page) => isCostSummaryPage(file, page)) : file.kind === 'cost-summary'
 }
 
 function pageAnalysisSummary(file: AnalyzedFile, page: DrawingPage) {
@@ -1764,7 +2208,7 @@ onMounted(() => {
         </button>
         <div class="topbar-actions">
           <span class="local-badge"><i /> 이 컴퓨터에서 안전하게 분석</span>
-          <button type="button" class="new-project-button" @click="resetProject">새 프로젝트</button>
+          <button type="button" class="new-project-button" :disabled="isWorkflowBusy" @click="resetProject">새 프로젝트</button>
         </div>
       </div>
     </header>
@@ -1786,19 +2230,19 @@ onMounted(() => {
           <p>{{ projectStatusDescription }}</p>
         </div>
         <nav class="step-nav" aria-label="프로젝트 단계">
-          <button type="button" :class="{ active: activeSection === 'upload' }" @click="scrollToSection('upload')">
+          <button type="button" :class="{ active: activeSection === 'upload' }" :aria-current="activeSection === 'upload' ? 'step' : undefined" @click="scrollToSection('upload')">
             <span class="step-number">01</span><span><b>도면 업로드</b><small>파일을 모아 분석</small></span>
           </button>
-          <button type="button" :class="{ active: activeSection === 'analysis' }" :disabled="!workflowStepEnabled('analysis')" @click="scrollToSection('analysis')">
+          <button type="button" :class="{ active: activeSection === 'analysis' }" :aria-current="activeSection === 'analysis' ? 'step' : undefined" :disabled="!workflowStepEnabled('analysis')" @click="scrollToSection('analysis')">
             <span class="step-number">02</span><span><b>자동 분석 결과</b><small>치수·근거·검토</small></span>
           </button>
-          <button type="button" :class="{ active: activeSection === 'model' }" :disabled="!workflowStepEnabled('model')" @click="scrollToSection('model')">
+          <button type="button" :class="{ active: activeSection === 'model' }" :aria-current="activeSection === 'model' ? 'step' : undefined" :disabled="!workflowStepEnabled('model')" @click="scrollToSection('model')">
             <span class="step-number">03</span><span><b>3차원 모델</b><small>벽체를 눌러 확인</small></span>
           </button>
-          <button type="button" :class="{ active: activeSection === 'takeoff' }" :disabled="!workflowStepEnabled('takeoff')" @click="scrollToSection('takeoff')">
+          <button type="button" :class="{ active: activeSection === 'takeoff' }" :aria-current="activeSection === 'takeoff' ? 'step' : undefined" :disabled="!workflowStepEnabled('takeoff')" @click="scrollToSection('takeoff')">
             <span class="step-number">04</span><span><b>발주 산출표</b><small>기준 입력·내보내기</small></span>
           </button>
-          <button type="button" :class="{ active: activeSection === 'optimization' }" :disabled="!workflowStepEnabled('optimization')" @click="scrollToSection('optimization')">
+          <button type="button" :class="{ active: activeSection === 'optimization' }" :aria-current="activeSection === 'optimization' ? 'step' : undefined" :disabled="!workflowStepEnabled('optimization')" @click="scrollToSection('optimization')">
             <span class="step-number">05</span><span><b>절단 최적화</b><small>자투리·비용 비교</small></span>
           </button>
         </nav>
@@ -1810,12 +2254,13 @@ onMounted(() => {
 
       <div class="content-column">
         <section class="workflow-progress" aria-labelledby="workflow-title">
+          <span class="visually-hidden" role="progressbar" aria-label="프로젝트 작업 진행률" aria-valuemin="1" :aria-valuemax="workflowSteps.length" :aria-valuenow="Math.min(workflowSteps.length, workflowProgressIndex + 1)" :aria-valuetext="`${Math.min(workflowSteps.length, workflowProgressIndex + 1)}단계 / ${workflowSteps.length}단계`" />
           <div class="workflow-progress__header">
             <div><span class="panel-kicker">작업 순서</span><strong id="workflow-title">{{ projectStatusLabel }}</strong></div>
             <span>{{ Math.min(workflowSteps.length, workflowProgressIndex + 1) }}단계 / {{ workflowSteps.length }}단계</span>
           </div>
           <ol class="workflow-progress__steps">
-            <li v-for="(step, index) in workflowSteps" :key="step.id" :class="workflowStepClass(index)">
+            <li v-for="(step, index) in workflowSteps" :key="step.id" :class="workflowStepClass(index)" :aria-current="index === workflowProgressIndex ? 'step' : undefined">
               <span>{{ String(index + 1).padStart(2, '0') }}</span><small>{{ step.label }}</small>
             </li>
           </ol>
@@ -1835,19 +2280,21 @@ onMounted(() => {
 
           <div
             class="drop-zone"
-            :class="{ dragging: isDragging }"
+            :class="{ dragging: isDragging, 'is-busy': isWorkflowBusy }"
             role="button"
-            tabindex="0"
+            :tabindex="isWorkflowBusy ? -1 : 0"
+            :aria-disabled="isWorkflowBusy"
+            :aria-busy="isWorkflowBusy"
             aria-label="도면 파일 드래그 앤 드롭 또는 파일 선택"
-            @dragenter.prevent="isDragging = true"
-            @dragover.prevent="isDragging = true"
+            @dragenter.prevent="!isWorkflowBusy && (isDragging = true)"
+            @dragover.prevent="!isWorkflowBusy && (isDragging = true)"
             @dragleave.prevent="isDragging = false"
             @drop.prevent="handleDrop"
             @click="triggerFileInput"
             @keydown.enter.prevent="triggerFileInput"
             @keydown.space.prevent="triggerFileInput"
           >
-            <input ref="fileInput" class="visually-hidden" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" @change="handleInput">
+            <input ref="fileInput" class="visually-hidden" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" :disabled="isWorkflowBusy" @change="handleInput">
             <div class="drop-icon" aria-hidden="true"><span class="upload-arrow">↑</span><span class="upload-tray" /></div>
             <div class="drop-copy">
               <strong>{{ isDragging ? '여기에 놓으세요' : '설계도 파일을 여기에 놓으세요' }}</strong>
@@ -1861,9 +2308,9 @@ onMounted(() => {
           <div class="upload-guidance"><span class="lightbulb">✦</span><span><b>평면도·입면도·단면도를 함께 올리면</b> 높이와 3차원 모델 정확도가 올라갑니다.</span><small class="future-format-note">캐드 도면(DWG·DXF)·건물 모델(IFC) 연결 구조 준비 · 현재 자동 분석 불가</small></div>
 
           <div v-if="project.files.length" class="file-list" aria-live="polite">
-            <div class="file-list-heading"><span>올린 파일 <b>{{ project.files.length }}개</b></span><button type="button" class="text-button" @click="showFileList = !showFileList">{{ showFileList ? '파일 목록 닫기' : '파일 목록 자세히 보기' }}</button><span class="analysis-pulse" :class="{ active: isAnalyzing }"><i /> {{ isAnalyzing ? '분석 진행 중' : '분석 상태 확인' }}</span></div>
+            <div class="file-list-heading"><span>올린 파일 <b>{{ project.files.length }}개</b></span><button type="button" class="text-button" :aria-expanded="showFileList" aria-controls="uploaded-file-list" @click="showFileList = !showFileList">{{ showFileList ? '파일 목록 닫기' : '파일 목록 자세히 보기' }}</button><span class="analysis-pulse" :class="{ active: isAnalyzing }"><i /> {{ isAnalyzing ? '분석 진행 중' : '분석 상태 확인' }}</span></div>
             <p v-if="!showFileList" class="file-list-summary">파일 {{ project.files.length }}개를 올렸습니다. 분석 결과를 확인하려면 아래 버튼을 누르세요.</p>
-            <div v-if="showFileList">
+            <div v-if="showFileList" id="uploaded-file-list">
               <article v-for="file in project.files" :key="file.id" class="file-card">
                 <div class="file-type-icon" :class="`file-${file.extension}`">{{ fileTypeLabel(file.extension).split(' ')[0] }}</div>
                   <div class="file-info">
@@ -1876,13 +2323,15 @@ onMounted(() => {
                       <span>높이 후보 <b>{{ fileAnalysisSummary(file).heightCandidates }}</b></span>
                       <span>자동 연결 <b>{{ fileAnalysisSummary(file).autoLinked }}</b></span>
                       <span>확인 필요 <b>{{ fileAnalysisSummary(file).reviewCount }}</b></span>
-                      <span>3D <b>{{ fileAnalysisSummary(file).can3d ? '가능' : file.kind === 'cost-summary' ? '사용 안 함' : '확인 필요' }}</b></span>
-                      <span>자재 계산 <b>{{ fileAnalysisSummary(file).canMaterial ? '가능' : file.kind === 'cost-summary' ? '사용 안 함' : '확인 필요' }}</b></span>
+                      <span>3D <b>{{ fileAnalysisSummary(file).can3d ? '가능' : fileIsCostOnly(file) ? '사용 안 함' : '확인 필요' }}</b></span>
+                      <span>자재 계산 <b>{{ fileAnalysisSummary(file).canMaterial ? '가능' : fileIsCostOnly(file) ? '사용 안 함' : '확인 필요' }}</b></span>
                     </div>
-                    <div v-if="file.status === 'analyzing'" class="progress-track"><span :style="{ width: `${file.progress}%` }" /></div>
+                    <div v-if="file.status === 'analyzing'" class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="file.progress" :aria-label="`${file.name} 분석 진행률`"><span :style="{ width: `${file.progress}%` }" /></div>
                     <div class="analysis-stage-line" :class="`stage-${file.stage}`"><span class="stage-pip" />{{ fileStatusLabel(file) }}</div>
                     <p v-if="file.error" class="file-error">{{ file.error }}</p>
-                    <p v-else-if="file.warnings.length" class="file-warning">{{ file.warnings[0] }}</p>
+                    <ul v-else-if="file.warnings.length" class="file-warning" aria-label="파일 분석 경고">
+                      <li v-for="warning in file.warnings" :key="warning">{{ warning }}</li>
+                    </ul>
                     <details v-if="file.pages.length" class="file-pages-details">
                       <summary><b>페이지별 분석 상태 보기</b><span>{{ file.pages.length }}페이지</span></summary>
                       <div class="file-page-status-list">
@@ -1890,7 +2339,7 @@ onMounted(() => {
                           <div><strong>{{ page.pageNumber }}페이지 · {{ DRAWING_KIND_LABELS[page.kind] }}</strong><span :class="['page-status-label', pageAnalysisStatus(page, file) === '분석 완료' ? 'is-complete' : 'is-review']">{{ pageAnalysisStatus(page, file) }}</span></div>
                           <small>OCR {{ pageOcrStatus(page) }} · 추출 문자 {{ page.text.length.toLocaleString('ko-KR') }}자 · 치수 {{ page.dimensions.length }}개</small>
                           <small>높이 후보 {{ pageAnalysisSummary(file, page).candidateCount }}개 · 자동 연결 {{ pageAnalysisSummary(file, page).linkedCount }}개 · 확인 필요 {{ pageAnalysisSummary(file, page).reviewCount }}개</small>
-                          <small>3D {{ pageAnalysisSummary(file, page).can3d ? '생성 가능' : file.kind === 'cost-summary' ? '사용 안 함' : '확인 필요' }} · 자재 계산 {{ pageAnalysisSummary(file, page).canMaterial ? '가능' : file.kind === 'cost-summary' ? '사용 안 함' : '확인 필요' }}</small>
+                          <small>3D {{ pageAnalysisSummary(file, page).can3d ? '생성 가능' : isCostSummaryPage(file, page) ? '사용 안 함' : '확인 필요' }} · 자재 계산 {{ pageAnalysisSummary(file, page).canMaterial ? '가능' : isCostSummaryPage(file, page) ? '사용 안 함' : '확인 필요' }}</small>
                           <button type="button" class="text-button" @click="clickPage(page)">원본 페이지 열기</button>
                         </article>
                       </div>
@@ -1898,14 +2347,14 @@ onMounted(() => {
                   </div>
                 <div class="file-actions">
                   <button v-if="file.pages.length" type="button" class="text-button" @click="openFilePreview(file)">미리보기</button>
-                  <button v-if="file.canReanalyze" type="button" class="icon-button" title="다시 분석" aria-label="다시 분석" @click="reanalyze(file.id)">↻</button>
-                  <button type="button" class="icon-button danger" title="파일 삭제" aria-label="파일 삭제" @click="removeFile(file.id)">×</button>
+                  <button v-if="file.canReanalyze" type="button" class="icon-button" title="다시 분석" :aria-label="`${file.name} 다시 분석`" :disabled="isWorkflowBusy" @click="reanalyze(file.id)">↻</button>
+                  <button type="button" class="icon-button danger" title="파일 삭제" :aria-label="`${file.name} 파일 삭제`" :disabled="isWorkflowBusy" @click="removeFile(file.id)">×</button>
                 </div>
               </article>
             </div>
             <div class="upload-next-card">
               <div><strong>도면 분석 결과를 확인할 차례입니다.</strong><p>파일 종류, 치수, 높이, 벽체 연결 결과를 큰 화면으로 확인할 수 있습니다.</p></div>
-              <button type="button" class="primary-button" :disabled="isAnalyzing" @click="scrollToSection('analysis')">분석 결과 보기</button>
+              <button type="button" class="primary-button" :disabled="isWorkflowBusy" @click="scrollToSection('analysis')">분석 결과 보기</button>
             </div>
           </div>
         </section>
@@ -1921,7 +2370,7 @@ onMounted(() => {
 
             <div class="summary-grid">
               <div class="summary-card accent-card"><span>건물 이름</span><strong>{{ project.buildingName }}</strong><small>파일명·도면 제목에서 추출</small></div>
-              <div class="summary-card"><span>도면 종류</span><strong>{{ [...new Set(project.files.map((file) => DRAWING_KIND_LABELS[file.kind]))].join(' · ') || '—' }}</strong><small>페이지별 분류 저장</small></div>
+              <div class="summary-card"><span>도면 종류</span><strong>{{ [...new Set(project.files.flatMap((file) => file.pages.map((page) => DRAWING_KIND_LABELS[page.kind])))].join(' · ') || '—' }}</strong><small>페이지별 분류 저장</small></div>
               <div class="summary-card"><span>층 수</span><strong>{{ floorCount ? `${floorCount}층` : '정보 없음' }}</strong><small>{{ floorCount ? '도면 표기에서 확인' : '층 표기 미확인' }}</small></div>
               <div class="summary-card"><span>높이 근거</span><strong>{{ heightDimensions.length ? `${heightDimensions.length}개 후보` : '높이 정보 없음' }}</strong><small>{{ heightDimensions.length ? '입면·단면 우선 연결' : '입면도 또는 단면도 필요' }}</small></div>
             </div>
@@ -2015,7 +2464,7 @@ onMounted(() => {
                 </div>
                 <div v-else class="preview-empty">분석 완료된 페이지 미리보기가 없습니다.</div>
                 <div v-if="allPages.length > 1" class="page-strip" aria-label="원본 페이지 선택">
-                  <button v-for="page in allPages" :key="page.id" type="button" :class="{ active: currentPage?.id === page.id }" @click="clickPage(page)">{{ page.pageNumber }}페이지 · {{ DRAWING_KIND_LABELS[page.kind] }}</button>
+                  <button v-for="page in allPages" :key="page.id" type="button" :class="{ active: currentPage?.id === page.id }" :aria-pressed="currentPage?.id === page.id" @click="clickPage(page)">{{ page.pageNumber }}페이지 · {{ DRAWING_KIND_LABELS[page.kind] }}</button>
                 </div>
                 <div v-if="currentPage" class="source-details">
                   <span class="kind-tag">{{ DRAWING_KIND_LABELS[currentPage.kind] }}</span>
@@ -2044,13 +2493,13 @@ onMounted(() => {
                   </div>
                 </div>
                 <div v-else class="empty-state small"><span>∅</span><p>아직 숫자 치수를 읽지 못했습니다.<br>원본 해상도와 치수 텍스트를 확인하세요.</p></div>
-                <button v-if="project.dimensions.length > 10" type="button" class="show-more-button" @click="showAllDimensions = !showAllDimensions">{{ showAllDimensions ? '간략히 보기' : `전체 치수 ${project.dimensions.length}개 보기` }} <span>{{ showAllDimensions ? '↑' : '↓' }}</span></button>
+                <button v-if="project.dimensions.length > 10" type="button" class="show-more-button" :aria-expanded="showAllDimensions" @click="showAllDimensions = !showAllDimensions">{{ showAllDimensions ? '간략히 보기' : `전체 치수 ${project.dimensions.length}개 보기` }} <span>{{ showAllDimensions ? '↑' : '↓' }}</span></button>
               </div>
             </div>
 
             <div class="wall-overview panel-card">
               <div class="panel-heading"><div><span class="panel-kicker">벽체 확인</span><h3>벽체·구역 연결 결과</h3></div><span class="subtle-note">높이는 같은 도면 → 입면도 → 단면도 순서로 확인</span></div>
-              <div v-if="project.walls.length" class="table-scroll"><table class="data-table wall-table"><thead><tr><th>구역</th><th>벽체</th><th>길이</th><th>높이</th><th>개구부</th><th>신뢰도</th><th>검토</th></tr></thead><tbody><tr v-for="wall in project.walls" :key="wall.id" :class="{ selected: selectedWallId === wall.id }" @click="selectWall(wall.id)"><td><span class="zone-color" :style="{ backgroundColor: wall.color }" />{{ wall.zone }}</td><td><b>{{ wall.number }}</b></td><td>{{ formatMm(wall.lengthMm) }}</td><td><span :class="{ 'missing-value': wall.heightMm === null }">{{ formatMm(wall.heightMm) }}</span></td><td>{{ wall.openings.length ? `${wall.openings.length}개` : '없음' }}</td><td><span :class="['confidence-text', wall.confidence]">{{ CONFIDENCE_LABELS[wall.confidence] }}</span></td><td><span :class="['review-pill', wall.reviewStatus]">{{ wall.conflicts?.length ? '치수 충돌' : wall.reviewStatus === 'verified' ? '자동 반영' : wall.reviewStatus === 'review' ? '검토' : '차단' }}</span></td></tr></tbody></table></div>
+              <div v-if="project.walls.length" class="table-scroll"><table class="data-table wall-table"><thead><tr><th>구역</th><th>벽체</th><th>길이</th><th>높이</th><th>개구부</th><th>신뢰도</th><th>검토</th></tr></thead><tbody><tr v-for="wall in project.walls" :key="wall.id" :class="{ selected: selectedWallId === wall.id }" @click="selectWall(wall.id)"><td><span class="zone-color" :style="{ backgroundColor: wall.color }" />{{ wall.zone }}</td><td><button type="button" class="table-row-button" :aria-label="`${wall.zone} ${wall.number} 3차원 상세 보기`" @click.stop="selectWall(wall.id)">{{ wall.number }}</button></td><td>{{ formatMm(wall.lengthMm) }}</td><td><span :class="{ 'missing-value': wall.heightMm === null }">{{ formatMm(wall.heightMm) }}</span></td><td>{{ wall.openings.length ? `${wall.openings.length}개` : '없음' }}</td><td><span :class="['confidence-text', wall.confidence]">{{ CONFIDENCE_LABELS[wall.confidence] }}</span></td><td><span :class="['review-pill', wall.reviewStatus]">{{ wall.conflicts?.length ? '치수 충돌' : wall.reviewStatus === 'verified' ? '자동 반영' : wall.reviewStatus === 'review' ? '검토' : '차단' }}</span></td></tr></tbody></table></div>
               <div v-else class="missing-callout"><span class="warning-symbol">!</span><div><strong>벽체를 자동 생성할 근거가 아직 부족합니다.</strong><p>평면도의 실제 치수선과 벽체 표기가 읽혀야 하며, 높이는 임의로 입력하지 않습니다.</p></div></div>
             </div>
           </section>
@@ -2059,11 +2508,11 @@ onMounted(() => {
           <section v-if="activeSection === 'analysis'" class="workflow-action-card review-action" aria-labelledby="review-next-title">
             <div>
               <span class="panel-kicker">다음 단계</span>
-              <h3 id="review-next-title">확인했으면 3차원 모델로 이동하세요.</h3>
+              <h3 id="review-next-title">{{ canConfirmReview ? '확인했으면 3차원 모델로 이동하세요.' : '확인 가능한 벽체를 부분 모델로 미리보세요.' }}</h3>
               <p v-if="reviewBlockers.length">{{ reviewBlockers[0] }}{{ reviewBlockers.length > 1 ? ` 외 ${reviewBlockers.length - 1}건` : '' }}</p>
               <p v-else>현재 확인이 필요한 치수와 높이가 없어 다음 단계로 진행할 수 있습니다.</p>
             </div>
-            <button type="button" class="primary-button" :disabled="!canBuild3D" @click="build3DModel">확인 완료 · 3차원 모델 보기</button>
+            <button type="button" class="primary-button" :disabled="!canBuild3D" @click="build3DModel">{{ canConfirmReview ? '확인 완료 · 3차원 모델 보기' : '부분 모델 미리보기' }}</button>
           </section>
 
           <section v-if="activeSection === 'model'" id="model" class="section-block model-section">
@@ -2073,7 +2522,7 @@ onMounted(() => {
             </div>
             <div class="model-section-actions">
               <button type="button" class="back-button" @click="scrollToSection(project.files.length ? 'analysis' : 'upload')">← {{ project.files.length ? '분석 결과' : '파일 업로드' }}로 돌아가기</button>
-              <button type="button" class="outline-button" @click="toggleTestModel">{{ showTestModel ? '실제 도면 모델로 돌아가기' : '3D 화면 테스트 모델 보기' }}</button>
+              <button type="button" class="outline-button" :aria-pressed="showTestModel" @click="toggleTestModel">{{ showTestModel ? '실제 도면 모델로 돌아가기' : '3D 화면 테스트 모델 보기' }}</button>
             </div>
             <div v-if="showTestModel" class="model-notice model-notice--test"><span class="model-notice-icon">!</span><span><b>테스트 모델</b>입니다. 높이 2,800mm·4,200mm 벽체와 문·창문을 렌더링 확인용으로 표시합니다. 실제 발주 수량·비용·저장 결과에는 사용하지 않습니다.</span></div>
             <div v-else class="model-notice"><span class="model-notice-icon">◇</span><span>도면 정보를 기반으로 만든 자재 산출용 개략 3차원 모델입니다. <b>구조검토 및 설계 승인을 대신하지 않습니다.</b><small class="model-roof-note">{{ project.model.partial ? project.model.blockedReason : '' }} 지붕: {{ project.model.partial ? '부분 모델이라 반영하지 않음' : project.model.roof.isReady ? `${project.model.roof.kind === 'flat' ? '평지붕' : '지붕 형태'} 반영` : project.model.roof.blockedReason }}</small></span></div>
@@ -2090,7 +2539,7 @@ onMounted(() => {
                 <Building3DViewer :model="displayModel" :selected-wall-id="showTestModel ? '' : selectedWallId" :mode="modelDisplayMode" :source-label="modelSourceLabel" @select="selectWall" />
                 <p v-if="!showTestModel && !project.model.isReady" class="model-blocked-note">{{ project.model.blockedReason }}</p>
               </div>
-              <aside id="wall-detail" class="wall-detail panel-card" :class="{ empty: !selectedWall || showTestModel }">
+              <aside id="wall-detail" class="wall-detail panel-card" :class="{ empty: !selectedWall || showTestModel }" tabindex="-1">
                 <template v-if="selectedWall && !showTestModel">
                   <div class="detail-heading"><div><span class="panel-kicker">선택한 벽체</span><h3>{{ selectedWall.zone }} / {{ selectedWall.number }}</h3></div><span class="detail-zone" :style="{ backgroundColor: selectedWall.color }" /></div>
                   <div class="detail-metrics"><div><span>가로 길이</span><b>{{ formatMm(selectedWall.lengthMm) }}</b></div><div><span>높이</span><b>{{ formatMm(selectedWall.heightMm) }}</b></div><div><span>개구부 면적</span><b>{{ project.takeoffs.find((row) => row.wallId === selectedWall.id)?.openingAreaM2.toFixed(2) || '0.00' }}㎡</b></div><div><span>순 벽체 면적</span><b>{{ project.takeoffs.find((row) => row.wallId === selectedWall.id)?.netAreaM2?.toFixed(2) || '—' }}㎡</b></div></div>
@@ -2125,18 +2574,19 @@ onMounted(() => {
             <div v-if="project.workflow.modelBuilt" class="takeoff-top-grid">
               <div class="settings-card panel-card">
                 <div class="panel-heading"><div><span class="panel-kicker">한 번만 입력</span><h3>판넬·부자재 기준</h3></div><span class="single-input-note">이 프로젝트의 공통 기준</span></div>
-                <div class="settings-grid">
-                  <label>판넬 유효 폭(mm)<input v-model.number="settingsDraft.panelEffectiveWidthMm" type="number" min="1" @change="updateSettings"></label>
-                  <label>판넬 표준 길이(mm)<input v-model.number="settingsDraft.panelStandardLengthMm" type="number" min="1" @change="updateSettings"></label>
-                  <label>판넬 두께(mm)<input v-model.number="settingsDraft.panelThicknessMm" type="number" min="1" @change="updateSettings"></label>
-                  <label>판넬 시공 방향<select v-model="settingsDraft.panelDirection" @change="updateSettings"><option value="vertical">세로</option><option value="horizontal">가로</option></select></label>
-                  <label>판넬 여유율(%)<input v-model.number="settingsDraft.panelWasteRate" type="number" min="0" step="0.5" @change="updateSettings"></label>
-                  <label>판넬당 고정 피스<input v-model.number="settingsDraft.fastenersPerPanel" type="number" min="0" @change="updateSettings"></label>
-                  <label>실란트 1본당 길이(m)<input v-model.number="settingsDraft.sealantLengthM" type="number" min="0.1" step="0.1" @change="updateSettings"></label>
-                  <label>코너재 1본당 길이(m)<input v-model.number="settingsDraft.cornerLengthM" type="number" min="0.1" step="0.1" @change="updateSettings"></label>
-                  <label>마감재 1본당 길이(m)<input v-model.number="settingsDraft.finishLengthM" type="number" min="0.1" step="0.1" @change="updateSettings"></label>
-                  <label class="checkbox-label"><input v-model="settingsDraft.reuseOffcuts" type="checkbox" @change="updateSettings"><span>절단 잔재 재사용</span></label>
+                <div class="settings-grid" :aria-describedby="settingsError ? 'material-settings-error' : undefined">
+                  <label>판넬 유효 폭(mm)<input v-model.number="settingsDraft.panelEffectiveWidthMm" type="number" min="1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>판넬 표준 길이(mm)<input v-model.number="settingsDraft.panelStandardLengthMm" type="number" min="1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>판넬 두께(mm)<input v-model.number="settingsDraft.panelThicknessMm" type="number" min="1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>판넬 시공 방향<select v-model="settingsDraft.panelDirection" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"><option value="vertical">세로</option><option value="horizontal">가로</option></select></label>
+                  <label>판넬 여유율(%)<input v-model.number="settingsDraft.panelWasteRate" type="number" min="0" max="100" step="0.5" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>판넬당 고정 피스<input v-model.number="settingsDraft.fastenersPerPanel" type="number" min="0" step="1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>실란트 1본당 길이(m)<input v-model.number="settingsDraft.sealantLengthM" type="number" min="0.1" step="0.1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>코너재 1본당 길이(m)<input v-model.number="settingsDraft.cornerLengthM" type="number" min="0.1" step="0.1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label>마감재 1본당 길이(m)<input v-model.number="settingsDraft.finishLengthM" type="number" min="0.1" step="0.1" :aria-invalid="Boolean(settingsError)" :disabled="isCalculating || isOptimizing" @change="updateSettings"></label>
+                  <label class="checkbox-label"><input v-model="settingsDraft.reuseOffcuts" type="checkbox" :disabled="isCalculating || isOptimizing" @change="updateSettings"><span>절단 잔재 재사용</span></label>
                 </div>
+                <p v-if="settingsError" id="material-settings-error" class="settings-error" role="alert">{{ settingsError }}</p>
                 <p class="settings-preview">현재 기준: {{ panelSpec(project.settings) }}</p>
               </div>
               <div class="takeoff-summary-card">
@@ -2148,7 +2598,7 @@ onMounted(() => {
             <div v-if="project.workflow.modelBuilt" class="formula-strip"><span>계산 방법</span><p>길이 × 높이 − 문과 창호 → 판넬 배치 → 여유율 → 피스·실란트·코너재·마감재</p><small>전체 면적만 나누지 않고 벽체별 실제 규격을 반영합니다.</small></div>
             <div v-if="project.workflow.takeoffCalculated" class="takeoff-table panel-card">
               <div class="panel-heading"><div><span class="panel-kicker">발주 표</span><h3>벽체별 발주 산출표</h3></div><span class="table-note">{{ project.takeoffs.length }}개 벽체 · {{ project.takeoffs.filter((row) => row.reviewStatus !== '확정').length }}개 검토 대상</span></div>
-              <div class="table-scroll"><table class="data-table purchase-table"><thead><tr><th>구역</th><th>벽체 번호</th><th>도면 근거</th><th>가로 길이</th><th>높이</th><th>개구부 면적</th><th>순 벽체 면적</th><th>판넬 규격</th><th>기본</th><th>여유 포함</th><th>고정 피스</th><th>실란트</th><th>코너재</th><th>마감재</th><th>절단 잔재</th><th>신뢰도</th><th>검토 상태</th></tr></thead><tbody><tr v-for="row in project.takeoffs" :key="row.wallId" :class="{ blocked: row.reviewStatus === '높이 정보 없음' }" @click="selectWall(row.wallId)"><td><span class="zone-color" :style="{ backgroundColor: project.walls.find((wall) => wall.id === row.wallId)?.color }" />{{ row.zone }}</td><td><b>{{ row.wallNumber }}</b></td><td class="evidence-cell">{{ row.evidenceLabel }}</td><td>{{ formatMm(row.lengthMm) }}</td><td>{{ formatMm(row.heightMm) }}</td><td>{{ row.openingAreaM2.toFixed(2) }}㎡</td><td>{{ row.netAreaM2 === null ? '—' : `${row.netAreaM2.toFixed(2)}㎡` }}</td><td class="spec-cell">{{ row.panelSpec }}</td><td>{{ row.basePanels ?? '—' }}</td><td><b>{{ row.panelsWithWaste ?? '—' }}</b></td><td>{{ row.fasteners ?? '—' }}</td><td>{{ row.sealantCartridges ?? '—' }}</td><td>{{ row.cornerPieces ?? '—' }}</td><td>{{ row.finishPieces ?? '—' }}</td><td>{{ row.offcutM === null ? '—' : `${row.offcutM.toFixed(2)}미터` }}</td><td><span :class="['confidence-text', row.confidence]">{{ CONFIDENCE_LABELS[row.confidence] }}</span></td><td><span :class="['review-pill', takeoffStatusClass(row.reviewStatus)]">{{ row.reviewStatus }}</span></td></tr><tr v-if="!project.takeoffs.length"><td colspan="17" class="empty-table">높이와 벽체 길이가 확인된 뒤 발주 산출표가 만들어집니다.</td></tr></tbody></table></div>
+              <div class="table-scroll"><table class="data-table purchase-table"><thead><tr><th>구역</th><th>벽체 번호</th><th>도면 근거</th><th>가로 길이</th><th>높이</th><th>개구부 면적</th><th>순 벽체 면적</th><th>판넬 규격</th><th>기본</th><th>여유 포함</th><th>고정 피스</th><th>실란트</th><th>코너재</th><th>마감재</th><th>절단 잔재</th><th>신뢰도</th><th>검토 상태</th></tr></thead><tbody><tr v-for="row in project.takeoffs" :key="row.wallId" :class="{ blocked: row.reviewStatus === '높이 정보 없음' }" @click="selectWall(row.wallId)"><td><span class="zone-color" :style="{ backgroundColor: project.walls.find((wall) => wall.id === row.wallId)?.color }" />{{ row.zone }}</td><td><button type="button" class="table-row-button" :aria-label="`${row.zone} ${row.wallNumber} 3차원 상세 보기`" @click.stop="selectWall(row.wallId)">{{ row.wallNumber }}</button></td><td class="evidence-cell">{{ row.evidenceLabel }}</td><td>{{ formatMm(row.lengthMm) }}</td><td>{{ formatMm(row.heightMm) }}</td><td>{{ row.openingAreaM2.toFixed(2) }}㎡</td><td>{{ row.netAreaM2 === null ? '—' : `${row.netAreaM2.toFixed(2)}㎡` }}</td><td class="spec-cell">{{ row.panelSpec }}</td><td>{{ row.basePanels ?? '—' }}</td><td><b>{{ row.panelsWithWaste ?? '—' }}</b></td><td>{{ row.fasteners ?? '—' }}</td><td>{{ row.sealantCartridges ?? '—' }}</td><td>{{ row.cornerPieces ?? '—' }}</td><td>{{ row.finishPieces ?? '—' }}</td><td>{{ row.offcutM === null ? '—' : `${row.offcutM.toFixed(2)}미터` }}</td><td><span :class="['confidence-text', row.confidence]">{{ CONFIDENCE_LABELS[row.confidence] }}</span></td><td><span :class="['review-pill', takeoffStatusClass(row.reviewStatus)]">{{ row.reviewStatus }}</span></td></tr><tr v-if="!project.takeoffs.length"><td colspan="17" class="empty-table">높이와 벽체 길이가 확인된 뒤 발주 산출표가 만들어집니다.</td></tr></tbody></table></div>
               <div v-if="project.missingItems.length" class="missing-list"><strong>자동 산출을 막는 확인 항목</strong><span v-for="item in project.missingItems" :key="item">{{ item }}</span></div>
             </div>
             <div v-else-if="project.workflow.modelBuilt" class="workflow-action-card takeoff-action">
@@ -2178,74 +2628,74 @@ onMounted(() => {
 
               <div class="inventory-mvp-actions">
                 <div><strong>시작 방법</strong><span>도면 부재를 가져오거나 아래 기본 예제로 계산 흐름을 확인하세요.</span></div>
-                <div class="inventory-mvp-action-buttons"><button type="button" class="outline-button" @click="refreshInventoryRequirements()">도면 부재 가져오기</button><button type="button" class="outline-button" @click="loadInventorySample">기본 예제 불러오기</button></div>
+                <div class="inventory-mvp-action-buttons"><button type="button" class="outline-button" :disabled="inventoryLocked || isWorkflowBusy" @click="refreshInventoryRequirements()">도면 부재 가져오기</button><button type="button" class="outline-button" :disabled="inventoryLocked || isWorkflowBusy" @click="loadInventorySample">기본 예제 불러오기</button></div>
               </div>
 
               <div class="inventory-scope-grid">
                 <div><b>계산 대상</b><span>동일 폭 직사각형 패널·보드의 길이 절단</span></div>
                 <div><b>자동 제외</b><span>곡선·불규칙 형상·규격 불일치 자재·손상 판정</span></div>
-                <div><b>재고 처리</b><span>계산 중 예상 사용 · 승인 후 예약 · 취소 시 변경 없음</span></div>
+                <div><b>재고 처리</b><span>계산 중 예상 사용 · 승인 후 예약 · 승인 취소 시 예약 해제</span></div>
               </div>
 
               <section class="inventory-settings-card">
                 <div class="inventory-subheading"><div><span class="panel-kicker">1단계</span><h4>절단 기준</h4></div><small>비어 있으면 계획을 확정하지 않습니다.</small></div>
                 <div class="inventory-settings-grid">
-                  <label>톱날 절단폭(mm)<input v-model.number="inventoryState.settings.kerfMm" type="number" min="0" step="0.1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
-                  <label>최소 절단 여유(mm)<input v-model.number="inventoryState.settings.minimumCutAllowanceMm" type="number" min="0" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
-                  <label>재사용 최소 잔량(mm)<input v-model.number="inventoryState.settings.minimumReusableOffcutMm" type="number" min="1" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /></label>
-                  <label>기존 방식 비교용 원자재 길이(mm)<input v-model.number="inventoryState.settings.baselineStockLengthMm" type="number" min="1" step="1" :disabled="inventoryLocked" @change="invalidateInventoryPlan" /><small>입력하지 않으면 폐기량 비교는 확인 필요로 남습니다.</small></label>
+                  <label>톱날 절단폭(mm)<input v-model.number="inventoryState.settings.kerfMm" type="number" min="0" step="0.1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventorySettings" /></label>
+                  <label>최소 절단 여유(mm)<input v-model.number="inventoryState.settings.minimumCutAllowanceMm" type="number" min="0" step="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventorySettings" /></label>
+                  <label>재사용 최소 잔량(mm)<input v-model.number="inventoryState.settings.minimumReusableOffcutMm" type="number" min="1" step="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventorySettings" /></label>
+                  <label>기존 방식 비교용 원자재 길이(mm)<input v-model.number="inventoryState.settings.baselineStockLengthMm" type="number" min="1" step="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventorySettings" /><small>입력하지 않으면 폐기량 비교는 확인 필요로 남습니다.</small></label>
                 </div>
               </section>
 
               <section class="inventory-requirements-card">
-                <div class="inventory-subheading"><div><span class="panel-kicker">2단계</span><h4>필요 조각 목록</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.requirements.length }}개 · 확인 필요 {{ inventoryRequirementsNeedingReview.length }}개</span><button type="button" class="outline-button" :disabled="!inventoryState.requirements.length || inventoryLocked" @click="confirmAllInventoryRequirements">모두 확인</button></div></div>
+                <div class="inventory-subheading"><div><span class="panel-kicker">2단계</span><h4>필요 조각 목록</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.requirements.length }}개 · 확인 필요 {{ inventoryRequirementsNeedingReview.length }}개</span><button type="button" class="outline-button" :disabled="!inventoryState.requirements.length || inventoryLocked || isWorkflowBusy" @click="confirmAllInventoryRequirements">모두 확인</button></div></div>
                 <p class="inventory-help">도면에서 가져온 값은 자동으로 확정하지 않습니다. 높이·폭·두께·표면 마감·도면 축척을 직접 확인한 뒤 조각별로 확인하세요.</p>
                 <div v-if="inventoryState.requirements.length" class="inventory-requirement-list">
                   <article v-for="requirement in inventoryState.requirements" :key="requirement.id" class="inventory-requirement-card" :class="{ confirmed: requirement.status === 'ready' && !requirement.missingFields.length }">
                     <div class="inventory-card-title"><div><strong>{{ requirement.zone }} · {{ requirement.location }}</strong><small>{{ inventoryRequirementSourceLabel(requirement) }} · {{ requirement.source === 'sample' ? '예제' : '도면/사용자 입력' }} · 신뢰도 {{ CONFIDENCE_LABELS[requirement.confidence] }}</small></div><span :class="['review-pill', requirement.status === 'ready' && !requirement.missingFields.length ? 'confirmed' : 'blocked']">{{ requirement.status === 'ready' && !requirement.missingFields.length ? '사용자 확인' : '확인 필요' }}</span></div>
                     <div class="inventory-field-grid">
-                      <label>자재 종류<input v-model="requirement.materialName" type="text" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>두께(mm)<input v-model.number="requirement.thicknessMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>폭(mm)<input v-model.number="requirement.widthMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>필요 길이(mm)<input v-model.number="requirement.requiredLengthMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>높이(mm)<input v-model.number="requirement.heightMm" type="number" min="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>수량<input v-model.number="requirement.quantity" type="number" min="1" step="1" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>표면 마감<input v-model="requirement.surfaceFinish" type="text" placeholder="예: 평판 도장" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>색상<input v-model="requirement.color" type="text" placeholder="예: 아이보리" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
-                      <label>도면 축척<input v-model="requirement.drawingScale" type="text" placeholder="예: 1:50" :disabled="inventoryLocked" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>자재 종류<input v-model="requirement.materialName" type="text" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>두께(mm)<input v-model.number="requirement.thicknessMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>폭(mm)<input v-model.number="requirement.widthMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>필요 길이(mm)<input v-model.number="requirement.requiredLengthMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>높이(mm)<input v-model.number="requirement.heightMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>수량<input v-model.number="requirement.quantity" type="number" min="1" step="1" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>표면 마감<input v-model="requirement.surfaceFinish" type="text" placeholder="예: 평판 도장" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>색상<input v-model="requirement.color" type="text" placeholder="예: 아이보리" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
+                      <label>도면 축척<input v-model="requirement.drawingScale" type="text" placeholder="예: 1:50" :disabled="inventoryLocked || isWorkflowBusy" @change="updateInventoryRequirement(requirement)" /></label>
                     </div>
-                    <div class="inventory-requirement-footer"><span v-if="inventoryRequirementMissingLabels(requirement).length" class="inventory-missing-fields">빠진 정보: {{ inventoryRequirementMissingLabels(requirement).join(' · ') }}</span><span v-else class="inventory-ready-note">필수 정보가 입력됐지만 사용자 확인 전에는 계산하지 않습니다.</span><button type="button" class="primary-button" :disabled="inventoryLocked || requirement.status === 'ready' && !requirement.missingFields.length" @click="confirmInventoryRequirement(requirement)">{{ requirement.status === 'ready' && !requirement.missingFields.length ? '확인 완료' : '정보 확인' }}</button></div>
+                    <div class="inventory-requirement-footer"><span v-if="inventoryRequirementMissingLabels(requirement).length" class="inventory-missing-fields">빠진 정보: {{ inventoryRequirementMissingLabels(requirement).join(' · ') }}</span><span v-else class="inventory-ready-note">필수 정보가 입력됐지만 사용자 확인 전에는 계산하지 않습니다.</span><button type="button" class="primary-button" :disabled="inventoryLocked || isWorkflowBusy || requirement.status === 'ready' && !requirement.missingFields.length" @click="confirmInventoryRequirement(requirement)">{{ requirement.status === 'ready' && !requirement.missingFields.length ? '확인 완료' : '정보 확인' }}</button></div>
                   </article>
                 </div>
                 <div v-else class="inventory-empty"><strong>필요 조각이 없습니다.</strong><span>도면 분석 후 ‘도면 부재 가져오기’를 누르거나 기본 예제를 불러오세요.</span></div>
               </section>
 
               <section class="inventory-owned-card">
-                <div class="inventory-subheading"><div><span class="panel-kicker">3단계</span><h4>보유 자재</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.ownedMaterials.length }}종</span><button type="button" class="outline-button" :disabled="inventoryLocked" @click="inventoryStockFormOpen = !inventoryStockFormOpen">{{ inventoryStockFormOpen ? '입력 닫기' : '보유 자재 추가' }}</button></div></div>
+                <div class="inventory-subheading"><div><span class="panel-kicker">3단계</span><h4>보유 자재</h4></div><div class="inventory-subheading-actions"><span class="table-note">{{ inventoryState.ownedMaterials.length }}종</span><button type="button" class="outline-button" :disabled="inventoryLocked || isWorkflowBusy" :aria-expanded="inventoryStockFormOpen" aria-controls="inventory-stock-form" @click="inventoryStockFormOpen = !inventoryStockFormOpen">{{ inventoryStockFormOpen ? '입력 닫기' : '보유 자재 추가' }}</button></div></div>
                 <div v-if="inventoryState.ownedMaterials.length" class="inventory-owned-list">
-                  <article v-for="stock in inventoryState.ownedMaterials" :key="stock.id" class="inventory-owned-card-row" :class="{ unusable: !stock.usable }"><div><strong>{{ stock.materialName }} · {{ stock.thicknessMm }}T · {{ inventorySourceLabel(stock.source) }}</strong><small>폭 {{ inventoryNumber(stock.widthMm) }}mm · 길이 {{ inventoryNumber(stock.lengthMm) }}mm · {{ stock.surfaceFinish }} · {{ stock.color }}</small><small>{{ stock.location }} · {{ stock.usable ? '사용 가능' : '사용 안 함' }} · 예약 {{ stock.reservedQuantity }}/{{ stock.quantity }}</small></div><button type="button" class="icon-button danger" :disabled="stock.reservedQuantity > 0 || inventoryLocked" aria-label="보유 자재 삭제" @click="removeInventoryStock(stock)">×</button></article>
+                  <article v-for="stock in inventoryState.ownedMaterials" :key="stock.id" class="inventory-owned-card-row" :class="{ unusable: !stock.usable }"><div><strong>{{ stock.materialName }} · {{ stock.thicknessMm }}T · {{ inventorySourceLabel(stock.source) }}</strong><small>폭 {{ inventoryNumber(stock.widthMm) }}mm · 길이 {{ inventoryNumber(stock.lengthMm) }}mm · {{ stock.surfaceFinish }} · {{ stock.color }}</small><small>{{ stock.location }} · {{ stock.usable ? '사용 가능' : '사용 안 함' }} · 예약 {{ stock.reservedQuantity }}/{{ stock.quantity }}</small></div><button type="button" class="icon-button danger" :disabled="stock.reservedQuantity > 0 || inventoryLocked || isWorkflowBusy" aria-label="보유 자재 삭제" @click="removeInventoryStock(stock)">×</button></article>
                 </div>
                 <div v-else class="inventory-empty"><strong>등록된 보유 자재가 없습니다.</strong><span>현장에 있는 자재와 자투리를 먼저 입력하세요. 길이·폭·두께·마감·색상이 맞지 않으면 자동 사용하지 않습니다.</span></div>
-                <div v-if="inventoryStockFormOpen" class="inventory-stock-form">
-                  <label>자재 종류<select v-model="inventoryStockDraft.materialType"><option value="panel">샌드위치패널</option><option value="board">보드</option></select></label>
-                  <label>자재 이름<input v-model="inventoryStockDraft.materialName" type="text" placeholder="예: 50T 샌드위치패널" /></label>
-                  <label>두께(mm)<input v-model="inventoryStockDraft.thicknessMm" type="number" min="1" /></label>
-                  <label>폭(mm)<input v-model="inventoryStockDraft.widthMm" type="number" min="1" /></label>
-                  <label>길이(mm)<input v-model="inventoryStockDraft.lengthMm" type="number" min="1" /></label>
-                  <label>표면 마감<input v-model="inventoryStockDraft.surfaceFinish" type="text" placeholder="예: 평판 도장" /></label>
-                  <label>색상<input v-model="inventoryStockDraft.color" type="text" placeholder="예: 아이보리" /></label>
-                  <label>수량<input v-model="inventoryStockDraft.quantity" type="number" min="1" step="1" /></label>
-                  <label>구분<select v-model="inventoryStockDraft.source"><option value="new">신규 자재</option><option value="scrap">자투리 자재</option></select></label>
-                  <label>보관 위치<input v-model="inventoryStockDraft.location" type="text" placeholder="예: 1층 자재장" /></label>
-                  <label class="checkbox-label"><input v-model="inventoryStockDraft.usable" type="checkbox" /><span>사용 가능</span></label>
-                  <label>메모<input v-model="inventoryStockDraft.note" type="text" placeholder="현장 메모" /></label>
-                  <div class="inventory-stock-form-actions"><button type="button" class="outline-button" @click="inventoryStockFormOpen = false; resetInventoryStockDraft()">취소</button><button type="button" class="primary-button" @click="addInventoryStock">보유 자재 저장</button></div>
+                <div v-if="inventoryStockFormOpen" id="inventory-stock-form" class="inventory-stock-form">
+                  <label>자재 종류<select v-model="inventoryStockDraft.materialType" :disabled="inventoryLocked || isWorkflowBusy"><option value="panel">샌드위치패널</option><option value="board">보드</option></select></label>
+                  <label>자재 이름<input v-model="inventoryStockDraft.materialName" type="text" placeholder="예: 50T 샌드위치패널" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>두께(mm)<input v-model="inventoryStockDraft.thicknessMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>폭(mm)<input v-model="inventoryStockDraft.widthMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>길이(mm)<input v-model="inventoryStockDraft.lengthMm" type="number" min="1" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>표면 마감<input v-model="inventoryStockDraft.surfaceFinish" type="text" placeholder="예: 평판 도장" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>색상<input v-model="inventoryStockDraft.color" type="text" placeholder="예: 아이보리" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>수량<input v-model="inventoryStockDraft.quantity" type="number" min="1" step="1" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label>구분<select v-model="inventoryStockDraft.source" :disabled="inventoryLocked || isWorkflowBusy"><option value="new">신규 자재</option><option value="scrap">자투리 자재</option></select></label>
+                  <label>보관 위치<input v-model="inventoryStockDraft.location" type="text" placeholder="예: 1층 자재장" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <label class="checkbox-label"><input v-model="inventoryStockDraft.usable" type="checkbox" :disabled="inventoryLocked || isWorkflowBusy" /><span>사용 가능</span></label>
+                  <label>메모<input v-model="inventoryStockDraft.note" type="text" placeholder="현장 메모" :disabled="inventoryLocked || isWorkflowBusy" /></label>
+                  <div class="inventory-stock-form-actions"><button type="button" class="outline-button" :disabled="isWorkflowBusy" @click="inventoryStockFormOpen = false; resetInventoryStockDraft()">취소</button><button type="button" class="primary-button" :disabled="inventoryLocked || isWorkflowBusy" @click="addInventoryStock">보유 자재 저장</button></div>
                 </div>
               </section>
 
               <section class="inventory-calculation-card">
                 <div><span class="panel-kicker">4단계</span><h4>계산·승인</h4><p>계산은 예상 사용만 만들며 실제 재고를 바꾸지 않습니다. 사용자가 승인한 뒤에만 예약 수량을 올립니다.</p></div>
-                <div class="inventory-calculation-actions"><button type="button" class="primary-button" :disabled="inventoryLocked" @click="calculateInventoryPlanForProject">보유 자재 기반 계산</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="outline-button" @click="cancelInventoryPlanForProject">계획 취소</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="primary-button" @click="approveInventoryPlanForProject">승인·재고 예약</button></div>
+                <div class="inventory-calculation-actions"><button type="button" class="primary-button" :disabled="inventoryLocked || isWorkflowBusy" @click="calculateInventoryPlanForProject">보유 자재 기반 계산</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="outline-button" :disabled="isWorkflowBusy" @click="cancelInventoryPlanForProject">계획 취소</button><button v-if="inventoryPlan?.status === 'calculated'" type="button" class="primary-button" :disabled="isWorkflowBusy" @click="approveInventoryPlanForProject">승인·재고 예약</button><button v-if="inventoryPlan?.status === 'approved'" type="button" class="outline-button" :disabled="isWorkflowBusy" @click="releaseApprovedInventoryPlanForProject">예약 해제·계획 취소</button></div>
               </section>
 
               <section v-if="inventoryState.missingFields.length" class="inventory-missing-panel"><strong>확인 필요 — 계획을 확정하지 않았습니다.</strong><ul><li v-for="item in inventoryState.missingFields" :key="item">{{ item }}</li></ul></section>
@@ -2264,23 +2714,23 @@ onMounted(() => {
             </section>
 
             <section class="optimization-catalog panel-card">
-              <div class="panel-heading"><div><span class="panel-kicker">첫 번째 확인</span><h3>자재 카탈로그</h3></div><button type="button" class="outline-button" @click="catalogFormOpen = !catalogFormOpen; resetCatalogDraft()">{{ catalogFormOpen ? '입력 닫기' : '자재 기준 입력' }}</button></div>
+              <div class="panel-heading"><div><span class="panel-kicker">첫 번째 확인</span><h3>자재 카탈로그</h3></div><button type="button" class="outline-button" :aria-expanded="catalogFormOpen" aria-controls="catalog-editor" :disabled="inventoryLocked" @click="catalogFormOpen = !catalogFormOpen; resetCatalogDraft()">{{ catalogFormOpen ? '입력 닫기' : '자재 기준 입력' }}</button></div>
               <p class="optimization-help">실제 업체 가격과 원자재 규격을 입력해야 총비용을 계산할 수 있습니다. 입력하지 않은 값은 임의로 채우지 않습니다.</p>
               <div class="catalog-selection-grid">
-                <label>판넬 부재에 사용할 자재<select v-model="project.optimization.selectedPanelMaterialId" @change="selectOptimizationMaterial('panel', project.optimization.selectedPanelMaterialId)"><option value="">선택하지 않음</option><option v-for="item in optimizationCatalogPanels" :key="item.id" :value="item.id">{{ item.name || '이름 없음' }} · {{ item.material }}</option></select></label>
-                <label>프로파일 부재에 사용할 자재<select v-model="project.optimization.selectedProfileMaterialId" @change="selectOptimizationMaterial('profile', project.optimization.selectedProfileMaterialId)"><option value="">선택하지 않음</option><option v-for="item in optimizationCatalogProfiles" :key="item.id" :value="item.id">{{ item.name || '이름 없음' }} · {{ item.material }}</option></select></label>
+                <label>판넬 부재에 사용할 자재<select :value="project.optimization.selectedPanelMaterialId" :disabled="inventoryLocked || isWorkflowBusy" @change="handleOptimizationMaterialChange('panel', $event)"><option value="">선택하지 않음</option><option v-for="item in optimizationCatalogPanels" :key="item.id" :value="item.id">{{ item.name || '이름 없음' }} · {{ item.material }}</option></select></label>
+                <label>프로파일 자동 산출<select disabled aria-describedby="profile-optimization-note"><option>도면 근거 파서 연결 전 · 사용 안 함</option></select></label>
               </div>
-              <p v-if="optimizationCatalogProfiles.length && !project.optimization.members.some((member) => member.materialType === 'profile')" class="optimization-help">현재 도면 분석에서 구조용 프로파일 부재의 위치·규격 근거를 찾지 못했습니다. 임의의 프로파일 수량은 만들지 않으며, 근거가 추가된 부재만 프로파일 절단 계산에 사용합니다.</p>
+              <p id="profile-optimization-note" class="optimization-help">현재 도면 분석은 구조용 프로파일의 위치·규격·수량 근거를 자동 생성하지 않습니다. 등록한 프로파일 카탈로그를 임의의 발주 수량으로 연결하지 않습니다.</p>
                   <div v-if="!project.optimization.catalog.length" class="optimization-empty"><strong>등록된 실제 자재 기준이 없습니다.</strong><span>샘플 단가와 규격을 자동으로 만들지 않습니다. 자재 기준 입력 버튼에서 업체 자료를 넣어주세요.</span></div>
                 <div v-else class="catalog-list">
                 <article v-for="item in project.optimization.catalog" :key="item.id" class="catalog-item" :class="{ selected: item.id === project.optimization.selectedPanelMaterialId || item.id === project.optimization.selectedProfileMaterialId }">
                   <div class="catalog-item__main"><strong>{{ item.name || '이름 없음' }} <em v-if="item.source === 'sample'" class="sample-data-label">샘플 데이터</em></strong><span>{{ item.materialType === 'panel' ? '판재' : '프로파일' }} · {{ item.material || '재질 확인 필요' }}</span><small>{{ catalogSpec(item) }}</small><small>{{ item.surfaceFinish || '표면 마감 확인 필요' }} · {{ item.color || '색상 확인 필요' }}</small></div>
                   <div class="catalog-item__meta"><b>{{ item.unitPrice === null ? '단가 확인 필요' : `${item.unitPrice.toLocaleString('ko-KR')}원/${item.unitLabel}` }}</b><span>{{ catalogMissingLabel(item) }}</span></div>
-                  <div class="catalog-item__actions"><button type="button" class="text-button" @click="editCatalogItem(item)">수정</button><button type="button" class="icon-button danger" aria-label="자재 기준 삭제" @click="removeCatalogItem(item)">×</button></div>
+                  <div class="catalog-item__actions"><button type="button" class="text-button" :disabled="inventoryLocked" @click="editCatalogItem(item)">수정</button><button type="button" class="icon-button danger" aria-label="자재 기준 삭제" :disabled="inventoryLocked" @click="removeCatalogItem(item)">×</button></div>
                 </article>
               </div>
 
-              <div v-if="catalogFormOpen" class="catalog-editor">
+              <div v-if="catalogFormOpen" id="catalog-editor" class="catalog-editor">
                 <div class="editor-heading"><strong>{{ editingCatalogId ? '자재 기준 수정' : '새 자재 기준 입력' }}</strong><span>빈 가격·규격은 계산 보류로 남습니다.</span></div>
                 <div class="settings-grid catalog-form-grid">
                   <label>자재 이름<input v-model="catalogDraft.name" type="text" placeholder="예: 외벽 판넬" /></label>
@@ -2322,9 +2772,9 @@ onMounted(() => {
 
             <details class="optimization-details panel-card">
               <summary><span><b>현재 현장 자투리 입력</b><small>사용처와 사용 시점이 없는 자투리는 자동으로 재사용하지 않습니다.</small></span><strong>{{ project.optimization.scraps.filter((scrap) => scrap.source === 'existing').length }}개</strong></summary>
-              <div class="existing-scrap-list"><article v-for="scrap in project.optimization.scraps.filter((item) => item.source === 'existing')" :key="scrap.id" class="existing-scrap-row"><div><strong>{{ scrap.material }} · {{ formatOptimizationMm(scrap.lengthMm) }}<span v-if="scrap.widthMm"> × {{ formatOptimizationMm(scrap.widthMm) }}</span></strong><small>{{ scrap.currentLocation }} · 발생 구역 {{ scrap.originZone }}</small></div><span :class="['review-pill', scrap.status === 'reuse-planned' ? 'confirmed' : 'blocked']">{{ scrap.status === 'reuse-planned' ? '재사용 예정' : '현장 재사용 불가' }}</span><button type="button" class="icon-button danger" aria-label="자투리 삭제" @click="removeExistingScrap(scrap.id)">×</button></article></div>
-              <button type="button" class="outline-button" @click="scrapFormOpen = !scrapFormOpen">{{ scrapFormOpen ? '자투리 입력 닫기' : '현장 자투리 등록' }}</button>
-              <div v-if="scrapFormOpen" class="scrap-editor">
+              <div class="existing-scrap-list"><article v-for="scrap in project.optimization.scraps.filter((item) => item.source === 'existing')" :key="scrap.id" class="existing-scrap-row"><div><strong>{{ scrap.material }} · {{ formatOptimizationMm(scrap.lengthMm) }}<span v-if="scrap.widthMm"> × {{ formatOptimizationMm(scrap.widthMm) }}</span></strong><small>{{ scrap.currentLocation }} · 발생 구역 {{ scrap.originZone }}</small></div><span :class="['review-pill', scrap.status === 'reuse-planned' ? 'confirmed' : 'blocked']">{{ scrap.status === 'reuse-planned' ? '재사용 예정' : '현장 재사용 불가' }}</span><button type="button" class="icon-button danger" aria-label="자투리 삭제" :disabled="inventoryLocked" @click="removeExistingScrap(scrap.id)">×</button></article></div>
+              <button type="button" class="outline-button" :aria-expanded="scrapFormOpen" aria-controls="scrap-editor" :disabled="inventoryLocked" @click="scrapFormOpen = !scrapFormOpen">{{ scrapFormOpen ? '자투리 입력 닫기' : '현장 자투리 등록' }}</button>
+              <div v-if="scrapFormOpen" id="scrap-editor" class="scrap-editor">
                 <label>자재<select v-model="scrapDraft.materialId"><option value="">선택</option><option v-for="item in project.optimization.catalog" :key="item.id" :value="item.id">{{ item.name }} · {{ item.material }}</option></select></label>
                 <label>길이(mm)<input v-model="scrapDraft.lengthMm" type="number" min="1" /></label>
                 <label>폭(mm, 판재)<input v-model="scrapDraft.widthMm" type="number" min="1" /></label>
@@ -2348,7 +2798,7 @@ onMounted(() => {
 
             <section v-if="project.optimization.scenarios.length" class="optimization-results">
               <div class="section-heading compact"><div><p class="eyebrow">계산 결과 비교</p><h2>어떤 기준으로 발주할까요?</h2><p>기본 추천은 총비용 최소안입니다. 가격이 없으면 총비용은 계산 불가로 남고 물량·폐기량만 비교합니다.</p></div></div>
-              <div class="scenario-grid"><button v-for="scenario in project.optimization.scenarios" :key="scenario.id" type="button" class="scenario-card" :class="{ selected: optimizationScenario?.id === scenario.id }" @click="chooseOptimizationScenario(scenario.id)"><span>{{ scenario.label }}</span><strong>{{ formatOptimizationCost(scenario.cost.totalCost) }}</strong><small>원자재 {{ scenario.stockCount }}{{ scenario.orderQuantity === null ? '개' : `개 주문` }} · 절단 {{ scenario.cutCount }}회</small><small v-if="scenario.wasteAreaM2 !== null">폐기 면적 {{ scenario.wasteAreaM2.toFixed(2) }}㎡ · 폐기율 {{ scenario.wasteRate === null ? '계산 불가' : `${scenario.wasteRate}%` }}</small><small v-else>폐기 길이 {{ formatOptimizationMm(scenario.wasteLengthMm) }}</small><em>{{ scenario.recommendation }}</em></button></div>
+              <div class="scenario-grid"><button v-for="scenario in project.optimization.scenarios" :key="scenario.id" type="button" class="scenario-card" :class="{ selected: optimizationScenario?.id === scenario.id }" :aria-pressed="optimizationScenario?.id === scenario.id" @click="chooseOptimizationScenario(scenario.id)"><span>{{ scenario.label }}</span><strong>{{ formatOptimizationCost(scenario.cost.totalCost) }}</strong><small>원자재 {{ scenario.stockCount }}{{ scenario.orderQuantity === null ? '개' : `개 주문` }} · 절단 {{ scenario.cutCount }}회</small><small v-if="scenario.wasteAreaM2 !== null">폐기 면적 {{ scenario.wasteAreaM2.toFixed(2) }}㎡ · 폐기율 {{ scenario.wasteRate === null ? '계산 불가' : `${scenario.wasteRate}%` }}</small><small v-else>폐기 길이 {{ formatOptimizationMm(scenario.wasteLengthMm) }}</small><em>{{ scenario.recommendation }}</em></button></div>
               <div class="scenario-explanation">총비용 최소안은 폐기량 최소안보다 자재 폐기량이 많을 수 있습니다. 현장에서는 구매비·절단비·운반비·보관비까지 합산해 결정해야 합니다.</div>
               <div v-if="optimizationScenario?.stockLengthComparison.length" class="stock-length-comparison panel-card"><strong>원자재 길이 비교</strong><span v-for="item in optimizationScenario.stockLengthComparison" :key="`${item.stockLengthMm}-${item.stockCount}`" :class="{ selected: item.selected }">{{ item.stockLengthMm.toLocaleString('ko-KR') }}mm · {{ item.stockCount }}개<span v-if="item.selected"> · 선택</span></span></div>
 
@@ -2363,7 +2813,7 @@ onMounted(() => {
                 <div v-else class="optimization-empty"><strong>표시할 절단 배치가 없습니다.</strong><span>원자재 규격과 부재 치수를 확인하세요.</span></div>
               </section>
 
-              <section class="optimization-output panel-card"><div class="panel-heading"><div><span class="panel-kicker">발주·현장 출력</span><h3>파일로 내려받기</h3></div><span class="table-note">비용이 계산 불가여도 입력값·근거·검토 상태는 출력할 수 있습니다.</span></div><div class="output-button-grid"><button type="button" class="outline-button" @click="exportSelectedOptimization('orders')">자재 발주서 CSV</button><button type="button" class="outline-button" @click="exportSelectedOptimization('members')">부재 절단 목록 CSV</button><button type="button" class="outline-button" @click="exportSelectedOptimization('plans')">절단 배치 CSV</button><button type="button" class="outline-button" @click="exportSelectedOptimization('scraps')">자투리 목록 CSV</button><button type="button" class="outline-button" @click="exportSelectedOptimization('comparison')">비용 비교표 CSV</button><button type="button" class="outline-button" @click="exportSelectedOptimization('inputs')">입력값·도면 근거 CSV</button><button type="button" class="primary-button" @click="printSelectedCuttingPlans">절단 배치도 인쇄·PDF</button></div></section>
+              <section class="optimization-output panel-card"><div class="panel-heading"><div><span class="panel-kicker">발주·현장 출력</span><h3>파일로 내려받기</h3></div><span class="table-note">{{ inventoryPlanControlsFieldOutputs ? '보유 재고 계획 기준 출력 · 원자재 비교안은 현장 출력에서 제외' : canDownloadOptimization ? '계산·배치 검증 통과' : '계산과 배치 검증을 통과해야 출력할 수 있습니다.' }}</span></div><div class="output-button-grid"><button type="button" class="outline-button" :disabled="!canDownloadOptimizationOrders" @click="exportSelectedOptimization('orders')">{{ inventoryPlan?.status === 'approved' ? '재고 반영 신규 발주서 CSV' : '자재 발주서 CSV' }}</button><button type="button" class="outline-button" :disabled="!canDownloadOptimization" @click="exportSelectedOptimization('members')">도면 필요 부재 목록 CSV</button><button type="button" class="outline-button" :disabled="!canDownloadOptimizationFieldPlan" @click="exportSelectedOptimization('plans')">{{ inventoryPlan?.status === 'approved' ? '재고 반영 절단 계획 CSV' : '절단 배치 CSV' }}</button><button type="button" class="outline-button" :disabled="!canDownloadRawOptimizationArtifacts" @click="exportSelectedOptimization('scraps')">{{ inventoryPlanControlsFieldOutputs ? '원자재 비교 자투리(출력 잠금)' : '자투리 목록 CSV' }}</button><button type="button" class="outline-button" :disabled="!canDownloadOptimization" @click="exportSelectedOptimization('comparison')">{{ inventoryPlanControlsFieldOutputs ? '재고 미반영 원자재 비교표 CSV' : '비용 비교표 CSV' }}</button><button type="button" class="outline-button" :disabled="!canDownloadOptimization" @click="exportSelectedOptimization('inputs')">최적화 입력 근거 CSV</button><button type="button" class="primary-button" :disabled="!canDownloadRawOptimizationArtifacts" @click="printSelectedCuttingPlans">{{ inventoryPlanControlsFieldOutputs ? '원자재 비교 배치 인쇄 잠금' : '절단 배치도 인쇄·PDF' }}</button></div></section>
 
               <section class="optimization-validation panel-card"><div class="panel-heading"><div><span class="panel-kicker">계산 신뢰성 검사</span><h3>배치 검증 결과</h3></div><span :class="['orderability-badge', { ready: project.optimization.validation.passed }]">{{ project.optimization.validation.passed ? '검증 통과' : '확인 필요' }}</span></div><div v-if="project.optimization.validation.passed" class="validation-success">모든 부재가 한 번씩 배정되고, 원자재 밖 배치·겹침·절단폭·개구부 중복을 검사했습니다.</div><ul v-else class="validation-errors"><li v-for="message in optimizationValidationMessages()" :key="message">{{ message }}</li></ul></section>
             </section>

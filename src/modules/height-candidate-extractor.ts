@@ -21,8 +21,12 @@ function lowerConfidence(left: ConfidenceLevel, right: ConfidenceLevel): Confide
 
 function roleOf(dimension: DimensionValue): HeightRole {
   if (isOpeningDimension(dimension)) return 'none'
-  if (dimension.heightRole) return dimension.heightRole
+  // A PDF text item can inherit a nearby "floor to ceiling" label while the
+  // actual number is an EL/LEVEL datum. Treat explicit level markers first so
+  // +0.000 remains a valid datum rather than an invalid direct height.
+  if (dimension.heightRole === 'level-calculated') return 'level-calculated'
   if (/\b(EL|LEVEL)\b|T\.?O\.?S|T\.?O\.?F|FFL|GL/i.test(dimension.context)) return 'level'
+  if (dimension.heightRole) return dimension.heightRole
   if (/(벽체\s*높이|wall\s*height|층고|천장고|ceiling\s*height|높이|height|\bH\s*[:=]|\bHT\s*[:=]?)/i.test(dimension.context)) return 'direct'
   if (['elevation', 'section'].includes(dimension.drawingType.toLowerCase()) && validMm(dimension.valueMm) && (dimension.valueMm as number) >= 1800 && (dimension.valueMm as number) <= 20000) return 'direct'
   return 'none'
@@ -34,7 +38,7 @@ function isOpeningDimension(dimension: DimensionValue) {
     ? dimension.context.slice(Math.max(0, sourceIndex - 24), sourceIndex + dimension.sourceText.length + 24)
     : dimension.context
   const tokenMatches = [...nearbyText.matchAll(/\b([DW]\s*[-#]?\s*\d+)\b/gi)]
-    .filter((match) => !/(?:\bWALL|\b벽체)\s*$/i.test(nearbyText.slice(0, match.index || 0)))
+    .filter((match) => !/(?:\bWALL(?:\s+NO\.?)?|\b벽체(?:\s+번호)?|\bAXIS|\bGRID|\b축|\b그리드)\s*$/i.test(nearbyText.slice(0, match.index || 0)))
   return Boolean(tokenMatches.length || /(문|door|창|window)/i.test(nearbyText))
 }
 
@@ -49,6 +53,10 @@ export function isDirectHeightDimension(dimension: DimensionValue) {
 
 function validMm(value: number | null): value is number {
   return value !== null && Number.isFinite(value) && value > 0
+}
+
+function finiteLevelMm(value: number | null): value is number {
+  return value !== null && Number.isFinite(value)
 }
 
 function zoneFromText(text: string) {
@@ -131,7 +139,10 @@ function dimensionMatchesWall(dimension: DimensionValue, wall: Wall) {
 }
 
 export function deriveLevelHeightDimensions(dimensions: DimensionValue[]) {
-  const levels = dimensions.filter((dimension) => isLevelDimension(dimension) && validMm(dimension.valueMm) && primaryEvidence(dimension))
+  // Elevation datums are signed coordinates, not physical lengths. Negative
+  // and zero datums are valid inputs; the derived wall height must still pass
+  // the positive-length validation below.
+  const levels = dimensions.filter((dimension) => isLevelDimension(dimension) && finiteLevelMm(dimension.valueMm) && primaryEvidence(dimension))
   const groups = new Map<string, DimensionValue[]>()
   for (const level of levels) {
     const key = levelGroupKey(level)
@@ -142,12 +153,15 @@ export function deriveLevelHeightDimensions(dimensions: DimensionValue[]) {
   }
   const derived: DimensionValue[] = []
   for (const group of groups.values()) {
-    const upper = group.find((level) => levelRole(level) === 'upper')
-    const lower = group.find((level) => levelRole(level) === 'lower')
+    const uppers = group.filter((level) => levelRole(level) === 'upper')
+    const lowers = group.filter((level) => levelRole(level) === 'lower')
     const unknown = group.filter((level) => levelRole(level) === 'unknown')
-    const pair = upper && lower
-      ? [upper, lower] as const
-      : !upper && !lower && unknown.length === 2
+    // A page can contain several floor/roof datums. Guessing the first upper
+    // and lower value can silently create the wrong wall height, so automatic
+    // derivation is limited to an unambiguous 1:1 pair.
+    const pair = uppers.length === 1 && lowers.length === 1 && unknown.length === 0
+      ? [uppers[0], lowers[0]] as const
+      : uppers.length === 0 && lowers.length === 0 && unknown.length === 2
         ? [...unknown].sort((left, right) => (right.valueMm as number) - (left.valueMm as number)) as [DimensionValue, DimensionValue]
         : null
     if (!pair) continue

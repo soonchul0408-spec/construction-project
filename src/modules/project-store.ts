@@ -1,6 +1,7 @@
 import { emptyInventoryCuttingState, emptyOptimizationState, PROJECT_STATUS_DESCRIPTIONS } from '../types/domain'
 import { emptyHeightDiagnostics } from './height-diagnostics'
 import { emptyConsistencyValidation } from './consistency-validator'
+import { isCostSummaryPage, maskSensitiveCostText } from './cost-summary-parser.ts'
 import type { AnalysisStage, DimensionValue, ProjectState, ProjectStatus, ProjectWorkflow } from '../types/domain'
 
 const STORAGE_KEY = 'drawing-material-calculator:project:v1'
@@ -78,7 +79,7 @@ function migrateProject(project: ProjectState): ProjectState {
     reviewConfirmed: Boolean(project.workflow?.reviewConfirmed),
     modelBuilt: Boolean(project.workflow?.modelBuilt || project.model?.isReady),
     takeoffCalculated: Boolean(project.workflow?.takeoffCalculated || project.takeoffs?.length),
-    optimizationCalculated: Boolean(project.workflow?.optimizationCalculated || project.optimization?.scenarios?.length),
+    optimizationCalculated: Boolean(project.workflow?.optimizationCalculated && project.optimization?.sourceFingerprint),
   }
   const status: ProjectStatus = project.status || (workflow.takeoffCalculated ? 'partial' : project.files?.length ? 'needs-review' : 'empty')
   return {
@@ -101,7 +102,7 @@ function migrateProject(project: ProjectState): ProjectState {
       ? { ...emptyHeightDiagnostics(), ...project.heightDiagnostics, stages: project.heightDiagnostics.stages || [], entries: project.heightDiagnostics.entries || [] }
       : emptyHeightDiagnostics(),
     consistencyValidation: project.consistencyValidation
-      ? { ...emptyConsistencyValidation(), ...project.consistencyValidation, tolerances: { ...emptyConsistencyValidation().tolerances, ...(project.consistencyValidation.tolerances || {}) } }
+      ? { ...emptyConsistencyValidation(), ...project.consistencyValidation, tolerances: { ...emptyConsistencyValidation().tolerances, ...project.consistencyValidation.tolerances } }
       : emptyConsistencyValidation(),
     optimization: project.optimization
       ? {
@@ -125,7 +126,7 @@ function migrateProject(project: ProjectState): ProjectState {
                 ...project.optimization.inventory,
                 settings: {
                   ...emptyInventoryCuttingState().settings,
-                  ...(project.optimization.inventory.settings || {}),
+                  ...project.optimization.inventory.settings,
                 },
                 requirements: (project.optimization.inventory.requirements || []).map((requirement) => ({
                   ...requirement,
@@ -160,22 +161,143 @@ function migrateProject(project: ProjectState): ProjectState {
   }
 }
 
+export function projectForStorage(project: ProjectState, compact = false) {
+  const costPageKeys = new Set(project.files.flatMap((file) => file.pages
+    .filter((page) => isCostSummaryPage(file, page))
+    .map((page) => `${file.id}:${page.pageNumber}`)))
+  const costSourcePageKeys = new Set(project.files.flatMap((file) => file.pages
+    .filter((page) => isCostSummaryPage(file, page))
+    .map((page) => `${file.name}:${page.pageNumber}`)))
+  const costFileNames = new Set(project.files.filter((file) => file.pages.some((page) => isCostSummaryPage(file, page))).map((file) => file.name))
+  const maskKnownFileNames = (value: string) => [...costFileNames].reduce(
+    (masked, fileName) => masked.replaceAll(fileName, maskSensitiveCostText(fileName)),
+    value,
+  )
+  const sanitizeStoredValue = <T>(value: T): T => {
+    if (typeof value === 'string') return maskKnownFileNames(value) as T
+    if (Array.isArray(value)) return value.map((item) => sanitizeStoredValue(item)) as T
+    if (!value || typeof value !== 'object') return value
+    const record = value as Record<string, unknown>
+    const costEvidence = typeof record.fileId === 'string' && typeof record.pageNumber === 'number'
+      && (record.drawingKind === 'cost-summary' || costPageKeys.has(`${record.fileId}:${record.pageNumber}`))
+    const sanitized: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(record)) {
+      if (key === 'imageDataUrl' && (compact || costEvidence)) continue
+      if (costEvidence && typeof item === 'string' && ['rawText', 'note', 'fileName'].includes(key)) {
+        sanitized[key] = maskSensitiveCostText(maskKnownFileNames(item))
+      } else {
+        sanitized[key] = sanitizeStoredValue(item)
+      }
+    }
+    return sanitized as T
+  }
+  const scrubDimension = (dimension: DimensionValue, force = false) => {
+    const costDimension = force || costSourcePageKeys.has(`${dimension.sourceFile}:${dimension.pageNumber}`) || dimension.evidence.some((evidence) => costPageKeys.has(`${evidence.fileId}:${evidence.pageNumber}`) || evidence.drawingKind === 'cost-summary')
+    const sourceFileNeedsMasking = costFileNames.has(dimension.sourceFile)
+    if (!costDimension && !sourceFileNeedsMasking && !compact) return dimension
+    return {
+      ...dimension,
+      sourceFile: sourceFileNeedsMasking ? maskSensitiveCostText(dimension.sourceFile) : dimension.sourceFile,
+      label: costDimension ? maskSensitiveCostText(dimension.label) : dimension.label,
+      sourceText: costDimension ? maskSensitiveCostText(dimension.sourceText) : dimension.sourceText,
+      displayValue: costDimension ? maskSensitiveCostText(dimension.displayValue) : dimension.displayValue,
+      context: costDimension ? maskSensitiveCostText(dimension.context) : dimension.context,
+      calculation: costDimension && dimension.calculation ? maskSensitiveCostText(dimension.calculation) : dimension.calculation,
+      referencePlane: costDimension && dimension.referencePlane ? maskSensitiveCostText(dimension.referencePlane) : dimension.referencePlane,
+      levelDatum: dimension.levelDatum
+        ? {
+            ...dimension.levelDatum,
+            marker: costDimension ? maskSensitiveCostText(dimension.levelDatum.marker) : dimension.levelDatum.marker,
+            referencePlane: costDimension && dimension.levelDatum.referencePlane ? maskSensitiveCostText(dimension.levelDatum.referencePlane) : dimension.levelDatum.referencePlane,
+          }
+        : dimension.levelDatum,
+      evidence: dimension.evidence.map((evidence) => ({
+        ...evidence,
+        fileName: costDimension || costFileNames.has(evidence.fileName) ? maskSensitiveCostText(evidence.fileName) : evidence.fileName,
+        rawText: costDimension && evidence.rawText ? maskSensitiveCostText(evidence.rawText) : evidence.rawText,
+        note: costDimension && evidence.note ? maskSensitiveCostText(evidence.note) : evidence.note,
+        imageDataUrl: costDimension || compact ? undefined : evidence.imageDataUrl,
+      })),
+    }
+  }
+  const scrubHeightCandidate = (candidate: ProjectState['heightCandidates'][number]) => {
+    const costCandidate = candidate.pageNumber !== null && costSourcePageKeys.has(`${candidate.sourceFileName}:${candidate.pageNumber}`)
+    const sourceFileNeedsMasking = costFileNames.has(candidate.sourceFileName)
+    if (!costCandidate && !sourceFileNeedsMasking && !compact) return candidate
+    return {
+      ...candidate,
+      sourceFileName: sourceFileNeedsMasking ? maskSensitiveCostText(candidate.sourceFileName) : candidate.sourceFileName,
+      originalText: costCandidate ? maskSensitiveCostText(candidate.originalText) : candidate.originalText,
+      nearbyLabel: costCandidate ? maskSensitiveCostText(candidate.nearbyLabel) : candidate.nearbyLabel,
+      evidenceText: costCandidate ? maskSensitiveCostText(candidate.evidenceText) : candidate.evidenceText,
+      evidenceImage: costCandidate || compact ? null : candidate.evidenceImage,
+    }
+  }
+  const storageProject = {
+    ...project,
+    dimensions: project.dimensions.map((dimension) => scrubDimension(dimension)),
+    heightCandidates: project.heightCandidates.map(scrubHeightCandidate),
+    heightDiagnostics: {
+      ...project.heightDiagnostics,
+      candidates: project.heightDiagnostics.candidates.map(scrubHeightCandidate),
+      entries: project.heightDiagnostics.entries.map((entry) => costSourcePageKeys.has(`${entry.sourceFile}:${entry.pageNumber}`) || compact
+        ? {
+            ...entry,
+            sourceFile: costFileNames.has(entry.sourceFile) ? maskSensitiveCostText(entry.sourceFile) : entry.sourceFile,
+            displayValue: costSourcePageKeys.has(`${entry.sourceFile}:${entry.pageNumber}`) ? maskSensitiveCostText(entry.displayValue) : entry.displayValue,
+            evidenceText: costSourcePageKeys.has(`${entry.sourceFile}:${entry.pageNumber}`) ? maskSensitiveCostText(entry.evidenceText) : entry.evidenceText,
+            originalText: costSourcePageKeys.has(`${entry.sourceFile}:${entry.pageNumber}`) && entry.originalText ? maskSensitiveCostText(entry.originalText) : entry.originalText,
+            evidenceImage: null,
+          }
+        : entry),
+    },
+    costSummary: {
+      ...project.costSummary,
+      rows: project.costSummary.rows.map((row) => ({
+        ...row,
+        vendor: '[업체명 비식별화]',
+        item: maskSensitiveCostText(row.item),
+        evidence: row.evidence.map((evidence) => ({
+          ...evidence,
+          fileName: maskSensitiveCostText(evidence.fileName),
+          rawText: evidence.rawText ? maskSensitiveCostText(evidence.rawText) : evidence.rawText,
+          imageDataUrl: undefined,
+        })),
+      })),
+    },
+    files: project.files.map((file) => ({
+      ...file,
+      name: costFileNames.has(file.name) ? maskSensitiveCostText(file.name) : file.name,
+      previewUrl: compact || (file.pages[0] ? isCostSummaryPage(file, file.pages[0]) : file.kind === 'cost-summary') ? '' : file.previewUrl,
+      pages: file.pages.map((page) => {
+        const costPage = isCostSummaryPage(file, page)
+        return {
+          ...page,
+          text: costPage ? maskSensitiveCostText(page.text) : page.text,
+          previewUrl: compact || costPage ? '' : page.previewUrl,
+          dimensions: page.dimensions.map((dimension) => scrubDimension(dimension, costPage)),
+          zones: costPage ? [] : page.zones,
+          roomNames: costPage ? [] : page.roomNames,
+          axisLabels: costPage ? [] : page.axisLabels,
+          scales: costPage ? [] : page.scales,
+          vectorSegments: costPage ? [] : page.vectorSegments,
+          processingNotes: costPage ? [] : page.processingNotes,
+        }
+      }),
+    })),
+    restoredFromStorage: false,
+  }
+  return sanitizeStoredValue(storageProject)
+}
+
 export function saveProject(project: ProjectState) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...project, restoredFromStorage: false }))
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(projectForStorage(project)))
   } catch (error) {
     // Large multi-page scans can exceed browser quota. Preserve the structured
     // analysis and evidence even when thumbnails have to be omitted.
     try {
-      const compact = {
-        ...project,
-        files: project.files.map((file) => ({
-          ...file,
-          previewUrl: '',
-          pages: file.pages.map((page) => ({ ...page, previewUrl: '' })),
-        })),
-        restoredFromStorage: false,
-      }
+      const compact = projectForStorage(project, true)
       localStorage.setItem(STORAGE_KEY, JSON.stringify(compact))
     } catch (compactError) {
       console.warn('분석 결과를 로컬 저장소에 저장하지 못했습니다.', error, compactError)

@@ -7,6 +7,7 @@ import type {
   Opening,
   Wall,
 } from '../types/domain'
+import { isCostSummaryPage } from './cost-summary-parser.ts'
 
 const ZONE_COLORS = ['#2f6fed', '#c97935', '#16836d', '#9b59b6', '#bb4d70', '#3c8799']
 
@@ -26,7 +27,7 @@ function openingTokenFromDimension(dimension: DimensionValue) {
   const sourceIndex = dimension.context.lastIndexOf(dimension.sourceText)
   const matches = [...dimension.context.matchAll(/\b([DW]\s*[-#]?\s*\d+)\b/gi)]
     .map((match) => ({ token: match[1]?.replace(/\s+/g, '').toUpperCase() || '', index: match.index || 0 }))
-    .filter((match) => match.token && !/(?:\bWALL|\b벽체)\s*$/i.test(dimension.context.slice(0, match.index)))
+    .filter((match) => match.token && !/(?:\bWALL(?:\s+NO\.?)?|\b벽체(?:\s+번호)?|\bAXIS|\bGRID|\b축|\b그리드)\s*$/i.test(dimension.context.slice(0, match.index)))
   if (!matches.length) return null
   return [...matches].sort((a, b) => Math.abs(a.index - sourceIndex) - Math.abs(b.index - sourceIndex))[0]?.token || null
 }
@@ -104,17 +105,52 @@ function zoneFromContext(context: string, sourceText?: string) {
 }
 
 function wallNumberFromContext(context: string, index: number) {
-  const match = context.match(/(?:벽체|WALL|W)\s*[-#]?\s*([A-Z0-9-]+)/i)
-  if (!match?.[1]) return `W-${String(index + 1).padStart(2, '0')}`
-  const value = match[1].toUpperCase()
-  return value.startsWith('W-') ? value : `W-${value}`
+  return explicitWallNumberFromContext(context) || `W-${String(index + 1).padStart(2, '0')}`
+}
+
+function labeledWallNumberFromContext(context: string) {
+  const tokenWithDigit = '((?=[A-Z0-9-]*\\d)[A-Z0-9]+(?:-[A-Z0-9]+)*)'
+  const labeled = context.match(new RegExp(`(?:벽체|WALL)\\s*(?:NO\\.?|번호)?\\s*[-#:]?\\s*(?:W\\s*[-#]?\\s*)?${tokenWithDigit}`, 'i'))
+  const value = labeled?.[1]?.toUpperCase()
+  return value ? `W-${value.replace(/^W-?/, '')}` : null
 }
 
 function explicitWallNumberFromContext(context: string) {
-  const match = context.match(/(?:벽체|WALL|W)\s*[-#]?\s*([A-Z0-9-]+)/i)
-  if (!match?.[1]) return null
-  const value = match[1].toUpperCase()
-  return value.startsWith('W-') ? value : `W-${value}`
+  const labeled = labeledWallNumberFromContext(context)
+  if (labeled) return labeled
+  const tokenWithDigit = '((?=[A-Z0-9-]*\\d)[A-Z0-9]+(?:-[A-Z0-9]+)*)'
+  const bare = context.match(new RegExp(`\\bW\\s*[-#]?\\s*${tokenWithDigit}\\b`, 'i'))
+  const value = bare?.[1]?.toUpperCase()
+  return value ? `W-${value.replace(/^W-?/, '')}` : null
+}
+
+function dimensionSourceContext(dimension: DimensionValue) {
+  const evidenceText = dimension.evidence
+    .map((item) => item.rawText || '')
+    .find((text) => text.includes(dimension.sourceText) && /(?:ZONE|구역|벽체|WALL|축|AXIS|GRID|문|DOOR|창|WINDOW|폭|WIDTH|높이|HEIGHT|OFFSET|창대|SILL)/i.test(text))
+  if (evidenceText) return evidenceText
+  const sourceIndex = dimension.context.lastIndexOf(dimension.sourceText)
+  if (sourceIndex < 0) return dimension.context
+  const precedingZones = zoneMatches(dimension.context).filter((match) => match.index < sourceIndex)
+  const latestZone = precedingZones.at(-1)
+  return latestZone ? dimension.context.slice(latestZone.index) : dimension.context
+}
+
+function openingWallNumberFromDimension(dimension: DimensionValue) {
+  const sourceContext = dimensionSourceContext(dimension)
+  // A bare W-1 beside WINDOW is the opening label, not a wall target. Only an
+  // explicit WALL/벽체 label can constrain an opening to a wall number.
+  return labeledWallNumberFromContext(sourceContext)
+}
+
+function axisFromDimension(dimension: DimensionValue) {
+  const sourceContext = dimensionSourceContext(dimension)
+  const sourceIndex = sourceContext.lastIndexOf(dimension.sourceText)
+  const matches = [...sourceContext.matchAll(/(?:축|AXIS|GRID)\s*[:#]?\s*([A-Z0-9]+(?:\s*[-/]\s*[A-Z0-9]+)?)/gi)]
+    .map((match) => ({ value: (match[1] || '').replace(/\s+/g, '').toUpperCase(), index: match.index || 0 }))
+    .filter((match) => match.value)
+  if (!matches.length) return null
+  return [...matches].sort((a, b) => Math.abs(a.index - sourceIndex) - Math.abs(b.index - sourceIndex))[0]?.value || null
 }
 
 function openingTypeFromDimension(dimension: DimensionValue) {
@@ -133,15 +169,18 @@ function valueFollowsKeyword(dimension: DimensionValue, keywordPattern: RegExp) 
 }
 
 function preferredHeightCandidates(wallDimension: DimensionValue, dimensions: DimensionValue[], wallNumber: string) {
-  const candidates = dimensions.filter(isUsableHeightDimension)
-  if (!candidates.length) return []
+  const allCandidates = dimensions.filter(isUsableHeightDimension)
+  if (!allCandidates.length) return []
   const wallZone = zoneFromContext(wallDimension.context, wallDimension.sourceText)
-  const manual = candidates.filter((candidate) => {
+  const manual = allCandidates.filter((candidate) => {
     const candidateZone = candidate.manualZone || zoneFromContext(candidate.context, candidate.sourceText)
     return candidate.manualWallNumber?.toLowerCase() === wallNumber.toLowerCase() &&
       candidateZone.toLowerCase() === wallZone.toLowerCase()
   })
   if (manual.length) return [...manual].sort((a, b) => confidenceRank(b.confidence) - confidenceRank(a.confidence))
+  const explicitlyLinked = allCandidates.filter((candidate) => explicitWallNumberFromContext(candidate.context)?.toLowerCase() === wallNumber.toLowerCase())
+  if (explicitlyLinked.length) return [...explicitlyLinked].sort((a, b) => confidenceRank(b.confidence) - confidenceRank(a.confidence))
+  const candidates = allCandidates.filter((candidate) => !explicitWallNumberFromContext(candidate.context))
   const samePage = candidates.filter((candidate) => {
     const wallEvidence = wallDimension.evidence[0]
     const heightEvidence = candidate.evidence[0]
@@ -253,7 +292,15 @@ function geometryFromVector(
   }
 }
 
-function buildOpenings(files: AnalyzedFile[], dimensions: DimensionValue[]): Map<string, Opening[]> {
+interface OpeningAssignment {
+  zone?: string
+  wallNumber?: string
+  axis?: string
+  pageKeys: Set<string>
+  ambiguous: boolean
+}
+
+function buildOpenings(files: AnalyzedFile[], dimensions: DimensionValue[]) {
   const groups = new Map<string, { type: Opening['type']; token?: string; dimensions: DimensionValue[]; pageKeys: Set<string> }>()
   for (const dimension of dimensions) {
     const type = openingTypeFromDimension(dimension)
@@ -269,31 +316,34 @@ function buildOpenings(files: AnalyzedFile[], dimensions: DimensionValue[]): Map
     group.pageKeys.add(pageKey)
     groups.set(groupKey, group)
   }
-  const result = new Map<string, Opening[]>()
-  const addOpening = (key: string, opening: Opening) => {
-    const openings = result.get(key) || []
-    if (!openings.some((candidate) => candidate.id === opening.id)) openings.push(opening)
-    result.set(key, openings)
-  }
+  const openings: Opening[] = []
+  const assignments = new Map<string, OpeningAssignment>()
   for (const [groupKey, group] of groups.entries()) {
     const values = group.dimensions.filter((item) => item.valueMm !== null)
       .sort((a, b) => confidenceRank(b.confidence) - confidenceRank(a.confidence))
-    const widthCandidates = values.filter((item) => valueFollowsKeyword(item, /(폭|\bwidth\b|\bw(?:[-#]?\d+)\b)/i))
+    const widthCandidates = values.filter((item) => valueFollowsKeyword(item, /(폭|\bwidth\b)/i))
     const widthValue = widthCandidates[0] || values[0]
-    const heightCandidates = values.filter((item) => valueFollowsKeyword(item, /(높이|\bheight\b|\bh(?:[-#]?\d+)\b)/i) && item.id !== widthValue?.id)
+    const heightCandidates = values.filter((item) => valueFollowsKeyword(item, /(높이|\bheight\b)/i) && item.id !== widthValue?.id)
     const heightValue = heightCandidates[0] || values.find((item) => item.id !== widthValue?.id)
-    const offsetValue = values.find((item) => valueFollowsKeyword(item, /(offset|벽끝|기준선|시작점|from|거리)/i))
-    const sillValue = values.find((item) => valueFollowsKeyword(item, /(창대|문턱|sill)/i))
+    const offsetCandidates = values.filter((item) => valueFollowsKeyword(item, /(offset|벽끝|기준선|시작점|from|거리)/i))
+    const sillCandidates = values.filter((item) => valueFollowsKeyword(item, /(창대|문턱|sill)/i))
+    const offsetValue = offsetCandidates[0]
+    const sillValue = sillCandidates[0]
     const widthMm = widthValue?.valueMm || null
     const heightMm = heightValue?.valueMm || null
     const widthConflict = makeDimensionConflict('opening', `opening-width-${groupKey}`, widthCandidates.length ? widthCandidates : (widthValue ? [widthValue] : []), '같은 개구부의 폭 치수가 서로 다릅니다.')
     const heightConflict = makeDimensionConflict('opening', `opening-height-${groupKey}`, heightCandidates.length ? heightCandidates : (heightValue ? [heightValue] : []), '같은 개구부의 높이 치수가 서로 다릅니다.')
-    const conflict = widthConflict || heightConflict
+    const offsetConflict = makeDimensionConflict('opening', `opening-offset-${groupKey}`, offsetCandidates, '같은 개구부 표기가 서로 다른 위치에 반복됩니다. 개구부 인스턴스 수와 각 offset을 확인해야 합니다.')
+    const sillConflict = makeDimensionConflict('opening', `opening-sill-${groupKey}`, sillCandidates, '같은 개구부의 창대·문턱 높이가 서로 다릅니다.')
+    const conflict = widthConflict || heightConflict || offsetConflict || sillConflict
     const evidence = values.flatMap((item) => item.evidence)
     const zones = group.dimensions
       .map((item) => zoneFromContext(item.context, item.sourceText))
       .filter((zone) => zone !== '구역 미확인')
-    const zone = zones[0]
+    const uniqueZones = [...new Set(zones.map((value) => value.toLowerCase()))]
+    const zone = uniqueZones.length === 1 ? zones[0] : undefined
+    const wallNumbers = [...new Set(group.dimensions.map(openingWallNumberFromDimension).filter((value): value is string => Boolean(value)))]
+    const axes = [...new Set(group.dimensions.map(axisFromDimension).filter((value): value is string => Boolean(value)))]
     const opening: Opening = {
       id: `opening-${groupKey}`,
       type: group.type,
@@ -310,18 +360,25 @@ function buildOpenings(files: AnalyzedFile[], dimensions: DimensionValue[]): Map
       excludedFromAutomaticTakeoff: !widthMm || !heightMm || Boolean(conflict),
       conflict,
     }
-    for (const pageKey of group.pageKeys) addOpening(pageKey, opening)
-    if (zone) addOpening('__global__', opening)
+    openings.push(opening)
+    assignments.set(opening.id, {
+      zone,
+      wallNumber: wallNumbers.length === 1 ? wallNumbers[0] : undefined,
+      axis: axes.length === 1 ? axes[0] : undefined,
+      pageKeys: group.pageKeys,
+      ambiguous: uniqueZones.length > 1 || wallNumbers.length > 1 || axes.length > 1,
+    })
   }
   // Keep the argument in the adapter contract so a future vector parser can
-  // attach openings to pages without changing this public function signature.
+  // contribute opening targets without changing the caller contract.
   void files
-  return result
+  return { openings, assignments }
 }
 
 export function buildWalls(files: AnalyzedFile[], dimensions: DimensionValue[]): Wall[] {
-  const openingMap = buildOpenings(files, dimensions)
-  const lengthDimensions = dimensions.filter((dimension) => isLengthDimension(dimension))
+  const geometryDimensions = dimensions.filter((dimension) => !dimension.evidence.some((item) => item.drawingKind === 'cost-summary'))
+  const builtOpenings = buildOpenings(files, geometryDimensions)
+  const lengthDimensions = geometryDimensions.filter((dimension) => isLengthDimension(dimension))
   const planDimensions = lengthDimensions.filter((dimension) => dimensionKind(dimension) === 'floor-plan')
   const rawCandidates = planDimensions.length ? planDimensions : lengthDimensions
   // The same wall dimension is commonly repeated in a plan, elevation and a
@@ -341,17 +398,21 @@ export function buildWalls(files: AnalyzedFile[], dimensions: DimensionValue[]):
     const kindScore = (dimensionKind(b) === 'floor-plan' ? 2 : 0) - (dimensionKind(a) === 'floor-plan' ? 2 : 0)
     return kindScore || confidenceRank(b.confidence) - confidenceRank(a.confidence)
   }))
+  const wallCandidates = candidates.map((group, index) => {
+    const dimension = group[0]
+    const evidence = dimension?.evidence[0]
+    if (!dimension || !evidence) return null
+    return {
+      index,
+      pageKey: `${evidence.fileId}-${evidence.pageNumber}`,
+      zone: zoneFromContext(dimension.context, dimension.sourceText),
+      wallNumber: wallNumberFromContext(dimension.context, index),
+      axis: axisFromDimension(dimension),
+    }
+  }).filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
   const walls: Wall[] = []
   const zoneIndex = new Map<string, number>()
   const usedVectorIds = new Set<string>()
-  const wallCountByPage = new Map<string, number>()
-  for (const group of candidates) {
-    const dimension = group[0]
-    const evidence = dimension.evidence[0]
-    if (!evidence) continue
-    const pageKey = `${evidence.fileId}-${evidence.pageNumber}`
-    wallCountByPage.set(pageKey, (wallCountByPage.get(pageKey) || 0) + 1)
-  }
   let cursorX = 0
   let cursorZ = 0
 
@@ -365,21 +426,45 @@ export function buildWalls(files: AnalyzedFile[], dimensions: DimensionValue[]):
     if (!zoneIndex.has(zone)) zoneIndex.set(zone, zoneIndex.size)
     const zoneColor = ZONE_COLORS[(zoneIndex.get(zone) || 0) % ZONE_COLORS.length]
     const wallNumber = wallNumberFromContext(dimension.context, index)
-    const heightCandidates = preferredHeightCandidates(dimension, dimensions, wallNumber)
+    const heightCandidates = preferredHeightCandidates(dimension, geometryDimensions, wallNumber)
     const safeHeightCandidates = heightCandidates.filter(isSafeHeightDimension)
     const lengthConflict = makeDimensionConflict('length', `wall-length-${zone}-${wallNumberFromContext(dimension.context, index)}`, group, '같은 벽체의 길이 치수가 서로 다릅니다.')
     const heightConflict = makeDimensionConflict('height', `wall-height-${zone}-${wallNumberFromContext(dimension.context, index)}`, heightCandidates, '연결된 입면도·단면도의 높이 치수가 서로 다릅니다.')
     // Never choose one side of a real height conflict. The wall remains
     // unmodelled until a person confirms which source is correct.
     const height = heightConflict ? null : safeHeightCandidates[0] || null
-    const pageKey = evidence ? `${evidence.fileId}-${evidence.pageNumber}` : ''
-    const pageOpenings = [...(openingMap.get(pageKey) || []), ...(openingMap.get('__global__') || [])]
-      .filter((opening, openingIndex, openings) => openings.findIndex((candidate) => candidate.id === opening.id) === openingIndex)
-    const zoneOpenings = pageOpenings.filter((opening) => opening.zone === zone)
-    const openings = zoneOpenings.length
-      ? zoneOpenings
-      : (pageOpenings.length && (wallCountByPage.get(pageKey) || 0) === 1 ? pageOpenings : [])
-    const openingAssignmentNeedsReview = pageOpenings.length > 0 && openings.length === 0
+    const openings: Opening[] = []
+    let openingAssignmentNeedsReview = false
+    for (const opening of builtOpenings.openings) {
+      const assignment = builtOpenings.assignments.get(opening.id)
+      if (!assignment) continue
+      const pageScopedCandidates = wallCandidates.filter((candidate) => assignment.pageKeys.has(candidate.pageKey))
+      const zoneScopedCandidates = assignment.zone
+        ? wallCandidates.filter((candidate) => candidate.zone.toLowerCase() === assignment.zone?.toLowerCase())
+        : []
+      // An explicit zone is a constraint, not a hint. Falling back to another
+      // zone on the same page would subtract the opening from the wrong wall.
+      const scopedCandidates = assignment.zone ? zoneScopedCandidates : pageScopedCandidates
+      let targetCandidates = scopedCandidates
+      if (assignment.wallNumber) {
+        const wallNumberCandidates = wallCandidates.filter((candidate) => candidate.wallNumber.toLowerCase() === assignment.wallNumber?.toLowerCase())
+        targetCandidates = scopedCandidates.filter((candidate) => candidate.wallNumber.toLowerCase() === assignment.wallNumber?.toLowerCase())
+        if (!targetCandidates.length && !assignment.zone) targetCandidates = wallNumberCandidates
+      }
+      if (assignment.axis) {
+        const axisCandidates = targetCandidates.filter((candidate) => candidate.axis === assignment.axis)
+        targetCandidates = axisCandidates.length || assignment.wallNumber || assignment.zone
+          ? axisCandidates
+          : wallCandidates.filter((candidate) => candidate.axis === assignment.axis)
+      }
+      const currentIsScoped = scopedCandidates.some((candidate) => candidate.index === index)
+      const unresolvedExplicitTarget = Boolean(assignment.zone || assignment.wallNumber || assignment.axis) && targetCandidates.length === 0
+      if (assignment.ambiguous || targetCandidates.length !== 1) {
+        if (currentIsScoped || (unresolvedExplicitTarget && pageScopedCandidates.some((candidate) => candidate.index === index))) openingAssignmentNeedsReview = true
+        continue
+      }
+      if (targetCandidates[0]?.index === index) openings.push(opening)
+    }
     const lengthM = dimension.valueMm / 1000
     const vector = vectorForDimension(files, dimension, usedVectorIds)
     const vectorGeometry = vector ? geometryFromVector(files, dimension, vector) : null
@@ -540,7 +625,7 @@ export function buildBuildingGeometry(walls: Wall[], wallThicknessMm = 75, roof:
 
 export function listMissingGeometryItems(files: AnalyzedFile[], walls: Wall[]) {
   const missing: string[] = []
-  const kinds = new Set(files.map((file) => file.kind))
+  const kinds = new Set(files.flatMap((file) => file.pages.filter((page) => !isCostSummaryPage(file, page)).map((page) => page.kind)))
   if (!kinds.has('floor-plan')) missing.push('평면도 필요')
   if (!kinds.has('elevation') && !kinds.has('section')) missing.push('입면도 또는 단면도 필요 — 높이 정보 없음')
   if (!walls.length) missing.push('벽체 길이 또는 치수선 미확인')

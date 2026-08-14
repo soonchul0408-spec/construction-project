@@ -528,10 +528,10 @@ onBeforeUnmount(() => {
     </div>
     <div class="viewer-toolbar" aria-label="3차원 보기 도구">
       <div class="viewer-modes" role="group" aria-label="보기 방향">
-        <button type="button" :class="{ active: viewMode === 'iso' }" @click="setView('iso')">등각</button>
-        <button type="button" :class="{ active: viewMode === 'top' }" @click="setView('top')">위</button>
-        <button type="button" :class="{ active: viewMode === 'front' }" @click="setView('front')">앞</button>
-        <button type="button" :class="{ active: viewMode === 'side' }" @click="setView('side')">옆</button>
+        <button type="button" :class="{ active: viewMode === 'iso' }" :aria-pressed="viewMode === 'iso'" @click="setView('iso')">등각</button>
+        <button type="button" :class="{ active: viewMode === 'top' }" :aria-pressed="viewMode === 'top'" @click="setView('top')">위</button>
+        <button type="button" :class="{ active: viewMode === 'front' }" :aria-pressed="viewMode === 'front'" @click="setView('front')">앞</button>
+        <button type="button" :class="{ active: viewMode === 'side' }" :aria-pressed="viewMode === 'side'" @click="setView('side')">옆</button>
       </div>
       <div class="viewer-actions">
         <button type="button" class="fit-button" @click="fitCamera">전체 맞춤</button>
@@ -626,6 +626,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
   pointer-events: none;
 }
 
@@ -643,6 +645,7 @@ onBeforeUnmount(() => {
 
 .viewer-modes {
   display: flex;
+  flex-wrap: wrap;
   gap: 3px;
   padding: 3px;
   border: 1px solid #d3e2db;
@@ -774,14 +777,15 @@ onBeforeUnmount(() => {
 
 @media (max-width: 640px) {
   .viewer-shell {
-    min-height: 360px;
-    height: 360px;
+    min-height: 430px;
+    height: 430px;
   }
 
   .viewer-status {
-    top: 68px;
+    top: 126px;
+    right: 9px;
     left: 9px;
-    max-width: 52%;
+    max-width: none;
     padding: 7px 9px;
   }
 
@@ -792,14 +796,29 @@ onBeforeUnmount(() => {
     top: 9px;
     right: 9px;
     left: 9px;
+    align-items: stretch;
+  }
+
+  .viewer-modes {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .viewer-modes button {
     padding: 5px 7px;
   }
 
+  .viewer-actions {
+    width: 100%;
+  }
+
+  .viewer-actions button {
+    flex: 1 1 0;
+  }
+
   .viewer-axis-legend {
-    top: 68px;
+    top: 198px;
     right: 9px;
     gap: 4px;
     padding: 6px;

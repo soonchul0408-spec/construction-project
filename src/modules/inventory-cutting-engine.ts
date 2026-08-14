@@ -26,6 +26,18 @@ function nonNegative(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
+const MAX_REQUIREMENT_QUANTITY = 10_000
+const MAX_TOTAL_REQUIREMENT_UNITS = 50_000
+const MAX_STOCK_QUANTITY = 1_000_000
+
+function positiveInteger(value: number | null | undefined, max = MAX_REQUIREMENT_QUANTITY) {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= max
+}
+
+function nonNegativeInteger(value: number | null | undefined) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
 function sameNumber(left: number | null | undefined, right: number | null | undefined) {
   return typeof left === 'number' && typeof right === 'number' && left === right
 }
@@ -50,6 +62,18 @@ function scaleForMember(member: CuttingMember, pages: DrawingPage[]) {
   return page?.scales?.[0]?.ratio || ''
 }
 
+const GENERATED_REQUIREMENT_FIELDS: Array<keyof InventoryRequirement> = [
+  'materialType', 'materialName', 'thicknessMm', 'widthMm', 'requiredLengthMm',
+  'heightMm', 'quantity', 'surfaceFinish', 'color', 'drawingScale',
+]
+
+function requirementFingerprint(requirement: InventoryRequirement) {
+  return JSON.stringify(GENERATED_REQUIREMENT_FIELDS.map((field) => {
+    const value = requirement[field]
+    return typeof value === 'string' ? value.trim() : value ?? null
+  }))
+}
+
 export function getInventoryRequirementMissingFields(requirement: InventoryRequirement) {
   const missing: string[] = []
   if (!text(requirement.materialName)) missing.push('자재 종류')
@@ -60,7 +84,7 @@ export function getInventoryRequirementMissingFields(requirement: InventoryRequi
   if (!text(requirement.surfaceFinish)) missing.push('표면 마감')
   if (!text(requirement.color)) missing.push('색상')
   if (!text(requirement.drawingScale)) missing.push('도면 축척')
-  if (!positive(requirement.quantity)) missing.push('수량')
+  if (!positiveInteger(requirement.quantity)) missing.push(`수량(1~${MAX_REQUIREMENT_QUANTITY.toLocaleString('ko-KR')}의 정수)`)
   return missing
 }
 
@@ -114,6 +138,7 @@ export function buildInventoryRequirementsFromMembers(
         ],
       }
       const normalized = normalizeInventoryRequirement(requirement)
+      normalized.generatedFingerprint = requirementFingerprint(normalized)
       if (!normalized.missingFields.length && member.reviewStatus === 'ready' && member.confidence === 'high') {
         // 값이 모두 추출됐더라도 자동 확정하지 않습니다. 사람이 확인 버튼을 눌러야 ready가 됩니다.
         normalized.status = 'needs-review'
@@ -130,6 +155,29 @@ export function mergeInventoryRequirements(
   const merged = generated.map((next) => {
     const previous = existingById.get(next.id)
     if (!previous) return next
+    const nextFingerprint = next.generatedFingerprint || requirementFingerprint(next)
+    const sourceChanged = previous.generatedFingerprint
+      ? previous.generatedFingerprint !== nextFingerprint
+      : GENERATED_REQUIREMENT_FIELDS.some((field) => {
+          const previousValue = previous[field]
+          const nextValue = next[field]
+          const normalizedPrevious = typeof previousValue === 'string' ? previousValue.trim() : previousValue ?? null
+          const normalizedNext = typeof nextValue === 'string' ? nextValue.trim() : nextValue ?? null
+          return normalizedPrevious !== normalizedNext
+        })
+    if (sourceChanged) {
+      return normalizeInventoryRequirement({
+        ...next,
+        status: 'needs-review',
+        confirmedAt: null,
+        confirmedBy: null,
+        generatedFingerprint: nextFingerprint,
+        notes: [...new Set([
+          ...(next.notes || []),
+          '도면 또는 자재 카탈로그의 원천 값이 변경되어 이전 사용자 확인을 무효화했습니다.',
+        ])],
+      })
+    }
     const value: InventoryRequirement = {
       ...next,
       materialName: previous.materialName || next.materialName,
@@ -141,6 +189,7 @@ export function mergeInventoryRequirements(
       surfaceFinish: previous.surfaceFinish || next.surfaceFinish,
       color: previous.color || next.color,
       drawingScale: previous.drawingScale || next.drawingScale,
+      generatedFingerprint: nextFingerprint,
       status: previous.status,
       confirmedAt: previous.confirmedAt,
       confirmedBy: previous.confirmedBy,
@@ -239,8 +288,22 @@ function specificationReasons(stock: OwnedMaterial, requirement: InventoryRequir
   return reasons
 }
 
-function cutLengthFor(requirement: InventoryRequirement, kerfMm: number, allowanceMm: number) {
-  return (requirement.requiredLengthMm || 0) + kerfMm + allowanceMm
+function pieceLengthFor(requirement: InventoryRequirement, allowanceMm: number) {
+  return (requirement.requiredLengthMm || 0) + allowanceMm
+}
+
+function sameLength(left: number, right: number) {
+  return Math.abs(left - right) <= 0.001
+}
+
+function canCutFromLength(stockLengthMm: number, requirement: InventoryRequirement, kerfMm: number, allowanceMm: number) {
+  const pieceLengthMm = pieceLengthFor(requirement, allowanceMm)
+  return sameLength(stockLengthMm, pieceLengthMm) || stockLengthMm >= pieceLengthMm + kerfMm
+}
+
+function consumedLengthFor(stockLengthMm: number, requirement: InventoryRequirement, kerfMm: number, allowanceMm: number) {
+  const pieceLengthMm = pieceLengthFor(requirement, allowanceMm)
+  return sameLength(stockLengthMm, pieceLengthMm) ? pieceLengthMm : pieceLengthMm + kerfMm
 }
 
 function materialCanMatch(stock: OwnedMaterial, requirement: InventoryRequirement) {
@@ -270,7 +333,7 @@ function buildExcludedMaterials(
     else if (!readyRequirements.some((requirement) => materialCanMatch(stock, requirement))) {
       const first = readyRequirements[0]
       reasons.push(...specificationReasons(stock, first))
-    } else if (!readyRequirements.some((requirement) => materialCanMatch(stock, requirement) && stock.lengthMm !== null && stock.lengthMm > cutLengthFor(requirement, kerfMm, allowanceMm))) {
+    } else if (!readyRequirements.some((requirement) => materialCanMatch(stock, requirement) && stock.lengthMm !== null && canCutFromLength(stock.lengthMm, requirement, kerfMm, allowanceMm))) {
       reasons.push('필요 조각보다 보유 길이가 짧음')
     }
     if (!reasons.length) return null
@@ -316,7 +379,9 @@ function appendCut(
   allowanceMm: number,
 ) {
   const before = usage.remainingLengthMm
-  const actualUsedLengthMm = cutLengthFor(requirement, kerfMm, allowanceMm)
+  const pieceLengthMm = pieceLengthFor(requirement, allowanceMm)
+  const appliedKerfMm = sameLength(before, pieceLengthMm) ? 0 : kerfMm
+  const actualUsedLengthMm = consumedLengthFor(before, requirement, kerfMm, allowanceMm)
   const remainingLengthMm = round(Math.max(0, before - actualUsedLengthMm))
   const cut: InventoryCut = {
     id: `inventory-cut-${usage.id}-${cutOrder}`,
@@ -326,7 +391,7 @@ function appendCut(
     location: requirement.location,
     cutOrder,
     requiredLengthMm: requirement.requiredLengthMm as number,
-    kerfMm,
+    kerfMm: appliedKerfMm,
     actualUsedLengthMm,
     stockLengthBeforeMm: before,
     remainingLengthMm,
@@ -368,10 +433,22 @@ export function calculateInventoryCutPlan(input: {
   }
   if (!requirements.length) missingFields.push('필요 조각 목록')
   if (!input.ownedMaterials.length) missingFields.push('보유 자재')
+  for (const stock of input.ownedMaterials) {
+    const label = stock.materialName || stock.id
+    if (!positiveInteger(stock.quantity, MAX_STOCK_QUANTITY)) missingFields.push(`${label}: 보유 수량(1~${MAX_STOCK_QUANTITY.toLocaleString('ko-KR')}의 정수)`)
+    if (!nonNegativeInteger(stock.reservedQuantity)) missingFields.push(`${label}: 예약 수량(0 이상의 정수)`)
+    if (nonNegativeInteger(stock.reservedQuantity) && positiveInteger(stock.quantity, MAX_STOCK_QUANTITY) && stock.reservedQuantity > stock.quantity) {
+      missingFields.push(`${label}: 예약 수량이 보유 수량보다 큼`)
+    }
+  }
   const kerfMm = input.settings.kerfMm ?? 0
   const allowanceMm = input.settings.minimumCutAllowanceMm ?? 0
   const minimumReusableOffcutMm = input.settings.minimumReusableOffcutMm ?? 0
   const excludedMaterials = buildExcludedMaterials(input.ownedMaterials, requirements, kerfMm, allowanceMm)
+  const totalRequirementUnits = requirements.reduce((sum, requirement) => sum + (Number.isInteger(requirement.quantity) && requirement.quantity > 0 ? requirement.quantity : 0), 0)
+  if (totalRequirementUnits > MAX_TOTAL_REQUIREMENT_UNITS) {
+    missingFields.push(`전체 필요 조각 수는 ${MAX_TOTAL_REQUIREMENT_UNITS.toLocaleString('ko-KR')}개 이하여야 합니다.`)
+  }
   if (missingFields.length) {
     return { status: 'needs-review', plan: null, missingFields: [...new Set(missingFields)], excludedMaterials }
   }
@@ -395,18 +472,17 @@ export function calculateInventoryCutPlan(input: {
 
   for (const item of units) {
     const requirement = item.requirement
-    const neededWithCut = cutLengthFor(requirement, kerfMm, allowanceMm)
     let selectedUsage: InventoryStockUsage | null = null
     for (const stock of stockCandidates(requirement)) {
       const existingUsages = usageByStock.get(stock.id) || []
       const reusableUsage = existingUsages
-        .filter((usage) => usage.remainingLengthMm > neededWithCut)
+        .filter((usage) => canCutFromLength(usage.remainingLengthMm, requirement, kerfMm, allowanceMm))
         .sort((left, right) => left.remainingLengthMm - right.remainingLengthMm)[0]
       if (reusableUsage) {
         selectedUsage = reusableUsage
         break
       }
-      if ((stock.lengthMm as number) <= neededWithCut) continue
+      if (!canCutFromLength(stock.lengthMm as number, requirement, kerfMm, allowanceMm)) continue
       const usedUnits = usedUnitsByStock.get(stock.id) || 0
       if (usedUnits < Math.max(0, stock.quantity - stock.reservedQuantity)) {
         selectedUsage = createUsage(stock, stock.reservedQuantity + usedUnits + 1)
@@ -420,7 +496,7 @@ export function calculateInventoryCutPlan(input: {
       appendCut(selectedUsage, requirement, item.unit, ++cutOrder, kerfMm, allowanceMm)
       continue
     }
-    const orderLengthMm = requirement.requiredLengthMm as number
+    const orderLengthMm = pieceLengthFor(requirement, allowanceMm)
     const key = [requirement.materialType, text(requirement.materialName), requirement.thicknessMm, requirement.widthMm, text(requirement.surfaceFinish), text(requirement.color), orderLengthMm].join('|')
     const existingOrder = newOrderGroups.get(key)
     if (existingOrder) {
@@ -475,6 +551,7 @@ export function calculateInventoryCutPlan(input: {
     wasteReductionLengthMm: baselineWasteLengthMm === null ? null : round(baselineWasteLengthMm - plannedWasteLengthMm),
     approvedAt: null,
     cancelledAt: null,
+    sourceFingerprint: null,
   }
   return { status: 'calculated', plan, missingFields: [], excludedMaterials }
 }
@@ -508,4 +585,39 @@ export function approveInventoryCutPlan(
 export function cancelInventoryCutPlan(plan: InventoryCutPlan, now = new Date().toISOString()) {
   if (plan.status !== 'calculated') return plan
   return { ...plan, status: 'cancelled' as const, cancelledAt: now }
+}
+
+export function releaseInventoryCutPlanReservation(
+  plan: InventoryCutPlan,
+  ownedMaterials: OwnedMaterial[],
+  now = new Date().toISOString(),
+) {
+  if (plan.status !== 'approved') {
+    return { ok: false, message: '승인되어 예약된 계획만 예약 해제할 수 있습니다.', plan, ownedMaterials }
+  }
+  const usageCounts = new Map<string, number>()
+  for (const usage of plan.usages) {
+    usageCounts.set(usage.ownedMaterialId, (usageCounts.get(usage.ownedMaterialId) || 0) + 1)
+  }
+  for (const [ownedMaterialId, count] of usageCounts) {
+    const stock = ownedMaterials.find((item) => item.id === ownedMaterialId)
+    if (!stock || stock.reservedQuantity < count) {
+      return {
+        ok: false,
+        message: '승인 이후 예약 수량이 변경되어 자동으로 해제할 수 없습니다. 재고 이력을 확인하세요.',
+        plan,
+        ownedMaterials,
+      }
+    }
+  }
+  const nextOwnedMaterials = ownedMaterials.map((stock) => ({
+    ...stock,
+    reservedQuantity: Math.max(0, stock.reservedQuantity - (usageCounts.get(stock.id) || 0)),
+  }))
+  return {
+    ok: true,
+    message: '승인된 계획을 취소하고 보유 자재 예약을 해제했습니다.',
+    plan: { ...plan, status: 'cancelled' as const, cancelledAt: now },
+    ownedMaterials: nextOwnedMaterials,
+  }
 }

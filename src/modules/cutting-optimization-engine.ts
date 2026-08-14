@@ -350,6 +350,14 @@ function candidateLengths(material: MaterialCatalogItem) {
   return [...new Set([...(material.stockLengthOptionsMm || []), material.stockLengthMm].filter((value): value is number => value !== null && value > 0))].sort((a, b) => a - b)
 }
 
+const CUT_TOLERANCE_MM = 0.001
+
+function fitsCutAxis(requiredMm: number, availableMm: number, kerfMm: number) {
+  const remainderMm = availableMm - requiredMm
+  return remainderMm >= -CUT_TOLERANCE_MM
+    && (Math.abs(remainderMm) <= CUT_TOLERANCE_MM || remainderMm + CUT_TOLERANCE_MM >= kerfMm)
+}
+
 function orientationOptions(member: CuttingMember, material: MaterialCatalogItem, stockLengthMm: number, stockWidthMm: number) {
   const original = { lengthMm: member.requiredLengthMm, widthMm: member.requiredWidthMm || 0, rotated: false }
   const values = [original]
@@ -357,7 +365,8 @@ function orientationOptions(member: CuttingMember, material: MaterialCatalogItem
   if (canRotate && original.widthMm > 0 && original.lengthMm !== original.widthMm) {
     values.push({ lengthMm: original.widthMm, widthMm: original.lengthMm, rotated: true })
   }
-  return values.filter((value) => value.lengthMm <= stockLengthMm && value.widthMm <= stockWidthMm)
+  const kerfMm = material.kerfMm || 0
+  return values.filter((value) => fitsCutAxis(value.lengthMm, stockLengthMm, kerfMm) && fitsCutAxis(value.widthMm, stockWidthMm, kerfMm))
 }
 
 function fitOrientation(member: CuttingMember, material: MaterialCatalogItem, stockLengthMm: number, stockWidthMm: number) {
@@ -391,6 +400,22 @@ function splitFreeRectangle(free: FreeRectangle, placed: { lengthMm: number; wid
   return result
 }
 
+function panelCutCount(free: FreeRectangle, placed: { lengthMm: number; widthMm: number }) {
+  return Number(free.lengthMm - placed.lengthMm > 0.001)
+    + Number(free.widthMm - placed.widthMm > 0.001)
+}
+
+const MAX_MEMBER_QUANTITY = 10_000
+const MAX_EXPANDED_MEMBER_UNITS = 50_000
+
+function expandMemberUnits(members: CuttingMember[]) {
+  const totalUnits = members.reduce((sum, member) => sum + (Number.isInteger(member.quantity) && member.quantity > 0 ? member.quantity : 0), 0)
+  if (totalUnits > MAX_EXPANDED_MEMBER_UNITS) return []
+  return members.flatMap((member) => Number.isInteger(member.quantity) && member.quantity > 0 && member.quantity <= MAX_MEMBER_QUANTITY
+    ? Array.from({ length: member.quantity }, () => member)
+    : [])
+}
+
 function storageForScrap(scrap: ScrapPiece, member: CuttingMember, material: MaterialCatalogItem, now: string) {
   const generatedAt = scrap.generatedAt || now
   const plannedUseAt = scrap.plannedUseAt || member.plannedInstallAt
@@ -405,14 +430,44 @@ function storageForScrap(scrap: ScrapPiece, member: CuttingMember, material: Mat
   }
 }
 
+function normalizedMaterialSpec(value: string) {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+function sameKnownDimension(left: number | null, right: number | null) {
+  return left !== null
+    && right !== null
+    && Number.isFinite(left)
+    && Number.isFinite(right)
+    && left > 0
+    && right > 0
+    && Math.abs(left - right) <= CUT_TOLERANCE_MM
+}
+
 function canUseScrap(scrap: ScrapPiece, member: CuttingMember, material: MaterialCatalogItem) {
   if (!scrap.available || scrap.status !== 'reuse-planned' || scrap.materialId !== material.id) return false
+  if (member.materialId !== material.id || member.materialType !== material.materialType || member.shape !== 'rectangle') return false
+  const catalogMaterial = normalizedMaterialSpec(material.material)
+  if (!catalogMaterial || normalizedMaterialSpec(scrap.material) !== catalogMaterial) return false
+  // A catalog row can retain its id while its physical specification is edited.
+  // Reject an older remnant unless its recorded thickness still matches exactly.
+  if (!sameKnownDimension(scrap.thicknessMm, material.thicknessMm)) return false
+  if (!Number.isFinite(scrap.lengthMm) || scrap.lengthMm <= 0 || !Number.isFinite(member.requiredLengthMm) || member.requiredLengthMm <= 0) return false
   // 목적 부재와 사용 예정 시점이 모두 정해진 자투리만 현장 재사용으로 씁니다.
   if (!scrap.plannedUseMemberId || scrap.plannedUseMemberId !== member.id || !scrap.plannedUseAt) return false
   if (scrap.usableZones.length && !scrap.usableZones.includes(member.zone)) return false
-  if (material.materialType === 'panel' && scrap.widthMm === null) return false
-  if (scrap.widthMm === null) return member.requiredLengthMm <= scrap.lengthMm
-  return Boolean(fitOrientation(member, material, scrap.lengthMm, scrap.widthMm))
+  if (material.materialType === 'panel') {
+    if (scrap.widthMm === null || !Number.isFinite(scrap.widthMm) || scrap.widthMm <= 0) return false
+    if (member.requiredWidthMm === null || !Number.isFinite(member.requiredWidthMm) || member.requiredWidthMm <= 0) return false
+    return Boolean(fitOrientation(member, material, scrap.lengthMm, scrap.widthMm))
+  }
+  // A profile remnant's recorded width represents its section width. Do not
+  // substitute a remnant from an older section specification under the same id.
+  if (material.stockWidthMm === null ? scrap.widthMm !== null : !sameKnownDimension(scrap.widthMm, material.stockWidthMm)) return false
+  if (member.requiredWidthMm !== null) return false
+  const kerfMm = material.kerfMm || 0
+  return Math.abs(scrap.lengthMm - member.requiredLengthMm) <= CUT_TOLERANCE_MM
+    || scrap.lengthMm + CUT_TOLERANCE_MM >= member.requiredLengthMm + kerfMm
 }
 
 function makePlacement(
@@ -487,6 +542,13 @@ function cloneScrap(scrap: ScrapPiece): ScrapPiece {
   return { ...scrap, usableZones: [...scrap.usableZones] }
 }
 
+function buildPersistentScrapState(existingScraps: ScrapPiece[], scenarioScraps: ScrapPiece[]) {
+  return [
+    ...existingScraps.filter((scrap) => scrap.source === 'existing').map(cloneScrap),
+    ...scenarioScraps.filter((scrap) => scrap.source === 'generated').map(cloneScrap),
+  ]
+}
+
 function finalizeExistingScraps(scraps: ScrapPiece[], plans: CuttingStockPlan[]) {
   const usedScrapIds = new Set(plans.flatMap((plan) => plan.scrapIds))
   for (const scrap of scraps) {
@@ -543,7 +605,12 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
         remainingAreaM2: scrap.widthMm === null || orientation.widthMm === null ? null : round((scrap.lengthMm * scrap.widthMm - orientation.lengthMm * orientation.widthMm) / 1_000_000),
         wasteLengthMm: null,
         wasteAreaM2: scrap.widthMm === null || orientation.widthMm === null ? null : round((scrap.lengthMm * scrap.widthMm - orientation.lengthMm * orientation.widthMm) / 1_000_000),
-        cutCount: orientation.lengthMm < scrap.lengthMm || (scrap.widthMm !== null && orientation.widthMm !== null && orientation.widthMm < scrap.widthMm) ? 1 : 0,
+        cutCount: scrap.widthMm === null || orientation.widthMm === null
+          ? Number(orientation.lengthMm < scrap.lengthMm)
+          : panelCutCount(
+              { xMm: 0, yMm: 0, lengthMm: scrap.lengthMm, widthMm: scrap.widthMm },
+              orientation,
+            ),
         scrapIds: [scrap.id],
       })
       const storage = storageForScrap(scrap, member, material, now)
@@ -560,6 +627,14 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
           plan?.scrapIds.push(remainderScrap.id)
           scraps.push(remainderScrap)
         }
+        if (plan) {
+          const reusableRemainderAreaM2 = round(remainderRects.reduce(
+            (sum, remainder) => sum + remainder.lengthMm * remainder.widthMm / 1_000_000,
+            0,
+          ))
+          plan.remainingAreaM2 = reusableRemainderAreaM2
+          plan.wasteAreaM2 = reusableRemainderAreaM2
+        }
       }
       continue
     }
@@ -572,7 +647,8 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
       if (choice && (!best || choice.score < best.score)) best = { plan, freeIndex: choice.freeIndex, option: choice.option, score: choice.score }
     }
     if (!best) {
-      const planId = `sheet-${plans.length + 1}-${stockLengthMm}`
+      const rawStockIndex = plans.filter((plan) => plan.source === 'raw-material').length + 1
+      const planId = `sheet-${material.id}-${rawStockIndex}-${stockLengthMm}`
       const freeRects: FreeRectangle[] = [{ xMm: 0, yMm: 0, lengthMm: stockLengthMm, widthMm: stockWidthMm }]
       const choice = chooseFreePlacement(freeRects, member, material)
       if (!choice) {
@@ -586,7 +662,7 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
         materialId: material.id,
         materialType: 'panel' as const,
         source: 'raw-material' as const,
-        stockIndex: plans.length + 1,
+        stockIndex: rawStockIndex,
         stockLengthMm,
         stockWidthMm,
         placements: [placement],
@@ -594,7 +670,7 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
         remainingAreaM2: null,
         wasteLengthMm: null,
         wasteAreaM2: null,
-        cutCount: choice.option.lengthMm < stockLengthMm || choice.option.widthMm < stockWidthMm ? 1 : 0,
+        cutCount: panelCutCount(freeRects[0] as FreeRectangle, choice.option),
         scrapIds: [],
         freeRects: nextFree,
       }
@@ -609,7 +685,7 @@ function packPanels(material: MaterialCatalogItem, members: CuttingMember[], exi
     }
     const placement = makePlacement(member, best.plan.id, free.xMm, free.yMm, best.option.lengthMm, best.option.widthMm, best.option.rotated, ++cutOrder, 'raw-material', material.kerfMm || 0)
     best.plan.placements.push(placement)
-    best.plan.cutCount += best.option.lengthMm < stockLengthMm || best.option.widthMm < stockWidthMm ? 1 : 0
+    best.plan.cutCount += panelCutCount(free, best.option)
     const nextFree = splitFreeRectangle(free, best.option, material.kerfMm || 0)
     freeRects.splice(best.freeIndex, 1, ...nextFree)
     ;(best.plan as CuttingStockPlan & { freeRects?: FreeRectangle[] }).freeRects = freeRects
@@ -639,13 +715,17 @@ function packProfiles(material: MaterialCatalogItem, members: CuttingMember[], e
   const remaining = [...members].sort((a, b) => b.requiredLengthMm - a.requiredLengthMm || a.installOrder - b.installOrder)
   const unplaced: string[] = []
   let cutOrder = 0
+  const kerfMm = material.kerfMm || 0
+  const exactFit = (availableLengthMm: number, requiredLengthMm: number) => Math.abs(availableLengthMm - requiredLengthMm) <= 0.001
+  const canFit = (availableLengthMm: number, requiredLengthMm: number) => exactFit(availableLengthMm, requiredLengthMm) || availableLengthMm >= requiredLengthMm + kerfMm
   for (const member of remaining) {
     const scrapIndex = scraps.findIndex((scrap) => canUseScrap(scrap, member, material))
     if (scrapIndex >= 0) {
       const scrap = scraps[scrapIndex]
       if (!scrap) continue
       const planId = `scrap-profile-${scrap.id}`
-      const placement = makePlacement(member, planId, 0, 0, member.requiredLengthMm, scrap.widthMm, false, ++cutOrder, 'onsite-scrap', material.kerfMm || 0)
+      const appliedKerfMm = exactFit(scrap.lengthMm, member.requiredLengthMm) ? 0 : kerfMm
+      const placement = makePlacement(member, planId, 0, 0, member.requiredLengthMm, scrap.widthMm, false, ++cutOrder, 'onsite-scrap', kerfMm)
       plans.push({
         id: planId,
         materialId: material.id,
@@ -655,46 +735,50 @@ function packProfiles(material: MaterialCatalogItem, members: CuttingMember[], e
         stockLengthMm: scrap.lengthMm,
         stockWidthMm: scrap.widthMm,
         placements: [placement],
-        remainingLengthMm: Math.max(0, scrap.lengthMm - member.requiredLengthMm - (member.requiredLengthMm < scrap.lengthMm ? material.kerfMm || 0 : 0)),
+        remainingLengthMm: Math.max(0, scrap.lengthMm - member.requiredLengthMm - appliedKerfMm),
         remainingAreaM2: null,
-        wasteLengthMm: Math.max(0, scrap.lengthMm - member.requiredLengthMm - (member.requiredLengthMm < scrap.lengthMm ? material.kerfMm || 0 : 0)),
+        wasteLengthMm: Math.max(0, scrap.lengthMm - member.requiredLengthMm - appliedKerfMm),
         wasteAreaM2: null,
-        cutCount: member.requiredLengthMm < scrap.lengthMm ? 1 : 0,
+        cutCount: appliedKerfMm > 0 ? 1 : 0,
         scrapIds: [scrap.id],
       })
       const storage = storageForScrap(scrap, member, material, now)
       Object.assign(scrap, storage, { available: false, status: 'reuse-planned', note: `즉시 현장 재사용 · ${member.zone} · ${member.id}` })
-      const remainingLengthMm = Math.max(0, scrap.lengthMm - member.requiredLengthMm - (member.requiredLengthMm < scrap.lengthMm ? material.kerfMm || 0 : 0))
+      const remainingLengthMm = Math.max(0, scrap.lengthMm - member.requiredLengthMm - appliedKerfMm)
       if (remainingLengthMm > 0) {
-        const remainderScrap = newScrap(material, 'generated', planId, remainingLengthMm, scrap.widthMm, member.zone, now, member.requiredLengthMm + (member.requiredLengthMm < scrap.lengthMm ? material.kerfMm || 0 : 0), 0)
+        const remainderScrap = newScrap(material, 'generated', planId, remainingLengthMm, scrap.widthMm, member.zone, now, member.requiredLengthMm + appliedKerfMm, 0)
         plans.find((candidate) => candidate.id === planId)?.scrapIds.push(remainderScrap.id)
         scraps.push(remainderScrap)
       }
       continue
     }
-    const candidate = plans.find((plan) => plan.source === 'raw-material' && (plan.remainingLengthMm || 0) - (plan.placements.length ? material.kerfMm || 0 : 0) >= member.requiredLengthMm)
+    const candidate = plans.find((plan) => plan.source === 'raw-material' && canFit(plan.remainingLengthMm || 0, member.requiredLengthMm))
     if (candidate) {
-      const used = candidate.stockLengthMm - (candidate.remainingLengthMm || 0) + (candidate.placements.length ? material.kerfMm || 0 : 0)
-      const placement = makePlacement(member, candidate.id, used, 0, member.requiredLengthMm, material.stockWidthMm, false, ++cutOrder, 'raw-material', material.kerfMm || 0)
+      const availableLengthMm = candidate.remainingLengthMm || 0
+      const appliedKerfMm = exactFit(availableLengthMm, member.requiredLengthMm) ? 0 : kerfMm
+      const used = candidate.stockLengthMm - availableLengthMm
+      const placement = makePlacement(member, candidate.id, used, 0, member.requiredLengthMm, material.stockWidthMm, false, ++cutOrder, 'raw-material', kerfMm)
       candidate.placements.push(placement)
-      candidate.remainingLengthMm = Math.max(0, (candidate.remainingLengthMm || 0) - member.requiredLengthMm - (candidate.placements.length > 1 ? material.kerfMm || 0 : 0))
+      candidate.remainingLengthMm = Math.max(0, availableLengthMm - member.requiredLengthMm - appliedKerfMm)
       candidate.wasteLengthMm = candidate.remainingLengthMm
-      candidate.cutCount += member.requiredLengthMm < candidate.stockLengthMm ? 1 : 0
+      candidate.cutCount += appliedKerfMm > 0 ? 1 : 0
       continue
     }
-    if (member.requiredLengthMm > stockLengthMm) {
+    if (!canFit(stockLengthMm, member.requiredLengthMm)) {
       unplaced.push(member.id)
       continue
     }
-    const planId = `bar-${plans.length + 1}-${stockLengthMm}`
-    const placement = makePlacement(member, planId, 0, 0, member.requiredLengthMm, material.stockWidthMm, false, ++cutOrder, 'raw-material', material.kerfMm || 0)
-    const remainingLengthMm = Math.max(0, stockLengthMm - member.requiredLengthMm - (member.requiredLengthMm < stockLengthMm ? material.kerfMm || 0 : 0))
+    const rawStockIndex = plans.filter((plan) => plan.source === 'raw-material').length + 1
+    const planId = `bar-${material.id}-${rawStockIndex}-${stockLengthMm}`
+    const appliedKerfMm = exactFit(stockLengthMm, member.requiredLengthMm) ? 0 : kerfMm
+    const placement = makePlacement(member, planId, 0, 0, member.requiredLengthMm, material.stockWidthMm, false, ++cutOrder, 'raw-material', kerfMm)
+    const remainingLengthMm = Math.max(0, stockLengthMm - member.requiredLengthMm - appliedKerfMm)
     plans.push({
       id: planId,
       materialId: material.id,
       materialType: 'profile',
       source: 'raw-material',
-      stockIndex: plans.length + 1,
+      stockIndex: rawStockIndex,
       stockLengthMm,
       stockWidthMm: material.stockWidthMm,
       placements: [placement],
@@ -702,7 +786,7 @@ function packProfiles(material: MaterialCatalogItem, members: CuttingMember[], e
       remainingAreaM2: null,
       wasteLengthMm: remainingLengthMm,
       wasteAreaM2: null,
-      cutCount: member.requiredLengthMm < stockLengthMm ? 1 : 0,
+      cutCount: appliedKerfMm > 0 ? 1 : 0,
       scrapIds: [],
     })
   }
@@ -744,7 +828,10 @@ function calculateCost(
 ): OptimizationCostBreakdown {
   const stockCount = plans.filter((plan) => plan.source === 'raw-material').length
   const cutCount = plans.reduce((sum, plan) => sum + plan.cutCount, 0)
-  const wasteScraps = scraps.filter((scrap) => scrap.status !== 'reuse-planned')
+  // Existing site stock that was not selected is still inventory, not waste
+  // produced by this cutting plan. Only newly generated remnants belong in
+  // this scenario's waste and disposal totals.
+  const wasteScraps = scraps.filter((scrap) => scrap.source === 'generated' && scrap.status !== 'reuse-planned')
   const wasteArea = wasteScraps.reduce((sum, scrap) => sum + (scrap.widthMm === null ? 0 : scrap.lengthMm * scrap.widthMm / 1_000_000), 0)
   const wasteLength = wasteScraps.reduce((sum, scrap) => sum + scrap.lengthMm, 0)
   const hasStorage = scraps.some((scrap) => (scrap.storageDays || 0) > 0)
@@ -789,6 +876,17 @@ function validateScenario(members: CuttingMember[], plans: CuttingStockPlan[], w
       if (plan.materialType === 'panel' && plan.stockWidthMm !== null && (placement.xMm + placement.lengthMm > plan.stockLengthMm + 0.001 || placement.yMm + (placement.widthMm || 0) > plan.stockWidthMm + 0.001)) {
         validation.oversizedMemberErrors.push(`${placement.label}: 원자재 바깥으로 배치되었습니다.`)
       }
+      if (plan.materialType === 'panel' && plan.stockWidthMm !== null && placement.widthMm !== null && placement.kerfMm > 0) {
+        const edgeGaps = [
+          placement.xMm,
+          plan.stockLengthMm - placement.xMm - placement.lengthMm,
+          placement.yMm,
+          plan.stockWidthMm - placement.yMm - placement.widthMm,
+        ]
+        if (edgeGaps.some((gapMm) => gapMm > CUT_TOLERANCE_MM && gapMm + CUT_TOLERANCE_MM < placement.kerfMm)) {
+          validation.kerfErrors.push(`${placement.label}: 원자재 외곽과 부재 사이 절단폭이 부족합니다.`)
+        }
+      }
       if (plan.materialType === 'profile' && placement.xMm + placement.lengthMm > plan.stockLengthMm + 0.001) validation.oversizedMemberErrors.push(`${placement.label}: 원자재 길이를 초과했습니다.`)
     }
     for (let first = 0; first < plan.placements.length; first += 1) {
@@ -806,6 +904,9 @@ function validateScenario(members: CuttingMember[], plans: CuttingStockPlan[], w
     }
   }
   for (const member of members) {
+    if (!Number.isInteger(member.quantity) || member.quantity <= 0 || member.quantity > MAX_MEMBER_QUANTITY) {
+      validation.unitErrors.push(`${member.id}: 수량은 1~${MAX_MEMBER_QUANTITY.toLocaleString('ko-KR')}의 정수여야 합니다.`)
+    }
     const count = actual.get(member.id) || 0
     if (count !== member.quantity) {
       validation.memberAssignmentErrors.push(count === 0
@@ -824,7 +925,7 @@ function validateScenario(members: CuttingMember[], plans: CuttingStockPlan[], w
     const wallMembers = members.filter((member) => member.sourceWallId === wall.id)
     if (!wallMembers.length || wall.lengthMm === null || wall.heightMm === null) continue
     const expectedArea = (wall.lengthMm * wall.heightMm - wall.openings.reduce((sum, opening) => sum + (opening.areaM2 || 0) * 1_000_000, 0)) / 1_000_000
-    const actualArea = wallMembers.reduce((sum, member) => sum + member.requiredLengthMm * (member.requiredWidthMm || 0) / 1_000_000, 0)
+    const actualArea = wallMembers.reduce((sum, member) => sum + member.requiredLengthMm * (member.requiredWidthMm || 0) * member.quantity / 1_000_000, 0)
     if (Math.abs(expectedArea - actualArea) > 0.01) validation.openingDoubleCountErrors.push(`${wall.number}: 개구부 차감 면적과 절단 부재 면적이 맞지 않습니다.`)
   }
   validation.passed = [
@@ -852,7 +953,7 @@ function aggregateScenario(
   const rawPlans = packed.stockPlans.filter((plan) => plan.source === 'raw-material')
   const stockCount = rawPlans.length
   const orderQuantity = stockCount === 0 ? 0 : material.minimumOrderQuantity === null ? null : Math.max(stockCount, material.minimumOrderQuantity)
-  const wasteScraps = packed.scraps.filter((scrap) => scrap.status !== 'reuse-planned')
+  const wasteScraps = packed.scraps.filter((scrap) => scrap.source === 'generated' && scrap.status !== 'reuse-planned')
   const wasteAreaM2 = material.materialType === 'panel'
     ? round(wasteScraps.reduce((sum, scrap) => sum + (scrap.widthMm === null ? 0 : scrap.lengthMm * scrap.widthMm / 1_000_000), 0))
     : null
@@ -909,14 +1010,15 @@ function compareScores(a: number[], b: number[]) {
 
 function packForObjective(material: MaterialCatalogItem, members: CuttingMember[], existingScraps: ScrapPiece[], objective: Objective, walls: Wall[], reviews: OptimizationReviewItem[], now: string) {
   const lengths = candidateLengths(material)
+  const packingMembers = expandMemberUnits(members)
   const candidates = lengths.map((length) => {
     const packed = material.materialType === 'panel'
-      ? packPanels(material, members, existingScraps, length, objective, now)
-      : packProfiles(material, members, existingScraps, length, now)
+      ? packPanels(material, packingMembers, existingScraps, length, objective, now)
+      : packProfiles(material, packingMembers, existingScraps, length, now)
     return aggregateScenario(objective, material, members, reviews, packed, walls)
   })
   if (!candidates.length) {
-    const packed: PackedResult = { stockPlans: [], scraps: [], unplacedMemberIds: members.map((member) => member.id), cutCount: 0 }
+    const packed: PackedResult = { stockPlans: [], scraps: [], unplacedMemberIds: packingMembers.map((member) => member.id), cutCount: 0 }
     return aggregateScenario(objective, material, members, reviews, packed, walls)
   }
   const selected = [...candidates].sort((a, b) => compareScores(scenarioScore(a, objective), scenarioScore(b, objective)))[0] as OptimizationScenario
@@ -942,8 +1044,44 @@ function catalogReviews(material: MaterialCatalogItem | null, members: CuttingMe
   if (material.materialType === 'panel' && material.stockWidthMm === null) reviews.push(makeReview(`catalog-sheet-width-${material.id}`, 'fit', '판재 폭이 입력되지 않았습니다.', '자재 카탈로그', '폭 없음', '판재 폭을 입력해야 2차원 배치가 원자재 밖으로 나가지 않는지 확인할 수 있습니다.', 'blocked', material.id, [], undefined, 'stockWidthMm'))
   if (material.materialType === 'panel' && !candidateLengths(material).length) reviews.push(makeReview(`catalog-sheet-length-${material.id}`, 'fit', '판재 원자재 길이가 입력되지 않았습니다.', '자재 카탈로그', '길이 없음', '판재 원자재 길이 또는 비교할 길이를 입력해야 절단 배치를 계산할 수 있습니다.', 'blocked', material.id, [], undefined, 'stockLengthMm'))
   if (material.materialType === 'profile' && !candidateLengths(material).length) reviews.push(makeReview(`catalog-bar-size-${material.id}`, 'fit', '프로파일 원자재 길이가 없습니다.', '자재 카탈로그', '원자재 길이 없음', '6,000·9,000·12,000mm 등 비교할 원자재 길이를 입력해야 합니다.', 'blocked', material.id, [], undefined, 'stockLengthMm'))
+  if (candidateLengths(material).length > 1) reviews.push(makeReview(`catalog-length-price-${material.id}`, 'price', '원자재 길이별 단가가 없어 총비용 최소안을 확정할 수 없습니다.', '자재 카탈로그', candidateLengths(material).map((length) => `${length}mm`).join(', '), '비교 길이마다 실제 단가가 다를 수 있습니다. 발주 확정 전에는 한 가지 원자재 길이만 남기거나 길이별 견적을 별도로 확인하세요.', 'blocked', material.id, [], undefined, 'stockLengthOptionsMm'))
   if (material.minimumReusableOffcutMm === null) reviews.push(makeReview(`catalog-scrap-${material.id}`, 'scrap', '재사용 가능한 최소 자투리 크기가 없습니다.', '자재 카탈로그', '최소 자투리 기준 없음', '현장 내 재사용과 폐기 대상을 구분하려면 기준을 입력해야 합니다.', 'warning', material.id, [], undefined, 'minimumReusableOffcutMm'))
   if (material.lapAllowanceMm !== null && material.lapAllowanceMm > 0) reviews.push(makeReview(`catalog-lap-${material.id}`, 'fit', '허용 이음·겹침 길이는 절단 치수에 자동 적용하지 않았습니다.', '자재 카탈로그', `${material.lapAllowanceMm}mm`, '제조사 시공 방향과 이음 상세가 확인되지 않은 상태에서 겹침을 더하면 실제 부재를 임의 변경할 수 있어 사람 확인이 필요합니다.', 'warning', material.id))
+  const positiveDimensions: Array<{ field: keyof MaterialCatalogItem; label: string; value: number | null }> = [
+    { field: 'thicknessMm', label: '두께', value: material.thicknessMm },
+    ...(material.materialType === 'panel'
+      ? [{ field: 'stockWidthMm' as const, label: '원자재 폭', value: material.stockWidthMm }]
+      : []),
+  ]
+  for (const field of positiveDimensions.filter(({ value }) => value !== null && (!Number.isFinite(value) || (value as number) <= 0))) {
+    reviews.push(makeReview(`catalog-invalid-${material.id}-${String(field.field)}`, 'fit', `${field.label}가 올바르지 않습니다.`, '자재 카탈로그', String(field.value), `${field.label}는 0보다 큰 숫자여야 합니다.`, 'blocked', material.id, [], undefined, field.field))
+  }
+  if (material.stockLengthMm !== null && (!Number.isFinite(material.stockLengthMm) || material.stockLengthMm <= 0)) {
+    reviews.push(makeReview(`catalog-invalid-${material.id}-stockLengthMm`, 'fit', '원자재 길이가 올바르지 않습니다.', '자재 카탈로그', String(material.stockLengthMm), '원자재 길이는 0보다 큰 숫자여야 합니다.', 'blocked', material.id, [], undefined, 'stockLengthMm'))
+  }
+  if (material.stockLengthOptionsMm.some((value) => !Number.isFinite(value) || value <= 0)) {
+    reviews.push(makeReview(`catalog-invalid-${material.id}-stockLengthOptionsMm`, 'fit', '비교 원자재 길이에 올바르지 않은 값이 있습니다.', '자재 카탈로그', material.stockLengthOptionsMm.join(', '), '모든 비교 길이는 0보다 큰 숫자여야 합니다.', 'blocked', material.id))
+  }
+  if (material.minimumOrderQuantity !== null && (!Number.isInteger(material.minimumOrderQuantity) || material.minimumOrderQuantity <= 0)) {
+    reviews.push(makeReview(`catalog-invalid-${material.id}-minimumOrderQuantity`, 'price', '최소 주문 수량이 올바르지 않습니다.', '자재 카탈로그', String(material.minimumOrderQuantity), '최소 주문 수량은 1 이상의 정수여야 합니다.', 'blocked', material.id, [], undefined, 'minimumOrderQuantity'))
+  }
+  const nonNegativeFields: Array<{ field: keyof MaterialCatalogItem; label: string; value: number | null }> = [
+    { field: 'unitPrice', label: '단가', value: material.unitPrice },
+    { field: 'cuttingFee', label: '절단비', value: material.cuttingFee },
+    { field: 'cutCostPerCut', label: '절단 1회 비용', value: material.cutCostPerCut },
+    { field: 'kerfMm', label: '톱날 절단폭', value: material.kerfMm },
+    { field: 'transportCost', label: '운반비', value: material.transportCost },
+    { field: 'handlingCost', label: '현장 취급비', value: material.handlingCost },
+    { field: 'disposalCostPerM2', label: '면적당 폐기비', value: material.disposalCostPerM2 },
+    { field: 'disposalCostPerM', label: '길이당 폐기비', value: material.disposalCostPerM },
+    { field: 'temporaryStorageCostPerDay', label: '일일 임시 보관비', value: material.temporaryStorageCostPerDay },
+    { field: 'lapAllowanceMm', label: '이음·겹침 길이', value: material.lapAllowanceMm },
+    { field: 'minimumReusableOffcutMm', label: '최소 재사용 자투리', value: material.minimumReusableOffcutMm },
+    { field: 'reworkRiskCost', label: '재작업 위험 비용', value: material.reworkRiskCost },
+  ]
+  for (const field of nonNegativeFields.filter(({ value }) => value !== null && (!Number.isFinite(value) || (value as number) < 0))) {
+    reviews.push(makeReview(`catalog-invalid-${material.id}-${String(field.field)}`, field.field === 'kerfMm' ? 'fit' : 'price', `${field.label}가 올바르지 않습니다.`, '자재 카탈로그', String(field.value), `${field.label}는 0 이상의 숫자여야 합니다.`, 'blocked', material.id, [], undefined, field.field))
+  }
   const costFields: Array<{ field: keyof MaterialCatalogItem; label: string }> = [
     { field: 'unitPrice', label: '단가' },
     { field: 'minimumOrderQuantity', label: '최소 주문 수량' },
@@ -956,7 +1094,126 @@ function catalogReviews(material: MaterialCatalogItem | null, members: CuttingMe
     reviews.push(makeReview(`catalog-price-${material.id}-${String(field.field)}`, 'price', `${field.label}가 입력되지 않았습니다.`, '자재 카탈로그', `${field.label} 없음`, '가격이 없는 상태에서는 가짜 총액을 만들지 않고 비용 계산을 보류합니다.', 'blocked', material.id, [], undefined, field.field))
   }
   if (members.some((member) => member.shape !== 'rectangle')) reviews.push(makeReview(`shape-${material.id}`, 'shape', '직사각형 이외 형상이 포함되어 있습니다.', '도면 부재 목록', '지원되지 않는 형상', '불규칙 형상을 임의의 사각형으로 바꾸지 않습니다.', 'blocked', material.id))
+  for (const member of members.filter((candidate) => candidate.materialType !== material.materialType)) {
+    reviews.push(makeReview(
+      `material-type-${member.id}`,
+      'material',
+      '부재 형태와 자재 카탈로그 형태가 일치하지 않습니다.',
+      member.location || member.id,
+      `부재 ${member.materialType} · 자재 ${material.materialType}`,
+      '판재 부재는 판재 자재에, 프로파일 부재는 프로파일 자재에 다시 연결해야 합니다.',
+      'blocked',
+      member.id,
+      member.sourceReferences,
+      member.confidence,
+    ))
+  }
+  for (const member of members.filter((candidate) => !Number.isInteger(candidate.quantity) || candidate.quantity <= 0 || candidate.quantity > MAX_MEMBER_QUANTITY)) {
+    reviews.push(makeReview(
+      `quantity-${member.id}`,
+      'dimension',
+      '부재 수량이 올바른 정수가 아닙니다.',
+      member.location || member.id,
+      String(member.quantity),
+      `수량은 1~${MAX_MEMBER_QUANTITY.toLocaleString('ko-KR')}의 정수로 확인해야 하며 범위를 벗어난 값을 임의로 반올림하지 않습니다.`,
+      'blocked',
+      member.id,
+      member.sourceReferences,
+      member.confidence,
+    ))
+  }
   return reviews
+}
+
+function mergeCostBreakdowns(scenarios: OptimizationScenario[]): OptimizationCostBreakdown {
+  const sumWhenComplete = (field: keyof Omit<OptimizationCostBreakdown, 'missingInputs' | 'status'>) => {
+    const values = scenarios.map((scenario) => scenario.cost[field] as number | null)
+    return values.every((value) => value !== null)
+      ? values.reduce<number>((sum, value) => sum + (value || 0), 0)
+      : null
+  }
+  const missingInputs = [...new Set(scenarios.flatMap((scenario) => scenario.cost.missingInputs))]
+  const status = scenarios.some((scenario) => scenario.cost.status === 'price-missing')
+    ? 'price-missing' as const
+    : scenarios.some((scenario) => scenario.cost.status === 'review-required')
+      ? 'review-required' as const
+      : 'complete' as const
+  return {
+    purchaseCost: sumWhenComplete('purchaseCost'),
+    cuttingCost: sumWhenComplete('cuttingCost'),
+    cutCountCost: sumWhenComplete('cutCountCost'),
+    transportCost: sumWhenComplete('transportCost'),
+    handlingCost: sumWhenComplete('handlingCost'),
+    storageCost: sumWhenComplete('storageCost'),
+    disposalCost: sumWhenComplete('disposalCost'),
+    riskCost: sumWhenComplete('riskCost'),
+    totalCost: sumWhenComplete('totalCost'),
+    missingInputs,
+    status,
+  }
+}
+
+function combineMaterialScenarios(
+  objective: Objective,
+  materialScenarios: OptimizationScenario[],
+  members: CuttingMember[],
+  walls: Wall[],
+  reviews: OptimizationReviewItem[],
+): OptimizationScenario {
+  const stockPlans = materialScenarios.flatMap((scenario) => scenario.stockPlans)
+  const scraps = materialScenarios.flatMap((scenario) => scenario.scraps)
+  const unplacedMemberIds = materialScenarios.flatMap((scenario) => scenario.unplacedMemberIds)
+  const validation = validateScenario(members, stockPlans, walls)
+  const cost = mergeCostBreakdowns(materialScenarios)
+  const stockCount = materialScenarios.reduce((sum, scenario) => sum + scenario.stockCount, 0)
+  const cutCount = materialScenarios.reduce((sum, scenario) => sum + scenario.cutCount, 0)
+  const orderQuantity = materialScenarios.every((scenario) => scenario.orderQuantity !== null)
+    ? materialScenarios.reduce((sum, scenario) => sum + (scenario.orderQuantity || 0), 0)
+    : null
+  const areaValues = materialScenarios.map((scenario) => scenario.wasteAreaM2).filter((value): value is number => value !== null)
+  const lengthValues = materialScenarios.map((scenario) => scenario.wasteLengthMm).filter((value): value is number => value !== null)
+  const wasteAreaM2 = areaValues.length ? round(areaValues.reduce((sum, value) => sum + value, 0)) : null
+  const wasteLengthMm = lengthValues.length ? round(lengthValues.reduce((sum, value) => sum + value, 0), 2) : null
+  const panelStockAreaM2 = stockPlans
+    .filter((plan) => plan.source === 'raw-material' && plan.materialType === 'panel' && plan.stockWidthMm !== null)
+    .reduce((sum, plan) => sum + plan.stockLengthMm * (plan.stockWidthMm || 0) / 1_000_000, 0)
+  const wasteRate = wasteAreaM2 !== null && panelStockAreaM2 > 0
+    ? round((wasteAreaM2 / panelStockAreaM2) * 100, 2)
+    : null
+  const available = unplacedMemberIds.length === 0
+    && validation.passed
+    && reviews.length === 0
+    && cost.status === 'complete'
+  const description = objective === 'cost'
+    ? '모든 자재의 구매·절단·운반·보관·폐기 비용을 합산해 비교합니다.'
+    : objective === 'waste'
+      ? '모든 자재에서 남는 면적 또는 길이가 가장 작은 배치를 비교합니다.'
+      : '모든 자재의 원자재 개수와 절단 작업 수가 적은 배치를 비교합니다.'
+  return {
+    id: objective,
+    label: objective === 'cost' ? '총비용 최소안' : objective === 'waste' ? '폐기량 최소안' : '작업 단순안',
+    description,
+    available,
+    recommendation: cost.totalCost === null && objective === 'cost'
+      ? '가격 정보가 없어 총비용을 확정할 수 없습니다.'
+      : available
+        ? '현재 입력으로 발주 검토 가능한 안입니다.'
+        : '검토 항목을 해결해야 발주에 사용할 수 있습니다.',
+    stockPlans,
+    scraps,
+    unplacedMemberIds,
+    stockCount,
+    orderQuantity,
+    cutCount,
+    wasteAreaM2,
+    wasteLengthMm,
+    wasteRate,
+    cost,
+    validation,
+    stockLengthComparison: materialScenarios.length === 1
+      ? materialScenarios[0]?.stockLengthComparison || []
+      : [],
+  }
 }
 
 export function optimizeCuttingPlan(input: {
@@ -982,19 +1239,52 @@ export function optimizeCuttingPlan(input: {
     member.confidence,
   ))
   if (!selectedMaterials.length) reviews.push(makeReview('material-selection', 'material', '도면 부재와 연결된 자재가 없습니다.', '자재 카탈로그', '자재 선택 필요', '자재를 선택하고 다시 계산해야 합니다.'))
-  const scenarios: OptimizationScenario[] = []
-  let allScraps: ScrapPiece[] = input.existingScraps?.map(cloneScrap) || []
+  const totalMemberUnits = input.members.reduce((sum, member) => sum + (Number.isInteger(member.quantity) && member.quantity > 0 ? member.quantity : 0), 0)
+  if (totalMemberUnits > MAX_EXPANDED_MEMBER_UNITS) {
+    reviews.push(makeReview('member-quantity-total-limit', 'dimension', '전체 절단 부재 수가 계산 상한을 초과했습니다.', '도면 부재 목록', `${totalMemberUnits.toLocaleString('ko-KR')}개`, `한 번에 계산할 수 있는 전체 부재는 ${MAX_EXPANDED_MEMBER_UNITS.toLocaleString('ko-KR')}개 이하입니다.`, 'blocked'))
+  }
+  for (const materialId of selectedMaterialIds.filter((id) => !selectedMaterials.some((material) => material.id === id))) {
+    reviews.push(makeReview(
+      `material-missing-${materialId}`,
+      'material',
+      '부재에 연결된 자재 카탈로그 항목을 찾을 수 없습니다.',
+      '자재 카탈로그',
+      materialId,
+      '삭제되거나 변경된 자재 연결을 다시 확인해야 합니다.',
+      'blocked',
+      materialId,
+    ))
+  }
+  const scenariosByObjective = new Map<Objective, OptimizationScenario[]>([
+    ['cost', []],
+    ['waste', []],
+    ['simple', []],
+  ])
   for (const material of selectedMaterials) {
-    const materialMembers = input.members.filter((member) => member.materialId === material.id)
-    const materialReviews = [...reviews, ...catalogReviews(material, materialMembers)]
+    const linkedMaterialMembers = input.members.filter((member) => member.materialId === material.id)
+    const materialMembers = linkedMaterialMembers.filter((member) => member.materialType === material.materialType)
+    const catalogReviewItems = catalogReviews(material, linkedMaterialMembers)
+    const materialReviews = [
+      ...reviews.filter((review) => !review.targetId || materialMembers.some((member) => member.id === review.targetId)),
+      ...catalogReviewItems,
+    ]
+    reviews.push(...catalogReviewItems)
+    const materialScraps = (input.existingScraps || []).filter((scrap) => scrap.materialId === material.id)
     for (const objective of ['cost', 'waste', 'simple'] as Objective[]) {
-      const scenario = packForObjective(material, materialMembers, input.existingScraps || [], objective, input.walls, materialReviews, now)
-      scenarios.push(scenario)
-      if (objective === 'cost') allScraps = scenario.scraps
+      const scenario = packForObjective(material, materialMembers, materialScraps, objective, input.walls, materialReviews, now)
+      scenariosByObjective.get(objective)?.push(scenario)
     }
-    reviews.push(...catalogReviews(material, materialMembers))
   }
   const uniqueReviews = [...new Map(reviews.map((review) => [review.id, review])).values()]
+  const scenarios = selectedMaterials.length
+    ? (['cost', 'waste', 'simple'] as Objective[]).map((objective) => combineMaterialScenarios(
+        objective,
+        scenariosByObjective.get(objective) || [],
+        input.members,
+        input.walls,
+        uniqueReviews,
+      ))
+    : []
   const selectedScenario = scenarios.find((scenario) => scenario.id === 'cost') || scenarios[0]
   const validation = selectedScenario?.validation || emptyOptimizationValidation()
   const status = !scenarios.length
@@ -1002,13 +1292,18 @@ export function optimizeCuttingPlan(input: {
     : uniqueReviews.some((review) => review.severity === 'blocked' || !review.resolved) || !validation.passed || scenarios.some((scenario) => scenario.unplacedMemberIds.length || scenario.cost.status !== 'complete')
       ? 'needs-review'
       : 'calculated'
+  const persistentScraps = buildPersistentScrapState(input.existingScraps || [], selectedScenario?.scraps || [])
   return {
     members: input.members,
     reviews: uniqueReviews,
     scenarios,
     selectedScenarioId: 'cost',
     recommendedScenarioId: 'cost',
-    scraps: allScraps,
+    // Scenario scraps describe what happened in this run (a consumed onsite
+    // scrap is unavailable there). The top-level collection is persisted by
+    // the app and becomes the next run's input, so keep the user-entered
+    // existing-scrap state intact and only add newly generated remnants.
+    scraps: persistentScraps,
     status,
     validation,
   }

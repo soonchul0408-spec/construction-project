@@ -2,6 +2,7 @@ import { classifyDocument, classifyTextOrigin } from './document-classifier'
 import { extractDrawingMetadata, type TextEvidenceItem } from './drawing-metadata-extractor'
 import { normalizeNumericToken, numericTokensFromText, toDimensionValue } from './dimension-normalizer'
 import { readAsDataUrl } from './file-loader'
+import { shouldRunTileOcr } from './ocr-policy'
 import type { DrawingPage, Evidence, HandwritingStatus } from '../types/domain'
 
 export interface ImageAnalysisResult {
@@ -246,10 +247,6 @@ function mergeRecognizedResults(results: Array<{ text: string; confidence: numbe
     confidence: confidenceValues.length ? confidenceValues.reduce((sum, value) => sum + value, 0) / confidenceValues.length : 0,
     words,
   }
-}
-
-function shouldRunTileOcr(text: string, words: RecognizedWord[]) {
-  return !text.trim() || !words.length || !(/(?:높이|층고|천장고|height|\bH\s*[:=]|\bHT\s*[:=]?|EL\.?|LEVEL|T\.?O\.?S|T\.?O\.?F|FFL|GL)/i.test(text) && !/\d/.test(text))
 }
 
 function ocrQuality(result: { text: string; confidence: number; words: RecognizedWord[] }) {

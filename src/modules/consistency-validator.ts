@@ -7,12 +7,9 @@ import type {
   ConsistencyIssue,
   ConsistencyStatus,
   ConsistencyValidation,
-  CuttingMember,
   CuttingMemberConsistencyResult,
   CuttingPlacement,
-  CuttingStockPlan,
   DimensionValue,
-  MaterialCatalogItem,
   MaterialTakeoff,
   OptimizationState,
   ProjectWorkflow,
@@ -20,6 +17,7 @@ import type {
   WallConsistencyResult,
   Opening,
 } from '../types/domain'
+import { isCostSummaryPage } from './cost-summary-parser.ts'
 
 /**
  * All internal comparisons use millimetres. These limits are deliberately
@@ -56,7 +54,7 @@ function issue(
   return {
     id,
     category,
-    severity: status === '확인 필요' ? 'blocking' : 'blocking',
+    severity: 'blocking',
     status,
     message,
     action,
@@ -182,8 +180,19 @@ function rectanglesOverlap(a: { x: number; y: number; width: number; height: num
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
-function unionOpeningArea(openings: Opening[]) {
-  const rectangles = openings.map(rectangleForOpening).filter((item): item is NonNullable<ReturnType<typeof rectangleForOpening>> => Boolean(item))
+function unionOpeningArea(openings: Opening[], wallLengthMm?: number | null, wallHeightMm?: number | null) {
+  const rectangles = openings
+    .map(rectangleForOpening)
+    .filter((item): item is NonNullable<ReturnType<typeof rectangleForOpening>> => Boolean(item))
+    .map((item) => {
+      if (!positive(wallLengthMm) || !positive(wallHeightMm)) return item
+      const x = Math.max(0, item.x)
+      const y = Math.max(0, item.y)
+      const right = Math.min(wallLengthMm, item.x + item.width)
+      const top = Math.min(wallHeightMm, item.y + item.height)
+      return { x, y, width: Math.max(0, right - x), height: Math.max(0, top - y) }
+    })
+    .filter((item) => item.width > 0 && item.height > 0)
   if (!rectangles.length) return 0
   const xBreaks = unique([0, ...rectangles.flatMap((item) => [item.x, item.x + item.width])]).sort((a, b) => a - b)
   const yBreaks = unique([0, ...rectangles.flatMap((item) => [item.y, item.y + item.height])]).sort((a, b) => a - b)
@@ -223,7 +232,7 @@ function checkOpenings(wall: Wall, takeoff: MaterialTakeoff | null, modelWall: B
     }
     validOpenings.push({ opening, rectangle })
   }
-  const expectedArea = unionOpeningArea(wall.openings)
+  const expectedArea = unionOpeningArea(wall.openings, wall.lengthMm, wall.heightMm)
   if (takeoff && valid(takeoff.openingAreaM2) && Math.abs(expectedArea - takeoff.openingAreaM2) > CONSISTENCY_TOLERANCES.areaM2) {
     issues.push(issue(`opening-area-${wall.id}`, 'opening', '확인 필요', `${wall.zone} ${wall.wallNumber}: 개구부 면적이 원본 geometry와 자재 산출에서 다릅니다.`, '개구부 중복·누락 차감 여부를 확인한 뒤 다시 계산하세요.', wall.sourceReferences, { wallId: wall.id, zone: wall.zone, wallNumber: wall.wallNumber, originalValue: expectedArea, currentValue: takeoff.openingAreaM2, unit: '㎡', formula: '개구부 직사각형 합집합 면적' }))
   }
@@ -257,7 +266,7 @@ function validateWalls(files: AnalyzedFile[], dimensions: DimensionValue[], wall
     if (modelIds.has(modelWall.wallId)) issues.push(issue(`duplicate-model-wall-${modelWall.wallId}`, 'duplicate', '확인 필요', `3D 모델에 벽체 ${modelWall.wallId}가 중복 생성되었습니다.`, '중복 geometry를 제거한 뒤 다시 생성하세요.', modelWall.sourceReferences))
     modelIds.add(modelWall.wallId)
   }
-  const drawingFiles = files.filter((file) => file.kind !== 'cost-summary')
+  const drawingFiles = files.filter((file) => file.pages.some((page) => !isCostSummaryPage(file, page)))
   if (!drawingFiles.length) issues.push(issue('no-drawing-source', 'source', '분석 실패', '3D·자재 계산에 사용할 설계도 파일이 없습니다.', 'PDF·JPG·PNG 설계도를 업로드하세요.'))
   for (const file of files.filter((candidate) => candidate.status === 'failed')) issues.push(issue(`file-failed-${file.id}`, 'analysis', '분석 실패', `${file.name}: 파일 분석에 실패했습니다.`, '파일을 다시 분석하거나 원본 형식을 확인하세요.'))
   for (const wall of walls) {
@@ -302,18 +311,30 @@ function validateWalls(files: AnalyzedFile[], dimensions: DimensionValue[], wall
     const approvedHeight = approvedValueOf(sourceHeight)
     const sourceHeightValue = originalValueOf(sourceHeight)
     const heightUserConfirmed = Boolean(sourceHeight?.heightReviewAction && ['approved', 'edited', 'linked'].includes(sourceHeight.heightReviewAction))
+    const expectedNetAreaM2 = positive(wall.lengthMm) && positive(wall.heightMm)
+      ? Math.max(0, wall.lengthMm * wall.heightMm / 1_000_000 - unionOpeningArea(wall.openings, wall.lengthMm, wall.heightMm))
+      : null
     const comparisons = [
       compare(`source-wall-length-${wall.id}`, '원본 길이 → 벽체 길이', sourceLength?.valueMm ?? null, wall.lengthMm, 'mm', '벽체 길이 = 원본 치수의 mm 정규화값', refs, sourceLength && sourceLength.unit !== 'mm' ? `원본 단위 ${sourceLength.unit}를 mm로 변환했습니다.` : ''),
       compare(`wall-model-length-chain-${wall.id}`, '벽체 길이 → 3D 길이', wall.lengthMm, modelWall?.lengthMm ?? null, 'mm', '3D 길이 = 벽체 길이', refs),
       compare(`model-takeoff-length-${wall.id}`, '3D 길이 → 자재 계산 길이', modelWall?.lengthMm ?? null, takeoff?.lengthMm ?? null, 'mm', '자재 계산 길이 = 3D 입력 길이', refs),
       compare(`source-wall-height-${wall.id}`, '원본 높이 → 승인 높이', sourceHeightValue, approvedHeight, 'mm', '승인 높이 = 원본 높이 또는 사용자 확인값', refs, sourceHeight?.userEdited ? '사용자가 원본 높이를 수정했습니다.' : '', heightUserConfirmed),
-      compare(`approved-wall-height-${wall.id}`, '승인 높이 → 벽체 높이', approvedHeight, wall.heightMm, 'mm', '벽체 높이 = 승인 높이', refs, '', heightUserConfirmed),
+      compare(`approved-wall-height-${wall.id}`, '승인 높이 → 벽체 높이', approvedHeight, wall.heightMm, 'mm', '벽체 높이 = 승인 높이', refs),
       compare(`wall-model-height-chain-${wall.id}`, '벽체 높이 → 3D 높이', wall.heightMm, modelWall?.heightMm ?? null, 'mm', '3D 높이 = 벽체 높이', refs),
       compare(`model-takeoff-height-${wall.id}`, '3D 높이 → 자재 계산 높이', modelWall?.heightMm ?? null, takeoff?.heightMm ?? null, 'mm', '자재 계산 높이 = 3D 입력 높이', refs),
+      compare(`wall-takeoff-net-area-${wall.id}`, '벽체 geometry → 순 벽체 면적', expectedNetAreaM2, takeoff?.netAreaM2 ?? null, '㎡', '순면적 = 길이 × 높이 − 벽체 안 개구부 합집합 면적', takeoff?.sourceReferences || refs),
     ]
     const comparisonsWithIssues = comparisons.flatMap((comparison) => {
-      const confirmed = comparison.label.includes('원본 높이') && heightUserConfirmed
-      const found = comparisonIssue(comparison, wall, comparison.label.includes('높이') ? 'height' : 'dimension', confirmed)
+      // A user-confirmed value may intentionally override the extracted source,
+      // but every downstream wall/model/takeoff value must still match that
+      // approved value exactly within tolerance.
+      const confirmed = heightUserConfirmed && comparison.id.startsWith('source-wall-height-')
+      const category: ConsistencyIssue['category'] = comparison.unit === '㎡'
+        ? 'takeoff'
+        : comparison.label.includes('높이')
+          ? 'height'
+          : 'dimension'
+      const found = comparisonIssue(comparison, wall, category, confirmed)
       return found ? [found] : []
     })
     wallIssues.push(...comparisonsWithIssues)
@@ -406,10 +427,10 @@ function validateCutting(optimization: OptimizationState, walls: Wall[], actualD
   const memberMap = new Map(optimization.members.map((member) => [member.id, member]))
   const counts = new Map<string, number>()
   const memberIssues = new Map<string, ConsistencyIssue[]>()
-  const planScraps = new Map<string, { areaM2: number; lengthMm: number }>()
   for (const plan of scenario.stockPlans) {
-    const scrapTotals = scenario.scraps.filter((scrap) => plan.scrapIds.includes(scrap.id)).reduce((sum, scrap) => ({ areaM2: sum.areaM2 + (scrap.widthMm === null ? 0 : scrap.lengthMm * scrap.widthMm / 1_000_000), lengthMm: sum.lengthMm + scrap.lengthMm }), { areaM2: 0, lengthMm: 0 })
-    planScraps.set(plan.id, scrapTotals)
+    const scrapTotals = scenario.scraps
+      .filter((scrap) => scrap.source === 'generated' && scrap.sourceStockPlanId === plan.id && plan.scrapIds.includes(scrap.id))
+      .reduce((sum, scrap) => ({ areaM2: sum.areaM2 + (scrap.widthMm === null ? 0 : scrap.lengthMm * scrap.widthMm / 1_000_000), lengthMm: sum.lengthMm + scrap.lengthMm }), { areaM2: 0, lengthMm: 0 })
     if (plan.materialType === 'panel' && (plan.stockWidthMm === null || plan.stockWidthMm <= 0)) issues.push(issue(`plan-width-${plan.id}`, 'cutting', '계산 불가', `${plan.id}: 판재 원자재 폭이 없습니다.`, '자재 카탈로그의 원자재 폭을 입력하세요.'))
     for (const placement of plan.placements) {
       counts.set(placement.memberId, (counts.get(placement.memberId) || 0) + 1)
@@ -500,14 +521,14 @@ export function validateConsistency(input: {
   testData?: boolean
   checkedAt?: string
 }): ConsistencyValidation {
-  const actualData = input.actualData ?? input.files.some((file) => file.pages.length > 0 && file.kind !== 'cost-summary')
+  const actualData = input.actualData ?? input.files.some((file) => file.pages.some((page) => !isCostSummaryPage(file, page)))
   const testData = Boolean(input.testData)
   const wallValidation = validateWalls(input.files, input.dimensions, input.walls, input.model, input.takeoffs)
   const zoneValidation = compareZoneTotals(input.walls, input.takeoffs)
   const cuttingValidation = validateCutting(input.optimization, input.walls, actualData, testData)
   const issues = [...wallValidation.issues, ...zoneValidation.issues, ...cuttingValidation.issues]
   if (testData) issues.push(issue('test-data-project', 'test-data', '확인 필요', '현재 화면의 결과는 테스트 데이터입니다.', '실제 설계도를 업로드한 뒤 다시 계산하세요.'))
-  const hasSources = actualData && input.files.some((file) => file.pages.some((page) => page.dimensions.length || page.text.trim()))
+  const hasSources = actualData && input.files.some((file) => file.pages.some((page) => !isCostSummaryPage(file, page) && (page.dimensions.length || page.text.trim())))
   const drawingIssues = issues.filter((item) => ['source', 'analysis', 'dimension', 'height'].includes(item.category))
   const modelIssues = issues.filter((item) => item.category === 'model')
   const takeoffIssues = issues.filter((item) => ['takeoff', 'opening', 'duplicate'].includes(item.category))
@@ -547,7 +568,17 @@ export function validateConsistency(input: {
         netAreaM2: takeoff.netAreaM2,
         openingAreaM2: takeoff.openingAreaM2,
         panelsWithWaste: takeoff.panelsWithWaste,
-        comparisons: wall ? [compare(`takeoff-net-area-${takeoff.wallId}`, '순 벽체 면적', takeoff.netAreaM2, takeoff.netAreaM2, '㎡', '순면적 = 길이 × 높이 − 개구부 면적', takeoff.sourceReferences || [])] : [],
+        comparisons: wall && positive(wall.lengthMm) && positive(wall.heightMm)
+          ? [compare(
+              `takeoff-net-area-${takeoff.wallId}`,
+              '순 벽체 면적',
+              Math.max(0, wall.lengthMm * wall.heightMm / 1_000_000 - unionOpeningArea(wall.openings, wall.lengthMm, wall.heightMm)),
+              takeoff.netAreaM2,
+              '㎡',
+              '순면적 = 길이 × 높이 − 벽체 안 개구부 합집합 면적',
+              takeoff.sourceReferences || [],
+            )]
+          : [],
         issues: rowIssues,
       }
     }),

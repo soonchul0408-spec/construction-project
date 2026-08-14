@@ -1,4 +1,5 @@
 import { buildHeightCandidates, isDirectHeightDimension, isLevelDimension } from './height-candidate-extractor.ts'
+import { isCostSummaryPage } from './cost-summary-parser.ts'
 import type {
   AnalyzedFile,
   BuildingGeometry,
@@ -86,7 +87,7 @@ function noHeightCause(files: AnalyzedFile[], dimensions: DimensionValue[], cand
   if (candidates.some((candidate) => candidate.sourceType === 'HANDWRITING')) return 'handwriting-excluded'
   if (candidates.some((candidate) => dimensions.find((dimension) => dimension.id === candidate.candidateId)?.heightExcluded)) return 'manual-excluded'
   if (candidates.some((candidate) => candidate.sourceType === 'LEVEL_CALCULATION' || candidate.status === '기준 레벨만 확인됨')) return 'level-only'
-  const drawingFiles = files.filter((file) => file.kind !== 'cost-summary')
+  const drawingFiles = files.filter((file) => file.pages.some((page) => !isCostSummaryPage(file, page)))
   const ocrUnavailable = drawingFiles.some((file) => /OCR\s*(엔진|기능)|OCR.*(사용 불가|초기화|실행하지 못)/i.test([...file.warnings, ...file.pages.flatMap((page) => page.warnings)].join(' ')))
   if (ocrUnavailable) return 'ocr-unavailable'
   const ocrSignal = drawingFiles.some((file) => {
@@ -113,7 +114,10 @@ function candidateEntry(
   wall: Wall | undefined,
   modelWallIds: Set<string>,
 ): HeightDiagnosticEntry {
-  const invalid = invalidCause(dimension)
+  const levelOnly = isLevelDimension(dimension)
+  // A signed/zero elevation datum is valid input for a level difference but
+  // never a directly usable physical wall height.
+  const invalid = levelOnly ? null : invalidCause(dimension)
   const source = dimension.evidence[0]
   const wallConfidence = wall ? lowerConfidence(dimension.confidence, wall.confidence) : dimension.confidence
   const fieldMismatch = Boolean(wall && validMm(wall.lengthMm) && validMm(wall.heightMm) && !modelWallIds.has(wall.id))
@@ -122,7 +126,6 @@ function candidateEntry(
   const uncertainPrint = dimension.handwritingStatus === 'uncertain' || source?.handwritingStatus === 'uncertain'
   const lowConfidence = dimension.confidence === 'low' || wallConfidence === 'low'
   const reviewConfidence = wallConfidence !== 'high'
-  const levelOnly = isLevelDimension(dimension)
   const cause = invalid || handwriting
     ? (handwriting ? 'handwriting-excluded' : invalid)
     : dimension.heightExcluded
@@ -254,8 +257,8 @@ export function buildHeightDiagnostics(
   suppliedCandidates?: HeightCandidate[],
 ): HeightDiagnostics {
   if (!files.length) return emptyHeightDiagnostics()
-  const drawingFiles = files.filter((file) => file.kind !== 'cost-summary')
-  const pages = drawingFiles.flatMap((file) => file.pages)
+  const drawingFiles = files.filter((file) => file.pages.some((page) => !isCostSummaryPage(file, page)))
+  const pages = drawingFiles.flatMap((file) => file.pages.filter((page) => !isCostSummaryPage(file, page)))
   const floorPlanOnly = pages.some((page) => page.kind === 'floor-plan') && !pages.some((page) => page.kind === 'elevation' || page.kind === 'section')
   const candidates = suppliedCandidates || buildHeightCandidates(files, dimensions, walls)
   const directCandidates = candidates.filter((candidate) => {
@@ -325,7 +328,7 @@ export function buildHeightDiagnostics(
     : !walls.length ? 'height-not-linked'
       : linkedWalls.length < walls.length ? (directCandidates.length ? 'height-not-linked' : noCandidate)
         : null
-  const confidenceReview = candidates.filter((candidate) => candidate.confidence !== 'high' || candidate.status === '확인 필요')
+  const confidenceReview = candidates.filter((candidate) => candidate.status !== '기준 레벨만 확인됨' && (candidate.confidence !== 'high' || candidate.status === '확인 필요'))
   const lowConfidence = confidenceReview.filter((candidate) => candidate.confidence === 'low' || candidate.status === '확인 필요')
   const confidenceStatus: HeightDiagnosticStageStatus = confidenceReview.length || conflictCount
     ? 'needs-review'

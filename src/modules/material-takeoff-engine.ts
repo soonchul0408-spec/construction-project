@@ -1,15 +1,50 @@
 import type { MaterialSettings, MaterialTakeoff, Opening, Wall } from '../types/domain'
 
-function openingArea(openings: Opening[]) {
-  const valid = openings.filter((opening) => !opening.excludedFromAutomaticTakeoff && opening.areaM2 !== null)
-  const positioned = valid.filter((opening) => opening.widthMm !== null && opening.heightMm !== null && opening.offsetMm !== null)
-  if (positioned.length !== valid.length || !positioned.length) {
-    return valid.reduce((sum, opening) => sum + (opening.areaM2 || 0), 0)
+interface OpeningRectangle {
+  opening: Opening
+  xStart: number
+  xEnd: number
+  yStart: number
+  yEnd: number
+}
+
+function openingRectangle(opening: Opening): OpeningRectangle | null {
+  if (opening.excludedFromAutomaticTakeoff || opening.widthMm === null || opening.heightMm === null || opening.offsetMm === null) return null
+  if (opening.type !== 'door' && opening.sillHeightMm === null) return null
+  if (opening.widthMm <= 0 || opening.heightMm <= 0) return null
+  const bottom = opening.type === 'door' ? 0 : opening.sillHeightMm as number
+  return {
+    opening,
+    xStart: opening.offsetMm,
+    xEnd: opening.offsetMm + opening.widthMm,
+    yStart: bottom,
+    yEnd: bottom + opening.heightMm,
   }
+}
+
+function openingArea(openings: Opening[], wallLengthMm?: number, wallHeightMm?: number) {
+  const valid = openings.filter((opening) => !opening.excludedFromAutomaticTakeoff && opening.areaM2 !== null)
+  const positioned = valid.map(openingRectangle).filter((rectangle): rectangle is OpeningRectangle => Boolean(rectangle))
+  const unpositionedAreaM2 = valid
+    .filter((opening) => !positioned.some((rectangle) => rectangle.opening.id === opening.id))
+    .reduce((sum, opening) => sum + (opening.areaM2 || 0), 0)
+  if (!positioned.length) return unpositionedAreaM2
+  const bounded = positioned.map((rectangle) => wallLengthMm !== undefined && wallHeightMm !== undefined
+    ? {
+      ...rectangle,
+      xStart: Math.max(0, rectangle.xStart),
+      xEnd: Math.min(wallLengthMm, rectangle.xEnd),
+      yStart: Math.max(0, rectangle.yStart),
+      yEnd: Math.min(wallHeightMm, rectangle.yEnd),
+    }
+    : rectangle)
+    .filter((rectangle) => rectangle.xEnd > rectangle.xStart && rectangle.yEnd > rectangle.yStart)
+  if (!bounded.length) return unpositionedAreaM2
   // Union the rectangular opening cells instead of summing them blindly. This
-  // prevents an overlapping door/window pair from being deducted twice.
-  const xBreaks = [...new Set([0, ...positioned.flatMap((opening) => [opening.offsetMm as number, (opening.offsetMm as number) + (opening.widthMm as number)])])].sort((a, b) => a - b)
-  const yBreaks = [...new Set([0, ...positioned.flatMap((opening) => [opening.type === 'door' ? 0 : (opening.sillHeightMm || 0), (opening.type === 'door' ? 0 : (opening.sillHeightMm || 0)) + (opening.heightMm as number)])])].sort((a, b) => a - b)
+  // prevents an overlapping door/window pair from being deducted twice. Each
+  // rectangle is first clipped to the wall so off-wall area is never deducted.
+  const xBreaks = [...new Set(bounded.flatMap((rectangle) => [rectangle.xStart, rectangle.xEnd]))].sort((a, b) => a - b)
+  const yBreaks = [...new Set(bounded.flatMap((rectangle) => [rectangle.yStart, rectangle.yEnd]))].sort((a, b) => a - b)
   let areaMm2 = 0
   for (let xIndex = 0; xIndex < xBreaks.length - 1; xIndex += 1) {
     const xStart = xBreaks[xIndex] as number
@@ -19,14 +54,11 @@ function openingArea(openings: Opening[]) {
       const yEnd = yBreaks[yIndex + 1] as number
       const centerX = (xStart + xEnd) / 2
       const centerY = (yStart + yEnd) / 2
-      const covered = positioned.some((opening) => {
-        const bottom = opening.type === 'door' ? 0 : opening.sillHeightMm || 0
-        return centerX > (opening.offsetMm as number) && centerX < (opening.offsetMm as number) + (opening.widthMm as number) && centerY > bottom && centerY < bottom + (opening.heightMm as number)
-      })
+      const covered = bounded.some((rectangle) => centerX > rectangle.xStart && centerX < rectangle.xEnd && centerY > rectangle.yStart && centerY < rectangle.yEnd)
       if (covered) areaMm2 += (xEnd - xStart) * (yEnd - yStart)
     }
   }
-  return areaMm2 / 1_000_000
+  return areaMm2 / 1_000_000 + unpositionedAreaM2
 }
 
 function openingPerimeterM(openings: Opening[]) {
@@ -37,9 +69,12 @@ function openingPerimeterM(openings: Opening[]) {
 }
 
 function positionedOpening(opening: Opening) {
-  if (opening.excludedFromAutomaticTakeoff || opening.widthMm === null || opening.heightMm === null || opening.offsetMm === null) return false
-  if (opening.type !== 'door' && opening.sillHeightMm === null) return false
-  return opening.widthMm > 0 && opening.heightMm > 0 && opening.offsetMm >= 0
+  return openingRectangle(opening) !== null
+}
+
+function openingWithinWall(opening: Opening, wallLengthMm: number, wallHeightMm: number) {
+  const rectangle = openingRectangle(opening)
+  return Boolean(rectangle && rectangle.xStart >= 0 && rectangle.yStart >= 0 && rectangle.xEnd <= wallLengthMm && rectangle.yEnd <= wallHeightMm)
 }
 
 function openingsOverlap(openings: Opening[]) {
@@ -122,7 +157,7 @@ function layoutForWall(wall: Wall, settings: MaterialSettings, walls: Wall[]) {
   const heightM = wall.heightMm / 1000
   const effectiveWidthM = settings.panelEffectiveWidthMm / 1000
   const standardLengthM = settings.panelStandardLengthMm / 1000
-  const openingAreaM2 = openingArea(wall.openings)
+  const openingAreaM2 = openingArea(wall.openings, wall.lengthMm, wall.heightMm)
   const grossAreaM2 = lengthM * heightM
   const netAreaM2 = Math.max(0, grossAreaM2 - openingAreaM2)
   const panelAreaM2 = effectiveWidthM * standardLengthM
@@ -130,8 +165,9 @@ function layoutForWall(wall: Wall, settings: MaterialSettings, walls: Wall[]) {
   const verticalCourses = Math.ceil(heightM / standardLengthM)
   const horizontalRows = Math.ceil(heightM / effectiveWidthM)
   const horizontalPieces = Math.ceil(lengthM / standardLengthM)
-  const placeableOpenings = wall.openings.filter((opening) => positionedOpening(opening) && (opening.offsetMm as number) + (opening.widthMm as number) <= wall.lengthMm && (opening.type === 'door' ? 0 : opening.sillHeightMm as number) + (opening.heightMm as number) <= wall.heightMm)
-  const hasUnplacedOpening = wall.openings.some((opening) => !opening.excludedFromAutomaticTakeoff && !positionedOpening(opening))
+  const placeableOpenings = wall.openings.filter((opening) => openingWithinWall(opening, wall.lengthMm as number, wall.heightMm as number))
+  const hasOutOfBoundsOpening = wall.openings.some((opening) => !opening.excludedFromAutomaticTakeoff && positionedOpening(opening) && !openingWithinWall(opening, wall.lengthMm as number, wall.heightMm as number))
+  const hasUnplacedOpening = hasOutOfBoundsOpening || wall.openings.some((opening) => !opening.excludedFromAutomaticTakeoff && !positionedOpening(opening))
   const cuttablePieceCount = hasUnplacedOpening || openingsOverlap(placeableOpenings)
     ? null
     : actualPanelPieceCount(wall, settings, placeableOpenings)
@@ -173,6 +209,7 @@ function layoutForWall(wall: Wall, settings: MaterialSettings, walls: Wall[]) {
     offcutM,
     seamLengthM,
     hasUnplacedOpening,
+    hasOutOfBoundsOpening,
     hasOverlappingOpenings: openingsOverlap(placeableOpenings),
     areaMinimumPanels,
     grossPanelLayout: settings.panelDirection === 'vertical' ? verticalColumns * verticalCourses : horizontalRows * horizontalPieces,
@@ -203,12 +240,13 @@ export function calculateTakeoffs(walls: Wall[], settings: MaterialSettings): Ma
     }
     if (wall.confidence !== 'high') notes.push('추출값 중간/낮은 신뢰도 검토 필요.')
     if ((wall.conflicts || []).length) notes.push(...(wall.conflicts || []).map((conflict) => `치수 충돌: ${conflict.reason}`))
-    if (layout?.hasUnplacedOpening) notes.push('개구부 위치 또는 창대 높이가 확인되지 않아 실제 판넬 배치를 확정하지 않았습니다.')
+    if (layout?.hasUnplacedOpening && !layout.hasOutOfBoundsOpening) notes.push('개구부 위치 또는 창대 높이가 확인되지 않아 실제 판넬 배치를 확정하지 않았습니다.')
+    if (layout?.hasOutOfBoundsOpening) notes.push('개구부가 벽체 경계를 벗어나 벽체와 겹치는 면적만 차감했으며 위치 확인이 필요합니다.')
     if (layout?.hasOverlappingOpenings) notes.push('개구부끼리 겹쳐 자동 부자재 수량을 확정하지 않았습니다.')
     if (layout && settings.reuseOffcuts) notes.push('절단 잔재는 원자재 규격을 반영한 절단 최적화 단계에서 확정합니다.')
     if (layout?.cuttablePieceCount !== null && layout?.cuttablePieceCount !== undefined && layout.cuttablePieceCount !== layout.basePanels) notes.push(`개구부 경계를 반영한 절단 부재 ${layout.cuttablePieceCount}개는 절단 최적화에서 원자재 배치로 검증합니다.`)
     const formula = wall.lengthMm !== null && wall.heightMm !== null
-      ? `순면적 = ${wall.lengthMm}mm × ${wall.heightMm}mm − 확인된 개구부 ${openingArea(wall.openings).toFixed(2)}㎡; 판넬 부재 = 실제 벽체 격자 배치${layout?.hasUnplacedOpening ? ' (개구부 위치 확인 필요)' : ''}`
+      ? `순면적 = ${wall.lengthMm}mm × ${wall.heightMm}mm − 확인된 개구부 ${openingArea(wall.openings, wall.lengthMm, wall.heightMm).toFixed(2)}㎡; 판넬 부재 = 실제 벽체 격자 배치${layout?.hasUnplacedOpening ? ' (개구부 위치 확인 필요)' : ''}`
       : '높이 정보가 없어 계산할 수 없습니다.'
     return {
       wallId: wall.id,
@@ -217,7 +255,7 @@ export function calculateTakeoffs(walls: Wall[], settings: MaterialSettings): Ma
       evidenceLabel,
       lengthMm: wall.lengthMm,
       heightMm: wall.heightMm,
-      openingAreaM2: roundM2(openingArea(wall.openings)),
+      openingAreaM2: roundM2(wall.lengthMm !== null && wall.heightMm !== null ? openingArea(wall.openings, wall.lengthMm, wall.heightMm) : openingArea(wall.openings)),
       netAreaM2: layout ? roundM2(layout.netAreaM2) : null,
       panelSpec: spec,
       basePanels: layout?.basePanels ?? null,

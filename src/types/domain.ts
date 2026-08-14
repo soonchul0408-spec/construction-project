@@ -785,6 +785,8 @@ export interface OptimizationState {
   validation: OptimizationValidation
   scraps: ScrapPiece[]
   lastCalculatedAt: string | null
+  /** Deterministic snapshot of drawing/settings/catalog inputs used to build scenarios. */
+  sourceFingerprint?: string | null
   inventory: InventoryCuttingState
 }
 
@@ -824,6 +826,8 @@ export interface InventoryRequirement {
   missingFields: string[]
   source: 'drawing' | 'manual' | 'sample'
   notes: string[]
+  /** Fingerprint of the last drawing/catalog values used to generate this row. */
+  generatedFingerprint?: string | null
 }
 
 export interface OwnedMaterial {
@@ -914,6 +918,8 @@ export interface InventoryCutPlan {
   wasteReductionLengthMm: number | null
   approvedAt: string | null
   cancelledAt: string | null
+  /** Snapshot of requirements, stock and cutting settings used for this plan. */
+  sourceFingerprint?: string | null
 }
 
 export interface InventoryCuttingState {
@@ -954,6 +960,7 @@ export function emptyOptimizationState(): OptimizationState {
     validation: emptyOptimizationValidation(),
     scraps: [],
     lastCalculatedAt: null,
+    sourceFingerprint: null,
     inventory: emptyInventoryCuttingState(),
   }
 }

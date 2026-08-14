@@ -45,6 +45,12 @@ function itemLocation(item: PdfTextItem, pageWidth: number, pageHeight: number) 
 type PdfPoint = { x: number; y: number }
 type PdfMatrix = [number, number, number, number, number, number]
 
+function numberArray(value: unknown) {
+  if (Array.isArray(value)) return value.map(Number)
+  if (ArrayBuffer.isView(value)) return Array.from(value as unknown as ArrayLike<number>, Number)
+  return []
+}
+
 function multiplyMatrix(left: PdfMatrix, right: PdfMatrix): PdfMatrix {
   const [a, b, c, d, e, f] = left
   const [g, h, i, j, k, l] = right
@@ -139,23 +145,38 @@ export function extractPdfVectorSegments(
       current = points[3] || null
       pathStart = points[0] || null
     } else if (fn === opCodes.constructPath) {
-      const pathOps = Array.isArray(args[0]) ? args[0] as number[] : []
-      const coordinates = Array.isArray(args[1]) ? args[1] as number[] : []
+      const pathOps = numberArray(args[0])
+      const coordinates = numberArray(args[1])
       let coordinateIndex = 0
       for (const pathOp of pathOps) {
-        if (pathOp === 0) {
+        if (pathOp === opCodes.moveTo) {
           moveTo(coordinates[coordinateIndex], coordinates[coordinateIndex + 1])
           coordinateIndex += 2
-        } else if (pathOp === 1) {
+        } else if (pathOp === opCodes.lineTo) {
           lineTo(coordinates[coordinateIndex], coordinates[coordinateIndex + 1])
           coordinateIndex += 2
-        } else if (pathOp === 2) {
+        } else if (pathOp === opCodes.curveTo) {
           lineTo(coordinates[coordinateIndex + 4], coordinates[coordinateIndex + 5])
           coordinateIndex += 6
-        } else if (pathOp === 3) {
+        } else if (pathOp === opCodes.curveTo2 || pathOp === opCodes.curveTo3) {
           lineTo(coordinates[coordinateIndex + 2], coordinates[coordinateIndex + 3])
           coordinateIndex += 4
-        } else if (pathOp === 4) {
+        } else if (pathOp === opCodes.rectangle) {
+          const x = Number(coordinates[coordinateIndex] || 0)
+          const y = Number(coordinates[coordinateIndex + 1] || 0)
+          const width = Number(coordinates[coordinateIndex + 2] || 0)
+          const height = Number(coordinates[coordinateIndex + 3] || 0)
+          const points = [
+            transformPoint(matrix, { x, y }),
+            transformPoint(matrix, { x: x + width, y }),
+            transformPoint(matrix, { x: x + width, y: y + height }),
+            transformPoint(matrix, { x, y: y + height }),
+          ]
+          for (let pointIndex = 0; pointIndex < points.length; pointIndex += 1) addSegment(points[pointIndex], points[(pointIndex + 1) % points.length])
+          current = points[3] || null
+          pathStart = points[0] || null
+          coordinateIndex += 4
+        } else if (pathOp === opCodes.closePath) {
           addSegment(current, pathStart)
           current = pathStart
         }

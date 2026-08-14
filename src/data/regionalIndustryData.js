@@ -45,8 +45,7 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
     relatedCompanyIds: ['samsung-sds', 'naver-cloud'],
     sourceTitle: '전라남도 보도자료',
     sourceDate: '2026.03.10',
-    sourceUrl:
-      'https://www.jeonnam.go.kr/M7116/boardView.do?menuId=jeonnam0202000000&seq=1961088',
+    sourceUrl: 'https://www.jeonnam.go.kr/M7116/boardView.do?menuId=jeonnam0202000000&seq=1961088',
     timeline: [
       {
         date: '2026.03.10',
@@ -76,7 +75,8 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
       {
         date: '2024.12.26',
         title: '산업단지계획 승인',
-        description: '국토교통부 자료에서 국가산업단지 지정과 관계기관·기업 협약 내용을 확인했습니다.',
+        description:
+          '국토교통부 자료에서 국가산업단지 지정과 관계기관·기업 협약 내용을 확인했습니다.',
         type: 'success',
       },
       {
@@ -101,8 +101,8 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
     relatedCompanies: ['삼성SDI 등 공개자료 언급 기업'],
     relatedCompanyIds: ['samsung-sdi'],
     sourceTitle: '울산 국가첨단전략산업 이차전지 특화단지',
-    sourceDate: '2026.07.10 확인',
-    sourceUrl: 'https://battery.utp.or.kr/',
+    sourceDate: '2026.07.13',
+    sourceUrl: 'https://battery.utp.or.kr/business/program.php?id=22',
     timeline: [
       {
         date: '2023.07.20',
@@ -111,7 +111,7 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
         type: 'success',
       },
       {
-        date: '2026.07.10 확인',
+        date: '2026.07.13',
         title: '지원사업 공고 확인',
         description: '특화단지 지원사업 공고를 기준으로 관련 정보를 연결했습니다.',
         type: 'primary',
@@ -133,8 +133,7 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
     relatedCompanyIds: ['hanwha-aerospace'],
     sourceTitle: '방위사업청 보도자료',
     sourceDate: '2021.06.25',
-    sourceUrl:
-      'https://www.dapa.go.kr/dapa/doc/selectDoc.do?bbsSeq=326&docSeq=13214&menuSeq=3069',
+    sourceUrl: 'https://www.dapa.go.kr/dapa/doc/selectDoc.do?bbsSeq=326&docSeq=13214&menuSeq=3069',
     timeline: [
       {
         date: '2020년',
@@ -164,12 +163,11 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
     relatedCompanies: ['지역 에너지 수요기업', '공공기관'],
     relatedCompanyIds: ['kepco-kdn'],
     sourceTitle: '한국에너지공단 공지사항',
-    sourceDate: '2026.06.04',
-    sourceUrl:
-      'https://www.energy.or.kr/front/board/View2.do?boardMngNo=2&boardNo=24567',
+    sourceDate: '2026.05.20',
+    sourceUrl: 'https://www.energy.or.kr/front/board/View2.do?boardMngNo=2&boardNo=24567',
     timeline: [
       {
-        date: '2026.06.04',
+        date: '2026.05.20',
         title: '수행기관 모집 공개',
         description: '경기지역 에너지데이터 분석 서비스 시범사업 관련 공개자료를 확인했습니다.',
         type: 'primary',
@@ -178,6 +176,4 @@ const SAMPLE_REGIONAL_INDUSTRY_ITEMS = [
   },
 ]
 
-export const REGIONAL_INDUSTRY_ITEMS = SAMPLE_REGIONAL_INDUSTRY_ITEMS.map(
-  withSampleProjectMetadata,
-)
+export const REGIONAL_INDUSTRY_ITEMS = SAMPLE_REGIONAL_INDUSTRY_ITEMS.map(withSampleProjectMetadata)

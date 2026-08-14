@@ -15,7 +15,7 @@ function calculatedState(overrides: Partial<InventoryCuttingState> = {}) {
   return {
     ...sample,
     ...overrides,
-    settings: { ...sample.settings, ...(overrides.settings || {}) },
+    settings: { ...sample.settings, ...overrides.settings },
     requirements: overrides.requirements || sample.requirements,
     ownedMaterials: overrides.ownedMaterials || sample.ownedMaterials,
   }
@@ -91,7 +91,7 @@ assert.ok(mismatchResult.plan?.excludedMaterials.some((item) => item.ownedMateri
 
 const tooShort = calculatedState({
   requirements: [sample.requirements[0]],
-  ownedMaterials: [{ ...sample.ownedMaterials[0], id: 'too-short', lengthMm: 2755, quantity: 1 }],
+  ownedMaterials: [{ ...sample.ownedMaterials[0], id: 'too-short', lengthMm: 2754, quantity: 1 }],
 })
 const tooShortResult = calculateInventoryCutPlan({ requirements: tooShort.requirements, ownedMaterials: tooShort.ownedMaterials, settings: tooShort.settings, now })
 assert.equal(tooShortResult.plan?.newOrderPieceCount, 1, '톱날 폭을 고려해 부족한 자재는 신규 발주해야 합니다.')

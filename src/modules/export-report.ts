@@ -1,5 +1,6 @@
 import type {
   CuttingMember,
+  InventoryCutPlan,
   MaterialCatalogItem,
   MaterialSettings,
   MaterialTakeoff,
@@ -32,7 +33,11 @@ const CSV_HEADERS = [
 
 function csvCell(value: unknown) {
   const text = value === null || value === undefined ? '' : String(value)
-  return `"${text.replace(/"/g, '""')}"`
+  const trimmed = text.trimStart()
+  const formulaLike = typeof value === 'string'
+    && (/^[=+@]/.test(trimmed) || /^-(?!\d+(?:\.\d+)?$)/.test(trimmed) || /^[\t\r]/.test(text))
+  const safeText = formulaLike ? `'${text}` : text
+  return `"${safeText.replace(/"/g, '""')}"`
 }
 
 function confidenceLabel(confidence: string) {
@@ -160,40 +165,180 @@ export function downloadScrapsCsv(scraps: ScrapPiece[]) {
   downloadText(csvRows(['자투리 ID', '발생 원천', '재질', '두께(mm)', '길이(mm)', '폭(mm)', '배치 X(mm)', '배치 Y(mm)', '보관 위치', '발생 구역', '사용 가능 구역', '사용 예정 부재', '발생 시점', '사용 예정 시점', '임시 보관 일수', '임시 보관비', '처리 상태', '비고'], rows), '현장-자투리-목록.csv')
 }
 
-export function downloadOptimizationOrderCsv(scenario: OptimizationScenario, catalog: MaterialCatalogItem[]) {
+const OPTIMIZATION_ORDER_HEADERS = ['자재 종류', '자재 형태', '재질', '두께(mm)', '원자재 크기', '주문 수량', '단가', '구매비', '절단비', '절단 횟수 비용', '운반비', '현장 취급비', '임시 보관비', '폐기비', '재작업 위험 비용', '총비용', '사용 구역', '계산 상태', '확인 필요 여부']
+
+export function optimizationOrderToCsv(scenario: OptimizationScenario, catalog: MaterialCatalogItem[]) {
   const materialIds = [...new Set(scenario.stockPlans.map((plan) => plan.materialId))]
-  const rows = materialIds.map((materialId) => {
+  const rows = materialIds.flatMap((materialId) => {
     const item = catalog.find((candidate) => candidate.id === materialId)
     const plans = scenario.stockPlans.filter((plan) => plan.materialId === materialId)
-    const zones = [...new Set(plans.flatMap((plan) => plan.placements.map((placement) => placement.zone)))].join(' · ')
-    const stockSize = item?.materialType === 'panel'
-      ? `${item.stockLengthMm ?? '확인 필요'} × ${item.stockWidthMm ?? '확인 필요'}mm`
-      : (item?.stockLengthOptionsMm || []).length
-        ? `${(item?.stockLengthOptionsMm || []).join(' · ')}mm`
-        : `${item?.stockLengthMm ?? '확인 필요'}mm`
-    return [
-      item?.name || '자재 이름 확인 필요',
-      item?.materialType === 'profile' ? '프로파일' : '판재',
-      item?.material || '재질 확인 필요',
-      item?.thicknessMm ?? '',
-      stockSize,
-      scenario.orderQuantity,
-      item?.unitPrice,
-      scenario.cost.purchaseCost,
-      scenario.cost.cuttingCost,
-      scenario.cost.cutCountCost,
-      scenario.cost.transportCost,
-      scenario.cost.handlingCost,
-      scenario.cost.storageCost,
-      scenario.cost.disposalCost,
-      scenario.cost.riskCost,
-      scenario.cost.totalCost,
-      zones,
-      scenario.cost.status,
-      scenario.available ? '아니오' : '예',
-    ]
+    const rawPlans = plans.filter((plan) => plan.source === 'raw-material')
+    const onsitePlans = plans.filter((plan) => plan.source === 'onsite-scrap')
+    const groups = [...rawPlans.reduce((bySize, plan) => {
+      const key = `${plan.materialType}|${plan.stockLengthMm}|${plan.stockWidthMm ?? ''}`
+      const group = bySize.get(key)
+      if (group) group.push(plan)
+      else bySize.set(key, [plan])
+      return bySize
+    }, new Map<string, typeof rawPlans>()).values()]
+
+    // A material cut entirely from onsite scraps still needs one row for its
+    // cutting costs, but must never invent a catalog stock size or order.
+    if (!groups.length) groups.push([])
+
+    const stockCount = rawPlans.length
+    const materialOrderQuantity = stockCount === 0
+      ? 0
+      : item?.minimumOrderQuantity === null || item?.minimumOrderQuantity === undefined
+        ? null
+        : Math.max(stockCount, item.minimumOrderQuantity)
+    const minimumOrderExtra = materialOrderQuantity === null ? 0 : Math.max(0, materialOrderQuantity - stockCount)
+    const materialScraps = scenario.scraps.filter((scrap) => scrap.materialId === materialId)
+    const rawPlanIds = new Set(rawPlans.map((plan) => plan.id))
+
+    return groups.map((groupPlans, groupIndex) => {
+      const firstPlan = groupPlans[0]
+      const planIds = new Set(groupPlans.map((plan) => plan.id))
+      const costPlans = groupIndex === 0 ? [...groupPlans, ...onsitePlans] : groupPlans
+      const groupScraps = materialScraps.filter((scrap) => (
+        scrap.sourceStockPlanId !== null && planIds.has(scrap.sourceStockPlanId)
+      ) || (groupIndex === 0 && (scrap.sourceStockPlanId === null || !rawPlanIds.has(scrap.sourceStockPlanId))))
+      const generatedWaste = groupScraps.filter((scrap) => scrap.source === 'generated' && scrap.status !== 'reuse-planned')
+      const wasteAreaM2 = generatedWaste.reduce((sum, scrap) => sum + (scrap.widthMm === null ? 0 : scrap.lengthMm * scrap.widthMm / 1_000_000), 0)
+      const wasteLengthM = generatedWaste.reduce((sum, scrap) => sum + scrap.lengthMm / 1000, 0)
+      const storedScraps = groupScraps.filter((scrap) => (scrap.storageDays || 0) > 0)
+      const orderQuantity = materialOrderQuantity === null
+        ? null
+        : groupPlans.length + (groupIndex === 0 ? minimumOrderExtra : 0)
+      const purchaseCost = orderQuantity !== null && item?.unitPrice !== null && item?.unitPrice !== undefined ? orderQuantity * item.unitPrice : null
+      const cuttingCost = item?.cuttingFee !== null && item?.cuttingFee !== undefined ? groupPlans.length * item.cuttingFee : null
+      const cutCount = costPlans.reduce((sum, plan) => sum + plan.cutCount, 0)
+      const cutCountCost = item?.cutCostPerCut !== null && item?.cutCostPerCut !== undefined ? cutCount * item.cutCostPerCut : null
+      const storageCost = storedScraps.length
+        ? storedScraps.every((scrap) => scrap.temporaryStorageCost !== null)
+          ? storedScraps.reduce((sum, scrap) => sum + (scrap.temporaryStorageCost || 0), 0)
+          : null
+        : 0
+      const materialType = firstPlan?.materialType || item?.materialType
+      const disposalCost = materialType === 'panel'
+        ? wasteAreaM2 > 0 && typeof item?.disposalCostPerM2 === 'number' ? wasteAreaM2 * item.disposalCostPerM2 : wasteAreaM2 > 0 ? null : 0
+        : wasteLengthM > 0 && typeof item?.disposalCostPerM === 'number' ? wasteLengthM * item.disposalCostPerM : wasteLengthM > 0 ? null : 0
+      const transportCost = groupIndex === 0 ? item?.transportCost ?? null : 0
+      const handlingCost = groupIndex === 0 ? item?.handlingCost ?? null : 0
+      const riskCost = groupIndex === 0 ? (scenario.available ? 0 : null) : 0
+      const costValues = [purchaseCost, cuttingCost, cutCountCost, transportCost, handlingCost, storageCost, disposalCost, riskCost]
+      const totalCost = costValues.every((value) => value !== null)
+        ? costValues.reduce<number>((sum, value) => sum + (value || 0), 0)
+        : null
+      const zones = [...new Set(costPlans.flatMap((plan) => plan.placements.map((placement) => placement.zone)))].join(' · ')
+      const stockSize = !firstPlan
+        ? '발주 없음(현장 자투리 사용)'
+        : firstPlan.materialType === 'panel'
+          ? `${firstPlan.stockLengthMm} × ${firstPlan.stockWidthMm ?? '확인 필요'}mm`
+          : `${firstPlan.stockLengthMm}mm`
+      return [
+        item?.name || '자재 이름 확인 필요',
+        materialType === 'profile' ? '프로파일' : '판재',
+        item?.material || '재질 확인 필요',
+        item?.thicknessMm ?? '',
+        stockSize,
+        orderQuantity,
+        item?.unitPrice,
+        purchaseCost,
+        cuttingCost,
+        cutCountCost,
+        transportCost,
+        handlingCost,
+        storageCost,
+        disposalCost,
+        riskCost,
+        totalCost,
+        zones,
+        totalCost === null ? '확인 필요' : '규격별 계산 완료',
+        scenario.available ? '아니오' : '예',
+      ]
+    })
   })
-  downloadText(csvRows(['자재 종류', '자재 형태', '재질', '두께(mm)', '원자재 크기', '주문 수량', '단가', '구매비', '절단비', '절단 횟수 비용', '운반비', '현장 취급비', '임시 보관비', '폐기비', '재작업 위험 비용', '총비용', '사용 구역', '계산 상태', '확인 필요 여부'], rows), '자재-발주서.csv')
+  rows.push([
+    '전체 합계', '', '', '', '', scenario.orderQuantity, '',
+    scenario.cost.purchaseCost, scenario.cost.cuttingCost, scenario.cost.cutCountCost,
+    scenario.cost.transportCost, scenario.cost.handlingCost, scenario.cost.storageCost,
+    scenario.cost.disposalCost, scenario.cost.riskCost, scenario.cost.totalCost, '',
+    scenario.cost.status, scenario.available ? '아니오' : '예',
+  ])
+  return csvRows(OPTIMIZATION_ORDER_HEADERS, rows)
+}
+
+export function downloadOptimizationOrderCsv(scenario: OptimizationScenario, catalog: MaterialCatalogItem[]) {
+  downloadText(optimizationOrderToCsv(scenario, catalog), '자재-발주서.csv')
+}
+
+const INVENTORY_ORDER_HEADERS = ['자재 종류', '자재 형태', '두께(mm)', '폭(mm)', '길이(mm)', '표면 마감', '색상', '신규 주문 수량', '요구사항 ID', '발주 사유', '재고 계획 상태', '계산 시각', '승인 시각']
+
+export function inventoryOrderToCsv(plan: InventoryCutPlan) {
+  const status = plan.status === 'approved' ? '승인·재고 예약 반영' : plan.status === 'calculated' ? '승인 전 예상' : '취소됨'
+  const rows = plan.newOrders.length
+    ? plan.newOrders.map((order) => [
+        order.materialName,
+        order.materialType === 'panel' ? '샌드위치패널' : '보드',
+        order.thicknessMm,
+        order.widthMm,
+        order.lengthMm,
+        order.surfaceFinish,
+        order.color,
+        order.quantity,
+        order.requirementIds.join(' · '),
+        order.reason,
+        status,
+        plan.createdAt,
+        plan.approvedAt || '',
+      ])
+    : [['발주 없음', '', '', '', '', '', '', 0, '', '승인된 보유 자재만으로 필요 조각을 모두 배정했습니다.', status, plan.createdAt, plan.approvedAt || '']]
+  return csvRows(INVENTORY_ORDER_HEADERS, rows)
+}
+
+export function downloadInventoryOrderCsv(plan: InventoryCutPlan) {
+  downloadText(inventoryOrderToCsv(plan), '재고-반영-신규-발주서.csv')
+}
+
+const INVENTORY_CUT_HEADERS = [
+  '계획 상태', '보유 자재 사용 ID', '자재 원천', '자재명', '두께(mm)', '폭(mm)', '원자재 길이(mm)',
+  '자재 단위 번호', '절단 순서', '요구사항 ID', '요구 단위', '구역', '설치 위치', '필요 길이(mm)',
+  '톱날 폭(mm)', '실제 사용 길이(mm)', '절단 전 길이(mm)', '절단 후 길이(mm)',
+  '최종 재사용 가능 잔량(mm)', '최종 폐기 예상 잔량(mm)', '계산 시각', '승인 시각',
+]
+
+export function inventoryCutPlanToCsv(plan: InventoryCutPlan) {
+  const status = plan.status === 'approved' ? '승인·재고 예약 반영' : plan.status === 'calculated' ? '승인 전 예상' : '취소됨'
+  const rows = plan.usages.flatMap((usage) => usage.cuts.map((cut) => [
+    status,
+    usage.id,
+    usage.source === 'scrap' ? '현장 자투리' : '보유 신규 자재',
+    usage.materialName,
+    usage.thicknessMm,
+    usage.widthMm,
+    usage.lengthMm,
+    usage.unitIndex,
+    cut.cutOrder,
+    cut.requirementId,
+    cut.requirementUnit,
+    cut.zone,
+    cut.location,
+    cut.requiredLengthMm,
+    cut.kerfMm,
+    cut.actualUsedLengthMm,
+    cut.stockLengthBeforeMm,
+    cut.remainingLengthMm,
+    usage.reusableRemainingLengthMm,
+    usage.wasteRemainingLengthMm,
+    plan.createdAt,
+    plan.approvedAt || '',
+  ]))
+  return csvRows(INVENTORY_CUT_HEADERS, rows)
+}
+
+export function downloadInventoryCutPlanCsv(plan: InventoryCutPlan) {
+  downloadText(inventoryCutPlanToCsv(plan), '승인-보유재고-절단-계획.csv')
 }
 
 export function downloadScenarioComparisonCsv(scenarios: OptimizationScenario[]) {
@@ -245,18 +390,18 @@ function printPlanMarkup(scenario: OptimizationScenario) {
       return `<div class="piece" style="left:${left}%;top:${top}%;width:${pieceWidth}%;height:${pieceHeight}%"><b>${htmlText(placement.label)}</b><small>${placement.lengthMm} × ${placement.widthMm || '길이'}mm</small><i>${placement.cutOrder}번</i></div>`
     }).join('')
     const title = `${plan.source === 'raw-material' ? '원자재' : '현장 자투리'} ${plan.stockIndex} · ${plan.stockLengthMm.toLocaleString('ko-KR')}mm${plan.stockWidthMm ? ` × ${plan.stockWidthMm.toLocaleString('ko-KR')}mm` : ''}`
-    return `<section class="plan"><h2>${title}</h2><div class="stock">${pieces || '<span class="empty">배치된 부재 없음</span>'}</div><p>절단 순서: ${plan.placements.map((placement) => `${placement.cutOrder}번 ${placement.label}`).join(' → ') || '없음'}<br>남는 면적: ${plan.wasteAreaM2 === null ? '—' : `${plan.wasteAreaM2.toFixed(2)}㎡`} · 남는 길이: ${plan.wasteLengthMm === null ? '—' : `${plan.wasteLengthMm.toLocaleString('ko-KR')}mm`}</p></section>`
+    return `<section class="plan"><h2>${title}</h2><div class="stock">${pieces || '<span class="empty">배치된 부재 없음</span>'}</div><p>절단 순서: ${plan.placements.map((placement) => `${placement.cutOrder}번 ${htmlText(placement.label)}`).join(' → ') || '없음'}<br>남는 면적: ${plan.wasteAreaM2 === null ? '—' : `${plan.wasteAreaM2.toFixed(2)}㎡`} · 남는 길이: ${plan.wasteLengthMm === null ? '—' : `${plan.wasteLengthMm.toLocaleString('ko-KR')}mm`}</p></section>`
   }).join('')
 }
 
 export function printCuttingPlans(projectName: string, scenario: OptimizationScenario) {
-  const popup = window.open('', '_blank', 'noopener,noreferrer,width=1280,height=900')
-  const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>${projectName} 절단 배치도</title><style>@page{size:A4 landscape;margin:12mm}body{font-family:Arial,"Noto Sans KR",sans-serif;color:#17221f;font-size:11px}h1{font-size:22px;margin:0 0 6px}p{color:#536861;line-height:1.6}.notice{padding:10px;background:#eef5f1;border:1px solid #d5e7df;margin:12px 0}.plan{break-inside:avoid;margin:18px 0}.plan h2{font-size:15px;margin:0 0 7px}.stock{position:relative;width:700px;height:260px;border:2px solid #7fa595;background:#f7fbf8}.piece{position:absolute;overflow:hidden;padding:4px;border:1px solid #216fca;color:#083b73;background:#9fd5ff;line-height:1.2}.piece b,.piece small,.piece i{display:block;white-space:nowrap}.piece i{font-style:normal;font-size:9px}.empty{display:grid;place-items:center;height:100%;color:#8a9892}.footer{margin-top:18px;color:#697a74}</style></head><body><h1>${projectName} · 절단 배치도</h1><p>선택 기준: ${scenario.label} · 출력 시각: ${new Date().toLocaleString('ko-KR')}</p><div class="notice">설계 치수는 변경하지 않았습니다. 파란색은 사용할 부재이며, 가격·규격·도면 신뢰도가 부족한 항목은 발주 전에 확인해야 합니다. 브라우저 인쇄 메뉴에서 PDF로 저장할 수 있습니다.</div>${printPlanMarkup(scenario)}<p class="footer">총비용: ${scenario.cost.totalCost === null ? '계산 불가' : `${scenario.cost.totalCost.toLocaleString('ko-KR')}원`} · 폐기율: ${scenario.wasteRate === null ? '계산 불가' : `${scenario.wasteRate}%`}</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),220));</script></body></html>`
+  const popup = window.open('', '_blank', 'width=1280,height=900')
+  if (popup) popup.opener = null
+  const safeProjectName = htmlText(projectName)
+  const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>${safeProjectName} 절단 배치도</title><style>@page{size:A4 landscape;margin:12mm}body{font-family:Arial,"Noto Sans KR",sans-serif;color:#17221f;font-size:11px}h1{font-size:22px;margin:0 0 6px}p{color:#536861;line-height:1.6}.notice{padding:10px;background:#eef5f1;border:1px solid #d5e7df;margin:12px 0}.plan{break-inside:avoid;margin:18px 0}.plan h2{font-size:15px;margin:0 0 7px}.stock{position:relative;width:700px;height:260px;border:2px solid #7fa595;background:#f7fbf8}.piece{position:absolute;overflow:hidden;padding:4px;border:1px solid #216fca;color:#083b73;background:#9fd5ff;line-height:1.2}.piece b,.piece small,.piece i{display:block;white-space:nowrap}.piece i{font-style:normal;font-size:9px}.empty{display:grid;place-items:center;height:100%;color:#8a9892}.footer{margin-top:18px;color:#697a74}</style></head><body><h1>${safeProjectName} · 절단 배치도</h1><p>선택 기준: ${htmlText(scenario.label)} · 출력 시각: ${new Date().toLocaleString('ko-KR')}</p><div class="notice">설계 치수는 변경하지 않았습니다. 파란색은 사용할 부재이며, 가격·규격·도면 신뢰도가 부족한 항목은 발주 전에 확인해야 합니다. 브라우저 인쇄 메뉴에서 PDF로 저장할 수 있습니다.</div>${printPlanMarkup(scenario)}<p class="footer">총비용: ${scenario.cost.totalCost === null ? '계산 불가' : `${scenario.cost.totalCost.toLocaleString('ko-KR')}원`} · 폐기율: ${scenario.wasteRate === null ? '계산 불가' : `${scenario.wasteRate}%`}</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),220));</script></body></html>`
   if (popup) {
     popup.document.write(html)
     popup.document.close()
-  } else {
-    window.print()
   }
 }
 
@@ -275,7 +420,8 @@ function htmlText(value: unknown) {
 }
 
 export function printReport(projectName: string, rows: MaterialTakeoff[], settings: MaterialSettings) {
-  const popup = window.open('', '_blank', 'noopener,noreferrer,width=1280,height=900')
+  const popup = window.open('', '_blank', 'width=1280,height=900')
+  if (popup) popup.opener = null
   const contentRows = rows.map((row) => `<tr>${[
     row.zone,
     row.wallNumber,
@@ -298,13 +444,11 @@ export function printReport(projectName: string, rows: MaterialTakeoff[], settin
     row.reviewStatus,
     row.reviewStatus === '확정' ? '아니오' : '예',
   ].map(htmlCell).join('')}</tr>`).join('')
-  const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>${projectName} 자재 산출표</title><style>
+  const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>${htmlText(projectName)} 자재 산출표</title><style>
     @page{size:A3 landscape;margin:12mm}body{font-family:Arial,"Noto Sans KR",sans-serif;color:#17221f;font-size:10px}h1{font-size:20px;margin:0 0 6px}p{margin:3px 0 14px;color:#4e625c}.notice{padding:8px;background:#eef5f1;border:1px solid #d5e7df;margin-bottom:12px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #cddbd5;padding:5px;vertical-align:top}th{background:#eaf2ee;text-align:left;white-space:nowrap}tr:nth-child(even){background:#fafcfb}.footer{margin-top:14px;color:#5b6d67}
   </style></head><body><h1>${htmlText(projectName)} · 발주 산출표</h1><p>생성 시각: ${new Date().toLocaleString('ko-KR')}</p><div class="notice">판넬 기준: 유효폭 ${settings.panelEffectiveWidthMm.toLocaleString('ko-KR')}mm · 표준길이 ${settings.panelStandardLengthMm.toLocaleString('ko-KR')}mm · 두께 ${settings.panelThicknessMm}T · ${settings.panelDirection === 'vertical' ? '세로' : '가로'} 시공 · 여유율 ${settings.panelWasteRate}%</div><table><thead><tr>${CSV_HEADERS.map(htmlCell).join('')}</tr></thead><tbody>${contentRows || `<tr><td colspan="${CSV_HEADERS.length}">계산 가능한 벽체가 없습니다.</td></tr>`}</tbody></table><p class="footer">도면 정보를 기반으로 만든 자재 산출용 개략 결과입니다. 구조검토 및 설계 승인을 대신하지 않습니다. 브라우저 인쇄 대화상자에서 PDF로 저장할 수 있습니다.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),220));</script></body></html>`
   if (popup) {
     popup.document.write(html)
     popup.document.close()
-  } else {
-    window.print()
   }
 }

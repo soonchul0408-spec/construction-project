@@ -6,6 +6,7 @@ import type {
   ProjectWorkflow,
   ConsistencyValidation,
 } from '../types/domain'
+import { isCostSummaryPage } from './cost-summary-parser.ts'
 
 export interface ProjectWorkflowAssessment {
   status: ProjectStatus
@@ -22,7 +23,7 @@ function allFilesFinished(files: AnalyzedFile[]) {
 }
 
 function hasCriticalAnalysisFailure(files: AnalyzedFile[]) {
-  const drawingFiles = files.filter((file) => file.kind !== 'cost-summary')
+  const drawingFiles = files.filter((file) => file.pages.some((page) => !isCostSummaryPage(file, page)))
   return drawingFiles.length > 0 && drawingFiles.every((file) => file.status === 'failed')
 }
 

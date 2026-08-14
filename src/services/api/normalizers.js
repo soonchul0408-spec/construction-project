@@ -2,6 +2,17 @@ import { DATA_ORIGINS, createSourceMetadata } from '@/data/sourceMetadata'
 
 const LOCAL_FINANCE_SOURCE_URL = 'https://www.data.go.kr/data/15118650/openapi.do'
 const UNKNOWN_INDUSTRY_CATEGORY = '분류 미확인'
+const MAX_CONTRACT_RECORDS = 1000
+const PROVIDER_SUCCESS_CODES = new Set([
+  '0',
+  '00',
+  '000',
+  '0000',
+  'INFO-000',
+  'NORMAL_SERVICE',
+  'NORMAL SERVICE',
+  'NORMAL SERVICE.',
+])
 
 const INDUSTRY_RULES = [
   {
@@ -78,7 +89,14 @@ const CONTRACT_FIELDS = {
   ],
   province: ['sido', 'siDo', '시도', '광역자치단체'],
   city: ['sigungu', 'siGunGu', '시군구', '기초자치단체'],
-  content: ['description', 'contractContent', 'contractDetails', 'cntrctCn', '계약내용', '사업내용'],
+  content: [
+    'description',
+    'contractContent',
+    'contractDetails',
+    'cntrctCn',
+    '계약내용',
+    '사업내용',
+  ],
   source: [
     'sourceUrl',
     'detailUrl',
@@ -94,7 +112,9 @@ const CONTRACT_FIELDS = {
 }
 
 function normalizeFieldKey(value) {
-  return String(value).replace(/[\s_()./-]/g, '').toLowerCase()
+  return String(value)
+    .replace(/[\s_()./-]/g, '')
+    .toLowerCase()
 }
 
 function hasValue(value) {
@@ -124,16 +144,92 @@ function toArray(value) {
   return typeof value === 'object' ? [value] : []
 }
 
+export function normalizeExternalHttpUrl(value, fallback = '') {
+  for (const candidate of [value, fallback]) {
+    const text = String(candidate ?? '').trim()
+    if (!text) continue
+
+    try {
+      const url = new URL(text)
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue
+      return url.toString()
+    } catch {
+      // 다음 안전한 후보를 확인합니다.
+    }
+  }
+
+  return ''
+}
+
+function pickEnvelopeValue(envelope, keys) {
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return ''
+  for (const key of keys) {
+    const value = envelope[key]
+    if (value !== undefined && value !== null && typeof value !== 'object') {
+      const text = String(value).trim()
+      if (text) return text
+    }
+  }
+  return ''
+}
+
+function assertNoProviderError(root) {
+  const envelopes = [
+    root,
+    root?.header,
+    root?.response,
+    root?.response?.header,
+    root?.response?.body,
+    root?.response?.body?.items,
+  ]
+
+  for (const envelope of envelopes) {
+    const code = pickEnvelopeValue(envelope, [
+      'resultCode',
+      'result_code',
+      'RESULT_CODE',
+      'returnReasonCode',
+      'CODE',
+    ])
+    if (!code || PROVIDER_SUCCESS_CODES.has(code.toUpperCase())) continue
+
+    const message = pickEnvelopeValue(envelope, [
+      'resultMsg',
+      'resultMessage',
+      'result_msg',
+      'RESULT_MSG',
+      'returnAuthMsg',
+      'errMsg',
+      'MESSAGE',
+    ])
+    throw new Error(
+      `지방재정365 API 오류 응답입니다. (${code}${message ? `: ${message.slice(0, 200)}` : ''})`,
+    )
+  }
+}
+
 function looksLikeContractRecord(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return false
 
-  const normalizedKeys = Object.keys(record).map(normalizeFieldKey)
-  const knownFields = Object.values(CONTRACT_FIELDS).flat().map(normalizeFieldKey)
-  return knownFields.some((field) => normalizedKeys.includes(field))
+  if (!pickField(record, CONTRACT_FIELDS.name)) return false
+
+  return [
+    CONTRACT_FIELDS.id,
+    CONTRACT_FIELDS.amount,
+    CONTRACT_FIELDS.date,
+    CONTRACT_FIELDS.method,
+    CONTRACT_FIELDS.type,
+    CONTRACT_FIELDS.company,
+    CONTRACT_FIELDS.region,
+    CONTRACT_FIELDS.province,
+    CONTRACT_FIELDS.city,
+    CONTRACT_FIELDS.content,
+  ].some((fieldNames) => pickField(record, fieldNames))
 }
 
 function extractContractRecords(payload) {
   const root = payload?.raw ?? payload?.data ?? payload
+  assertNoProviderError(root)
   const candidates = [
     root?.response?.body?.items?.item,
     root?.response?.body?.items,
@@ -148,10 +244,8 @@ function extractContractRecords(payload) {
   ]
 
   for (const candidate of candidates) {
-    const records = toArray(candidate).filter(
-      (record) => record && typeof record === 'object' && !Array.isArray(record),
-    )
-    if (records.length) return records
+    const records = toArray(candidate).filter(looksLikeContractRecord)
+    if (records.length) return records.slice(0, MAX_CONTRACT_RECORDS)
   }
 
   return looksLikeContractRecord(root) ? [root] : []
@@ -208,9 +302,10 @@ function normalizeRegion(record) {
   return [province, city].filter(Boolean).join(' ') || '전국'
 }
 
-function normalizeContractRecord(record, index, metadata) {
+function normalizeContractRecord(record, metadata) {
   const contractId = pickField(record, CONTRACT_FIELDS.id)
-  const projectName = pickField(record, CONTRACT_FIELDS.name) || `지방자치단체 계약 정보 ${index + 1}`
+  const projectName = pickField(record, CONTRACT_FIELDS.name)
+  if (!projectName) return null
   const contractType = pickField(record, CONTRACT_FIELDS.type)
   const contractMethod = pickField(record, CONTRACT_FIELDS.method)
   const contractDate = formatDisplayDate(pickField(record, CONTRACT_FIELDS.date))
@@ -219,7 +314,10 @@ function normalizeContractRecord(record, index, metadata) {
   const category = inferIndustryCategory(
     [projectName, contractType, contractContent].filter(Boolean).join(' '),
   )
-  const sourceUrl = pickField(record, CONTRACT_FIELDS.source) || metadata.sourceUrl || LOCAL_FINANCE_SOURCE_URL
+  const sourceUrl = normalizeExternalHttpUrl(
+    pickField(record, CONTRACT_FIELDS.source),
+    metadata.sourceUrl || LOCAL_FINANCE_SOURCE_URL,
+  )
   const verifiedAt = metadata.retrievedAt?.slice(0, 10) ?? null
   const recordId = createStableId(
     'lofin-contract',
@@ -234,7 +332,10 @@ function normalizeContractRecord(record, index, metadata) {
   ].filter(Boolean)
   const source = createSourceMetadata({
     provider: metadata.provider,
-    title: sourceUrl === LOCAL_FINANCE_SOURCE_URL ? '행정안전부 지방재정365 계약현황' : '지방재정365 계약 원문',
+    title:
+      sourceUrl === LOCAL_FINANCE_SOURCE_URL
+        ? '행정안전부 지방재정365 계약현황'
+        : '지방재정365 계약 원문',
     url: sourceUrl,
     publishedAt: contractDate || null,
     verifiedAt,
@@ -291,10 +392,12 @@ function normalizeContractRecord(record, index, metadata) {
     id: companyId,
     projectIds: [recordId],
     companyName,
-    mainBusiness: '공개 계약 데이터상 계약 상대방이며, 주요 사업은 기업 공식 소개에서 별도 확인이 필요합니다.',
+    mainBusiness:
+      '공개 계약 데이터상 계약 상대방이며, 주요 사업은 기업 공식 소개에서 별도 확인이 필요합니다.',
     industries: category === UNKNOWN_INDUSTRY_CATEGORY ? [] : [category],
     relationStatus,
-    relationReason: '지방재정365 계약현황에서 해당 사업의 계약 상대방으로 공개되어 직접 연결됩니다.',
+    relationReason:
+      '지방재정365 계약현황에서 해당 사업의 계약 상대방으로 공개되어 직접 연결됩니다.',
     directParticipation: '확인됨',
     connectionBasis: `지방재정365 계약현황의 계약명·계약일자·업체명 항목에서 ${companyName}의 계약 기록을 확인했습니다.`,
     officialUrl: sourceUrl,
@@ -313,18 +416,20 @@ function normalizeContractSnapshot(payload, body, retrievedAt) {
   const records = extractContractRecords(payload)
   const metadata = {
     provider: body.provider ?? '행정안전부 지방재정365 계약현황',
-    sourceUrl: body.sourceUrl ?? LOCAL_FINANCE_SOURCE_URL,
+    sourceUrl: normalizeExternalHttpUrl(body.sourceUrl, LOCAL_FINANCE_SOURCE_URL),
     retrievedAt,
   }
   const companies = new Map()
   const items = records
-    .map((record, index) => normalizeContractRecord(record, index, metadata))
+    .map((record) => normalizeContractRecord(record, metadata))
     .filter(Boolean)
     .map(({ item, company }) => {
       if (company) {
         const existingCompany = companies.get(company.id)
         if (existingCompany) {
-          existingCompany.projectIds = [...new Set([...existingCompany.projectIds, ...company.projectIds])]
+          existingCompany.projectIds = [
+            ...new Set([...existingCompany.projectIds, ...company.projectIds]),
+          ]
         } else {
           companies.set(company.id, company)
         }
@@ -347,10 +452,11 @@ function normalizeContractSnapshot(payload, body, retrievedAt) {
 }
 
 function normalizeSource(source, fallback = {}) {
+  const fallbackUrl = normalizeExternalHttpUrl(fallback.sourceUrl)
   return createSourceMetadata({
     provider: source?.provider ?? fallback.provider,
     title: source?.title ?? fallback.sourceTitle,
-    url: source?.url ?? fallback.sourceUrl,
+    url: normalizeExternalHttpUrl(source?.url, fallbackUrl),
     publishedAt: source?.publishedAt ?? fallback.sourceDate ?? null,
     verifiedAt: source?.verifiedAt ?? fallback.verifiedAt ?? null,
     retrievedAt: source?.retrievedAt ?? fallback.retrievedAt ?? null,
@@ -359,17 +465,21 @@ function normalizeSource(source, fallback = {}) {
 }
 
 function normalizeProject(item, retrievedAt) {
+  const safeItemSourceUrl = normalizeExternalHttpUrl(item.sourceUrl, LOCAL_FINANCE_SOURCE_URL)
   const source = normalizeSource(item.source ?? item.sources?.[0], {
     provider: item.provider,
     sourceTitle: item.sourceTitle,
-    sourceUrl: item.sourceUrl,
+    sourceUrl: safeItemSourceUrl,
     sourceDate: item.sourceDate,
     verifiedAt: item.verifiedAt,
     retrievedAt,
   })
-  const sources = (item.sources ?? [source]).map((sourceItem) =>
-    normalizeSource(sourceItem, { ...item, retrievedAt }),
-  )
+  const sources = (item.sources ?? [source])
+    .map((sourceItem) =>
+      normalizeSource(sourceItem, { ...item, sourceUrl: safeItemSourceUrl, retrievedAt }),
+    )
+    .filter((sourceItem) => sourceItem.url)
+  if (!sources.length && source.url) sources.push(source)
 
   return {
     ...item,
@@ -378,23 +488,31 @@ function normalizeProject(item, retrievedAt) {
     sources,
     sourceTitle: item.sourceTitle ?? source.title,
     sourceDate: item.sourceDate ?? source.publishedAt,
-    sourceUrl: item.sourceUrl ?? source.url,
+    sourceUrl: normalizeExternalHttpUrl(item.sourceUrl, source.url),
     verifiedAt: item.verifiedAt ?? source.verifiedAt,
   }
 }
 
 function normalizeCompany(company, retrievedAt) {
+  const safeOfficialUrl = normalizeExternalHttpUrl(company.officialUrl)
+  const safeEvidenceUrl = normalizeExternalHttpUrl(company.evidenceUrl)
   const sources = (company.sources ?? [])
-    .map((sourceItem) => normalizeSource(sourceItem, { ...company, retrievedAt }))
+    .map((sourceItem) =>
+      normalizeSource(sourceItem, {
+        ...company,
+        sourceUrl: safeEvidenceUrl || safeOfficialUrl,
+        retrievedAt,
+      }),
+    )
     .filter((source) => source.url)
 
-  if (!sources.length && company.officialUrl) {
+  if (!sources.length && safeOfficialUrl) {
     sources.push(
       normalizeSource(
         {
           provider: company.companyName,
           title: company.officialLinkLabel,
-          url: company.officialUrl,
+          url: safeOfficialUrl,
           role: 'official',
         },
         { ...company, retrievedAt },
@@ -405,6 +523,8 @@ function normalizeCompany(company, retrievedAt) {
   return {
     ...company,
     dataOrigin: DATA_ORIGINS.LIVE,
+    officialUrl: safeOfficialUrl,
+    evidenceUrl: safeEvidenceUrl,
     sources,
     verifiedAt: company.verifiedAt ?? sources[0]?.verifiedAt ?? null,
   }
@@ -414,7 +534,17 @@ export function normalizeRegionalIndustrySnapshot(payload) {
   const body = payload?.data ?? payload ?? {}
   const retrievedAt = body.retrievedAt ?? new Date().toISOString()
   const normalizedItems = Array.isArray(body.items)
-    ? body.items.filter((item) => item?.projectName).map((item) => normalizeProject(item, retrievedAt))
+    ? body.items
+        .filter(
+          (item) =>
+            item &&
+            typeof item === 'object' &&
+            !Array.isArray(item) &&
+            typeof item.projectName === 'string' &&
+            item.projectName.trim(),
+        )
+        .slice(0, MAX_CONTRACT_RECORDS)
+        .map((item) => normalizeProject(item, retrievedAt))
     : []
 
   if (normalizedItems.length) {
