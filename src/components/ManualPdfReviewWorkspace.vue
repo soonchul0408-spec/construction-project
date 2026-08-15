@@ -32,6 +32,11 @@ interface ManualDrawing {
   specs: ManualSpec[]
 }
 
+interface LocalTestManifest {
+  projectName: string
+  drawings: Array<{ name: string; size: number; kind?: DrawingKind }>
+}
+
 const DB_NAME = 'drawing-manual-review-v1'
 const STORE_NAME = 'drawings'
 const MAX_FILE_SIZE = 50 * 1024 * 1024
@@ -45,6 +50,7 @@ const isLoading = ref(true)
 const message = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
 const canvas = ref<HTMLCanvasElement | null>(null)
+const localTestManifest = ref<LocalTestManifest | null>(null)
 let pdfDocument: Awaited<ReturnType<typeof pdfjsLib.getDocument>> | null = null
 let renderTask: { cancel: () => void } | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -105,6 +111,19 @@ async function loadDrawings() {
     message.value = '브라우저 저장소를 열지 못했습니다. 개인정보 보호 모드에서는 저장이 제한될 수 있습니다.'
   } finally {
     isLoading.value = false
+    // The preview canvas is rendered only after the loading placeholder leaves
+    // the DOM; otherwise a restored PDF list appears without its first page.
+    await nextTick()
+    await renderPage()
+  }
+}
+
+async function loadLocalTestManifest() {
+  try {
+    const response = await fetch('/local-drawing-manifest.json', { cache: 'no-store' })
+    if (response.ok) localTestManifest.value = await response.json() as LocalTestManifest
+  } catch {
+    // This optional file is intentionally available only in a local dev setup.
   }
 }
 
@@ -113,7 +132,18 @@ async function persist() {
     const db = await openDatabase()
     const transaction = db.transaction(STORE_NAME, 'readwrite')
     const store = transaction.objectStore(STORE_NAME)
-    drawings.value.forEach((drawing) => store.put(drawing))
+    // IndexedDB cannot clone Vue's reactive Proxy. Store a plain record so PDF
+    // blobs and manual inputs survive a browser refresh without serialization.
+    drawings.value.forEach((drawing) => store.put({
+      id: drawing.id,
+      name: drawing.name,
+      size: drawing.size,
+      uploadedAt: drawing.uploadedAt,
+      status: drawing.status,
+      kind: drawing.kind,
+      blob: drawing.blob,
+      specs: drawing.specs.map((spec) => ({ ...spec })),
+    } satisfies ManualDrawing))
     await new Promise<void>((resolve, reject) => {
       transaction.oncomplete = () => resolve()
       transaction.onerror = () => reject(transaction.error)
@@ -164,15 +194,18 @@ async function selectDrawing(id: string) {
   if (!drawing) return
   try {
     pdfDocument?.destroy()
-    const bytes = await drawing.blob.arrayBuffer()
-    pdfDocument = await pdfjsLib.getDocument({ data: bytes }).promise
+    // PDF.js transfers its input buffer to the worker. Give it a copy so the
+    // browser-owned PDF Blob remains intact for IndexedDB persistence.
+    const sourceBytes = new Uint8Array(await drawing.blob.arrayBuffer())
+    pdfDocument = await pdfjsLib.getDocument({ data: sourceBytes.slice() }).promise
     pageCount.value = pdfDocument.numPages
     drawing.status = '검토 중'
     schedulePersist()
     await nextTick()
     await renderPage()
-  } catch {
+  } catch (error) {
     pageCount.value = 0
+    console.warn('Manual PDF preview failed.', error)
     message.value = 'PDF를 미리보기로 열지 못했습니다. 파일이 손상되지 않았는지 확인하세요.'
   }
 }
@@ -218,7 +251,7 @@ function formatWon(value: number) { return new Intl.NumberFormat('ko-KR', { styl
 
 watch([pageNumber, zoom], () => void nextTick(renderPage))
 watch(drawings, schedulePersist, { deep: true })
-onMounted(() => void loadDrawings())
+onMounted(() => { void loadDrawings(); void loadLocalTestManifest() })
 onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTimer) clearTimeout(saveTimer); blobUrls.forEach((url) => URL.revokeObjectURL(url)) })
 </script>
 
@@ -226,6 +259,7 @@ onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTi
   <section class="manual-workspace panel-card" aria-labelledby="manual-pdf-title">
     <div class="panel-heading"><div><span class="panel-kicker">1차 구현 테스트</span><h2 id="manual-pdf-title">수동 PDF 검토·자재 산출</h2><p>PDF 원본과 입력값은 이 브라우저의 IndexedDB에만 저장됩니다. 자동 판독, 3D 생성, 발주 전송은 추후 연동입니다.</p></div><span class="manual-safe-badge">서버 업로드 없음</span></div>
     <div class="manual-upload-row"><input ref="fileInput" class="visually-hidden" type="file" accept="application/pdf,.pdf" multiple @change="onInput"><button type="button" class="primary-button" @click="fileInput?.click()">PDF 여러 개 추가</button><small>PDF만 · 파일당 50MB 이하 · 새로고침 후에도 유지</small></div>
+    <section v-if="localTestManifest" class="local-test-manifest"><div><span class="panel-kicker">로컬 개발 전용 테스트 프로젝트</span><h3>{{ localTestManifest.projectName }}</h3><p>아래 목록은 이 Mac의 파일명·용량만 표시합니다. 원본은 선택 전까지 브라우저가 읽지 않으며 GitHub에 포함되지 않습니다.</p></div><ol><li v-for="drawing in localTestManifest.drawings" :key="drawing.name"><b>{{ drawing.name }}</b><span>{{ drawing.kind ? kindLabels[drawing.kind] : '유형 미지정' }} · {{ formatSize(drawing.size) }}</span></li></ol></section>
     <p v-if="message" class="manual-message">{{ message }}</p>
     <div v-if="isLoading" class="manual-empty">저장된 검토 작업을 불러오는 중입니다.</div>
     <div v-else-if="!drawings.length" class="manual-empty">실제 도면 PDF를 추가하면 이곳에서 미리보기·사양 검토·수동 산출을 시작할 수 있습니다.</div>
@@ -243,5 +277,5 @@ onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTi
 </template>
 
 <style scoped>
-.manual-workspace { margin-top: 22px; }.manual-safe-badge { color: #176341; font-weight: 800; }.manual-upload-row,.manual-toolbar,.manual-spec-heading,.manual-spec-top { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.manual-message { color:#28634c; }.manual-empty { padding:22px; border:1px dashed #b8c8bf; border-radius:10px; color:#61736a; }.manual-layout { display:grid; grid-template-columns:250px minmax(0,1fr); gap:16px; }.manual-list { display:grid; align-content:start; gap:8px; max-height:620px; overflow:auto; }.manual-list article { border:1px solid #d7e1db; border-radius:10px; padding:8px; }.manual-list article.selected { border-color:#398367; background:#f0f8f3; }.manual-list article > button:first-child { display:grid; gap:4px; width:100%; border:0; background:transparent; text-align:left; cursor:pointer; }.manual-list small,.manual-list span { color:#687b72; font-size:12px; }.manual-delete { margin-top:6px; border:0; background:transparent; color:#a73535; cursor:pointer; }.manual-content { min-width:0; }.manual-toolbar { padding:10px; background:#f6f8f6; border-radius:8px; }.manual-toolbar button { border:1px solid #c7d4cc; border-radius:6px; background:white; padding:5px 8px; }.pdf-canvas-wrap { margin-top:12px; min-height:260px; overflow:auto; background:#edf1ee; padding:14px; text-align:center; }.pdf-canvas-wrap canvas { max-width:none; background:white; box-shadow:0 2px 10px #2c41331f; }.manual-spec-heading { justify-content:space-between; margin-top:22px; }.manual-spec-heading h3 { margin:0; }.manual-spec-heading p { margin:4px 0 0; color:#64766c; }.manual-spec { border-top:1px solid #dfe7e1; padding:14px 0; }.manual-spec-top { justify-content:space-between; }.manual-spec-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }.manual-spec-grid label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.manual-spec-grid input,.manual-spec-grid select,.manual-toolbar select { width:100%; box-sizing:border-box; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.manual-wide { grid-column:span 2; }.manual-takeoff { margin-top:20px; padding-top:4px; }.manual-takeoff strong { color:#176341; } @media (max-width: 850px) { .manual-layout { grid-template-columns:1fr; }.manual-list { max-height:220px; }.manual-spec-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.manual-wide { grid-column:span 2; } } @media (max-width: 500px) { .manual-spec-grid { grid-template-columns:1fr; }.manual-wide { grid-column:auto; } }
+.manual-workspace { margin-top: 22px; }.manual-safe-badge { color: #176341; font-weight: 800; }.manual-upload-row,.manual-toolbar,.manual-spec-heading,.manual-spec-top { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.local-test-manifest { margin:14px 0; padding:14px; border:1px solid #c9ddd0; border-radius:10px; background:#f4faf6; }.local-test-manifest h3 { margin:3px 0; }.local-test-manifest p { margin:4px 0 10px; color:#587063; font-size:13px; }.local-test-manifest ol { margin:0; padding-left:22px; display:grid; gap:5px; }.local-test-manifest li { display:flex; justify-content:space-between; gap:12px; font-size:12px; }.local-test-manifest li span { white-space:nowrap; color:#61776a; }.manual-message { color:#28634c; }.manual-empty { padding:22px; border:1px dashed #b8c8bf; border-radius:10px; color:#61736a; }.manual-layout { display:grid; grid-template-columns:250px minmax(0,1fr); gap:16px; }.manual-list { display:grid; align-content:start; gap:8px; max-height:620px; overflow:auto; }.manual-list article { border:1px solid #d7e1db; border-radius:10px; padding:8px; }.manual-list article.selected { border-color:#398367; background:#f0f8f3; }.manual-list article > button:first-child { display:grid; gap:4px; width:100%; border:0; background:transparent; text-align:left; cursor:pointer; }.manual-list small,.manual-list span { color:#687b72; font-size:12px; }.manual-delete { margin-top:6px; border:0; background:transparent; color:#a73535; cursor:pointer; }.manual-content { min-width:0; }.manual-toolbar { padding:10px; background:#f6f8f6; border-radius:8px; }.manual-toolbar button { border:1px solid #c7d4cc; border-radius:6px; background:white; padding:5px 8px; }.pdf-canvas-wrap { margin-top:12px; min-height:260px; overflow:auto; background:#edf1ee; padding:14px; text-align:center; }.pdf-canvas-wrap canvas { max-width:none; background:white; box-shadow:0 2px 10px #2c41331f; }.manual-spec-heading { justify-content:space-between; margin-top:22px; }.manual-spec-heading h3 { margin:0; }.manual-spec-heading p { margin:4px 0 0; color:#64766c; }.manual-spec { border-top:1px solid #dfe7e1; padding:14px 0; }.manual-spec-top { justify-content:space-between; }.manual-spec-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }.manual-spec-grid label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.manual-spec-grid input,.manual-spec-grid select,.manual-toolbar select { width:100%; box-sizing:border-box; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.manual-wide { grid-column:span 2; }.manual-takeoff { margin-top:20px; padding-top:4px; }.manual-takeoff strong { color:#176341; } @media (max-width: 850px) { .manual-layout { grid-template-columns:1fr; }.manual-list { max-height:220px; }.manual-spec-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.manual-wide { grid-column:span 2; } } @media (max-width: 500px) { .local-test-manifest li { display:grid; }.manual-spec-grid { grid-template-columns:1fr; }.manual-wide { grid-column:auto; } }
 </style>
