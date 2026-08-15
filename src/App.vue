@@ -2,6 +2,7 @@
 import { computed, defineAsyncComponent, nextTick, onMounted, reactive, ref, watch } from 'vue'
 
 import ConfidenceReviewPanel from './components/ConfidenceReviewPanel.vue'
+import ManualPdfReviewWorkspace from './components/ManualPdfReviewWorkspace.vue'
 import { analyzeCadFile } from './modules/cad-parser-adapter'
 import { isCostSummaryPage, parseCostSummaries } from './modules/cost-summary-parser'
 import { classifyDocument, guessBuildingName } from './modules/document-classifier'
@@ -2306,6 +2307,8 @@ onMounted(() => {
             </div>
           </div>
           <div class="upload-guidance"><span class="lightbulb">✦</span><span><b>평면도·입면도·단면도를 함께 올리면</b> 높이와 3차원 모델 정확도가 올라갑니다.</span><small class="future-format-note">캐드 도면(DWG·DXF)·건물 모델(IFC) 연결 구조 준비 · 현재 자동 분석 불가</small></div>
+
+          <ManualPdfReviewWorkspace />
 
           <div v-if="project.files.length" class="file-list" aria-live="polite">
             <div class="file-list-heading"><span>올린 파일 <b>{{ project.files.length }}개</b></span><button type="button" class="text-button" :aria-expanded="showFileList" aria-controls="uploaded-file-list" @click="showFileList = !showFileList">{{ showFileList ? '파일 목록 닫기' : '파일 목록 자세히 보기' }}</button><span class="analysis-pulse" :class="{ active: isAnalyzing }"><i /> {{ isAnalyzing ? '분석 진행 중' : '분석 상태 확인' }}</span></div>
