@@ -193,7 +193,12 @@ async function selectDrawing(id: string) {
   const drawing = drawings.value.find((item) => item.id === id)
   if (!drawing) return
   try {
-    pdfDocument?.destroy()
+    renderTask?.cancel()
+    renderTask = null
+    if (pdfDocument) {
+      await pdfDocument.destroy()
+      pdfDocument = null
+    }
     // PDF.js transfers its input buffer to the worker. Give it a copy so the
     // browser-owned PDF Blob remains intact for IndexedDB persistence.
     const sourceBytes = new Uint8Array(await drawing.blob.arrayBuffer())
