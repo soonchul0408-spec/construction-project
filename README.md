@@ -19,9 +19,7 @@ npm run dev
 npm run check
 ```
 
-`npm run check`는 TypeScript, ESLint/Oxlint, 도면·높이·3D·자재·절단·재고 회귀검사, API 서버 경계검사, 프로덕션 빌드를 순서대로 실행합니다. 개별 검사는 `npm run verify:all`, `npm run lint:check`, `npm run typecheck`로 나눠 실행할 수 있습니다.
-
-공개자료 API 프록시는 기본적으로 꺼져 있습니다. 필요한 경우 [.env.example](./.env.example)과 [서버 실행 안내](./server/README.md)를 참고해 `.env.local`을 만든 뒤, 별도 터미널에서 `npm run api`와 `npm run dev`를 실행합니다. API 서버는 별도 설정이 없으면 `127.0.0.1:8787`에만 바인딩됩니다.
+`npm run check`는 TypeScript, ESLint/Oxlint, 도면·높이·3D·자재·절단·재고 회귀검사와 프로덕션 빌드를 순서대로 실행합니다. 개별 검사는 `npm run verify:all`, `npm run lint:check`, `npm run typecheck`로 나눠 실행할 수 있습니다.
 
 이번 전수 점검의 수정 근거, 회귀검사, 남은 제한사항은 [2026-08-14 코드 감사 보고서](./AUDIT-2026-08-14.md)에 정리했습니다.
 
