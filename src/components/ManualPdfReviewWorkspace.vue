@@ -136,6 +136,25 @@ const hybridOpeningArea = computed(() => {
   return Number(draft.openings.filter((opening) => opening.status === '확인 완료').reduce((sum, opening) => sum + finite(opening.widthMm) * finite(opening.heightMm) / 1_000_000, 0).toFixed(2))
 })
 const hybridNetWallArea = computed(() => Math.max(0, Number((hybridWallArea.value - hybridOpeningArea.value).toFixed(2))))
+const projectSummary = computed(() => ({
+  drawingCount: drawings.value.length,
+  classifiedCount: drawings.value.filter((drawing) => drawing.kind !== 'other').length,
+  confirmedSpecCount: drawings.value.reduce((count, drawing) => count + drawing.specs.filter((spec) => spec.status === '확인 완료').length, 0),
+  pendingSpecCount: drawings.value.reduce((count, drawing) => count + drawing.specs.filter((spec) => spec.status === '검토 필요').length, 0),
+}))
+const preflightIssues = computed(() => {
+  const drawing = selectedDrawing.value
+  if (!drawing) return []
+  const issues: string[] = []
+  if (drawing.kind === 'other') issues.push('도면 유형을 확인하거나 수동 지정하세요.')
+  if (drawing.hybridModel?.status !== '확인 완료') issues.push('3D 가로·세로·벽체 높이가 아직 확인 완료되지 않았습니다.')
+  const pendingOpenings = drawing.hybridModel?.openings.filter((opening) => opening.status === '검토 필요').length || 0
+  if (pendingOpenings) issues.push(`문·창호 개구부 ${pendingOpenings}건이 검토 필요입니다.`)
+  const pendingSpecs = drawing.specs.filter((spec) => spec.status === '검토 필요').length
+  if (pendingSpecs) issues.push(`사양·산출 항목 ${pendingSpecs}건이 검토 필요입니다.`)
+  if (!drawing.specs.some((spec) => spec.status === '확인 완료')) issues.push('확인 완료된 산출 항목이 아직 없습니다.')
+  return issues
+})
 
 function finite(value: unknown) {
   const number = Number(value)
@@ -467,6 +486,29 @@ function formatSize(size: number) { return `${(size / 1024 / 1024).toFixed(1)} M
 function formatDate(value: string) { return new Intl.DateTimeFormat('ko-KR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)) }
 function formatWon(value: number) { return new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 }).format(value) }
 
+function csvCell(value: unknown) {
+  return `"${String(value ?? '').replaceAll('"', '""')}"`
+}
+
+function downloadReviewReport() {
+  const rows: unknown[][] = [['구분', '도면명', '도면 유형', '상태', '항목/이름', '규격/상세', '단위', '수량', '단가', '재고', '검토 메모']]
+  for (const drawing of drawings.value) {
+    rows.push(['도면', drawing.name, kindLabels[drawing.kind], drawing.status, '', '', '', '', '', '', 'PDF 원본은 보고서에 포함하지 않음'])
+    const model = drawing.hybridModel
+    if (model) rows.push(['3D 입력', drawing.name, kindLabels[drawing.kind], model.status, '가로×세로×벽체 높이', `${model.lengthMm}×${model.widthMm}×${model.wallHeightMm}mm`, '', '', '', '', model.note])
+    for (const opening of model?.openings || []) rows.push(['개구부', drawing.name, kindLabels[drawing.kind], opening.status, opening.label, `W-${opening.wallIndex + 1} · ${opening.type}`, '㎡', Number((finite(opening.widthMm) * finite(opening.heightMm) / 1_000_000).toFixed(2)), '', '', `${opening.widthMm}×${opening.heightMm}mm · 위치 ${opening.offsetMm}mm`])
+    for (const spec of drawing.specs) rows.push([spec.origin === 'geometry-draft' ? '3D 계산 초안' : '사양', drawing.name, kindLabels[drawing.kind], spec.status, spec.item, spec.specification, spec.unit, spec.quantity, spec.unitPrice, spec.inventory, spec.memo])
+  }
+  const csv = `\uFEFF${rows.map((row) => row.map(csvCell).join(',')).join('\n')}`
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `도면-검토-보고서-${new Date().toISOString().slice(0, 10)}.csv`
+  link.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  message.value = 'PDF 원본 없이 검토·산출 입력값만 CSV로 저장했습니다.'
+}
+
 watch([pageNumber, zoom], () => void nextTick(renderPage))
 watch(drawings, schedulePersist, { deep: true })
 onMounted(() => { void loadDrawings(); void loadLocalTestManifest() })
@@ -502,6 +544,7 @@ onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTi
         <div class="manual-spec-heading"><div><h3>사양 검토</h3><p>모든 항목은 수동 입력이며 기본 상태는 ‘검토 필요’입니다.</p></div><button type="button" class="outline-button" @click="addSpec">항목 추가</button></div>
         <div class="manual-spec-list"><article v-for="(spec, index) in selectedDrawing.specs" :key="spec.id" class="manual-spec"><div class="manual-spec-top"><b>{{ index + 1 }}번 {{ spec.origin === 'geometry-draft' ? '3D 계산 초안' : '수동 검토 항목' }}</b><button type="button" class="text-button danger-text" @click="removeSpec(spec.id)">삭제</button></div><div class="manual-spec-grid"><label>항목명<input v-model="spec.item" placeholder="예: 샌드위치패널"></label><label>규격<input v-model="spec.specification" placeholder="예: 75T"></label><label>단위<input v-model="spec.unit" placeholder="예: ㎡, 개, m"></label><label>수량<input v-model.number="spec.quantity" min="0" type="number"></label><label>단가(원)<input v-model.number="spec.unitPrice" min="0" type="number"></label><label>재고 수량<input v-model.number="spec.inventory" min="0" type="number"></label><label>신뢰도<select v-model="spec.confidence"><option>높음</option><option>중간</option><option>낮음</option></select></label><label>검토 상태<select v-model="spec.status"><option>검토 필요</option><option>확인 완료</option></select></label><label class="manual-wide">검토 메모<input v-model="spec.memo" placeholder="원본 페이지·치수 확인 내용"></label></div></article><p v-if="!selectedDrawing.specs.length" class="manual-empty">아직 사양 항목이 없습니다. ‘항목 추가’로 실제 도면의 값을 입력하세요.</p></div>
         <section class="manual-takeoff"><div class="manual-spec-heading"><div><h3>수동 자재 산출</h3><p>‘확인 완료’ 항목만 반영합니다. 단위가 다르면 별도 행으로 유지합니다.</p></div><strong>{{ formatWon(totalAmount) }}</strong></div><div v-if="takeoffRows.length" class="table-scroll"><table class="data-table"><thead><tr><th>항목</th><th>규격</th><th>단위</th><th>확인 수량</th><th>재고</th><th>부족</th><th>신규 발주</th><th>금액</th></tr></thead><tbody><tr v-for="row in takeoffRows" :key="`${row.item}-${row.specification}-${row.unit}`"><td>{{ row.item }}</td><td>{{ row.specification }}</td><td>{{ row.unit }}</td><td>{{ row.quantity }}</td><td>{{ row.inventory }}</td><td>{{ row.shortage }}</td><td>{{ row.order }}</td><td>{{ formatWon(row.amount) }}</td></tr></tbody></table></div><p v-else class="manual-empty">확인 완료된 사양 항목만 산출표에 표시됩니다.</p></section>
+        <section class="preflight-card"><div class="manual-spec-heading"><div><span class="panel-kicker">발주 전 확인</span><h3>검토 상태와 보고서</h3><p>PDF 원본은 포함하지 않고 이 브라우저의 입력·검토 결과만 내보냅니다.</p></div><button type="button" class="outline-button" @click="downloadReviewReport">검토 보고서 CSV 저장</button></div><div class="preflight-summary"><span>도면 {{ projectSummary.drawingCount }}장</span><span>유형 확인 {{ projectSummary.classifiedCount }}장</span><span>확인 완료 항목 {{ projectSummary.confirmedSpecCount }}건</span><span>검토 필요 항목 {{ projectSummary.pendingSpecCount }}건</span></div><ul v-if="preflightIssues.length" class="preflight-issues"><li v-for="issue in preflightIssues" :key="issue">{{ issue }}</li></ul><p v-else class="preflight-ready">현재 선택 도면은 이 화면에서 관리하는 확인 항목을 모두 통과했습니다. 실제 발주 전에는 원본 도면·현장 조건·단가를 별도로 확인하세요.</p></section>
       </div>
     </div>
   </section>
@@ -509,4 +552,5 @@ onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTi
 
 <style scoped>
 .manual-workspace { margin-top: 22px; }.manual-safe-badge { color: #176341; font-weight: 800; }.manual-upload-row,.manual-toolbar,.manual-spec-heading,.manual-spec-top,.hybrid-confirmed,.hybrid-opening-heading { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.local-test-manifest { margin:14px 0; padding:14px; border:1px solid #c9ddd0; border-radius:10px; background:#f4faf6; }.local-test-manifest h3 { margin:3px 0; }.local-test-manifest p { margin:4px 0 10px; color:#587063; font-size:13px; }.local-test-manifest ol { margin:0; padding-left:22px; display:grid; gap:5px; }.local-test-manifest li { display:flex; justify-content:space-between; gap:12px; font-size:12px; }.local-test-manifest li span { white-space:nowrap; color:#61776a; }.manual-message { color:#28634c; }.manual-empty { padding:22px; border:1px dashed #b8c8bf; border-radius:10px; color:#61736a; }.manual-layout { display:grid; grid-template-columns:250px minmax(0,1fr); gap:16px; }.manual-list { display:grid; align-content:start; gap:8px; max-height:620px; overflow:auto; }.manual-list article { border:1px solid #d7e1db; border-radius:10px; padding:8px; }.manual-list article.selected { border-color:#398367; background:#f0f8f3; }.manual-list article > button:first-child { display:grid; gap:4px; width:100%; border:0; background:transparent; text-align:left; cursor:pointer; }.manual-list small,.manual-list span { color:#687b72; font-size:12px; }.manual-delete { margin-top:6px; border:0; background:transparent; color:#a73535; cursor:pointer; }.manual-content { min-width:0; }.manual-toolbar { padding:10px; background:#f6f8f6; border-radius:8px; }.manual-toolbar button { border:1px solid #c7d4cc; border-radius:6px; background:white; padding:5px 8px; }.pdf-canvas-wrap { margin-top:12px; min-height:260px; overflow:auto; background:#edf1ee; padding:14px; text-align:center; }.pdf-canvas-wrap canvas { max-width:none; background:white; box-shadow:0 2px 10px #2c41331f; }.manual-spec-heading { justify-content:space-between; margin-top:22px; }.manual-spec-heading h3 { margin:0; }.manual-spec-heading p { margin:4px 0 0; color:#64766c; }.hybrid-model-card { margin-top:22px; padding:16px; border:1px solid #bed8cc; border-radius:12px; background:#f7fbf8; }.hybrid-model-card .manual-spec-heading { margin-top:0; }.hybrid-privacy,.hybrid-source,.hybrid-blocked { margin:10px 0 0; font-size:13px; color:#526f60; }.hybrid-candidates { margin-top:12px; padding:10px; border-radius:8px; background:#edf6ef; color:#315944; font-size:13px; }.hybrid-candidates ul { margin:8px 0 0; padding-left:18px; }.hybrid-candidates li { display:flex; justify-content:space-between; gap:12px; }.hybrid-opening-heading { justify-content:space-between; margin-top:16px; }.hybrid-opening-heading p { margin:3px 0 0; font-size:12px; color:#526f60; }.hybrid-opening-row { display:grid; grid-template-columns:20px repeat(8,minmax(82px,1fr)) auto; gap:8px; align-items:end; margin-top:8px; padding:10px; border:1px solid #d7e5dc; border-radius:8px; background:#fff; }.hybrid-opening-row label { display:grid; gap:3px; font-size:11px; font-weight:700; color:#52645a; }.hybrid-opening-row input,.hybrid-opening-row select { min-width:0; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.hybrid-confirmed { justify-content:space-between; margin-top:14px; padding:10px; border-radius:8px; background:#e0f2e7; color:#185d3c; }.hybrid-blocked { padding:14px; border:1px dashed #b8c8bf; border-radius:8px; }.hybrid-viewer { margin-top:14px; min-height:380px; border-radius:10px; overflow:hidden; background:#eef4ef; }.hybrid-inputs { margin-top:14px; }.manual-spec { border-top:1px solid #dfe7e1; padding:14px 0; }.manual-spec-top { justify-content:space-between; }.manual-spec-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }.manual-spec-grid label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.manual-spec-grid input,.manual-spec-grid select,.manual-toolbar select { width:100%; box-sizing:border-box; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.manual-wide { grid-column:span 2; }.manual-takeoff { margin-top:20px; padding-top:4px; }.manual-takeoff strong { color:#176341; } @media (max-width: 850px) { .manual-layout { grid-template-columns:1fr; }.manual-list { max-height:220px; }.manual-spec-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.hybrid-opening-row { grid-template-columns:20px repeat(2,minmax(0,1fr)); }.manual-wide { grid-column:span 2; } } @media (max-width: 500px) { .local-test-manifest li,.hybrid-candidates li { display:grid; }.manual-spec-grid { grid-template-columns:1fr; }.hybrid-opening-row { grid-template-columns:1fr; }.manual-wide { grid-column:auto; } }
+.preflight-card { margin-top:22px; padding:16px; border:1px solid #d6e2d9; border-radius:12px; background:#fafcfb; }.preflight-card .manual-spec-heading { margin-top:0; }.preflight-summary { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }.preflight-summary span { padding:6px 9px; border-radius:999px; background:#edf4ef; color:#3c604a; font-size:12px; font-weight:700; }.preflight-issues { margin:12px 0 0; padding:12px 12px 12px 30px; border-radius:8px; background:#fff8e8; color:#795b1e; font-size:13px; }.preflight-issues li + li { margin-top:5px; }.preflight-ready { margin:12px 0 0; padding:12px; border-radius:8px; background:#e6f5ea; color:#24613e; font-size:13px; }
 </style>
