@@ -203,6 +203,13 @@ const selectedZoneId = ref('')
 const zoneDrawingEnabled = ref(false)
 const reviewFilter = ref<'all' | 'unreviewed' | 'excluded' | 'height-missing'>('all')
 const versionCopySourceId = ref('')
+const undoStack = ref<string[]>([])
+const redoStack = ref<string[]>([])
+function snapshotWork() { return selectedDrawing.value ? JSON.stringify({ marks: selectedDrawing.value.marks, measurements: selectedDrawing.value.measurements, reviewZones: selectedDrawing.value.reviewZones }) : '' }
+function recordUndo() { const snapshot = snapshotWork(); if (snapshot) { undoStack.value = [...undoStack.value.slice(-29), snapshot]; redoStack.value = [] } }
+function restoreWork(snapshot: string) { if (!selectedDrawing.value) return; const value = JSON.parse(snapshot) as { marks?: DrawingMark[]; measurements?: DrawingMeasurement[]; reviewZones?: ReviewZone[] }; selectedDrawing.value.marks = value.marks || []; selectedDrawing.value.measurements = value.measurements || []; selectedDrawing.value.reviewZones = value.reviewZones || []; schedulePersist(); void nextTick(renderPage) }
+function undoWork() { const current = snapshotWork(); const previous = undoStack.value.at(-1); if (!previous) return; undoStack.value = undoStack.value.slice(0, -1); redoStack.value = [...redoStack.value, current]; restoreWork(previous) }
+function redoWork() { const current = snapshotWork(); const next = redoStack.value.at(-1); if (!next) return; redoStack.value = redoStack.value.slice(0, -1); undoStack.value = [...undoStack.value, current]; restoreWork(next) }
 const activePreset = computed(() => presets.value.find((preset) => preset.id === activePresetId.value) || null)
 const catalog = computed(() => selectedDrawing.value?.panelCatalog || [])
 const stock = computed(() => selectedDrawing.value?.panelStock || [])
@@ -630,6 +637,7 @@ function pointerMove(event: PointerEvent) {
   draftRect.value = { x: Math.min(dragStart.value.x, point.x), y: Math.min(dragStart.value.y, point.y), width: Math.abs(point.x - dragStart.value.x), height: Math.abs(point.y - dragStart.value.y) }
 }
 function pointerUp() {
+  recordUndo()
   const rectangle = draftRect.value
   if (!rectangle || rectangle.width < .01 || rectangle.height < .01 || !selectedDrawing.value) { dragStart.value = null; draftRect.value = null; return }
   if (zoneDrawingEnabled.value) {
@@ -674,6 +682,7 @@ function addMeasurementPoint(point: MeasurementPoint) {
   measurementDraft.value = [...measurementDraft.value, point]
 }
 function finishMeasurement() {
+  recordUndo()
   const kind = measurementMode.value
   if (!selectedDrawing.value || kind === 'none' || kind === 'scale') return
   const minPoints = kind === 'wall' ? 2 : 3
@@ -907,7 +916,7 @@ function activateDrawingVersion(copyMarks: boolean) { const drawing = selectedDr
 
 watch([pageNumber, zoom], () => void nextTick(renderPage))
 watch(drawings, schedulePersist, { deep: true })
-const stopContinuousMarking = (event: KeyboardEvent) => { if (event.key === 'Escape') { measurementMode.value = 'none'; measurementDraft.value = []; activePresetId.value = '' } }
+const stopContinuousMarking = (event: KeyboardEvent) => { if (event.metaKey && event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) redoWork(); else undoWork(); return } if (event.key === 'Escape') { measurementMode.value = 'none'; measurementDraft.value = []; activePresetId.value = ''; selectedMarkId.value = ''; selectedMeasurementId.value = ''; selectedZoneId.value = '' } }
 onMounted(() => { updateCompactMode(); window.addEventListener('resize', updateCompactMode); window.addEventListener('keydown', stopContinuousMarking); void loadDrawings(); void loadLocalTestManifest(); void loadPresets(); void loadOpeningPresets() })
 onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode); window.removeEventListener('keydown', stopContinuousMarking); pdfDocument?.destroy(); renderTask?.cancel(); if (saveTimer) clearTimeout(saveTimer); blobUrls.forEach((url) => URL.revokeObjectURL(url)) })
 </script>
