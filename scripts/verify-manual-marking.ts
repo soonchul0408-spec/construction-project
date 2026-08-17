@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset, validatedOpeningAreaM2 } from '../src/modules/manual-marking-calculator.ts'
 import { planWallMaterial } from '../src/modules/wall-material-layout.ts'
+import { activateVersion } from '../src/modules/drawing-versioning.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -46,4 +47,7 @@ const horizontal = planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28
 assert.equal(horizontal.panelCount, 3, '가로 시공은 벽체 높이와 유효폭으로 3단을 계산합니다.')
 assert.equal(horizontal.requiredLengthMm, 10050, '가로 시공 필요 길이는 벽체 길이와 절단 여유를 합산합니다.')
 assert.equal(planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28, reviewed: false }, []).ready, false, '미검토 벽체는 발주표에서 제외합니다.')
+const versions = activateVersion([{ id: 'v1', group: '평면도', version: 1, current: true, printedAt: '2026-08-17', marks: [{ status: '확인 완료' as const, memo: '' }] }, { id: 'v2', group: '평면도', version: 2, current: false, marks: [] }], 'v2', 'v1')
+assert.equal(versions.drawings[1].marks[0].status, '검토 필요', '이전 버전 마킹 복사본은 재검토 필요입니다.')
+assert.equal(versions.reprintRecommended, true, '이전 도면 출력 후 버전 전환은 재출력 경고를 만듭니다.')
 console.log('Manual marking calculation verification passed.')
