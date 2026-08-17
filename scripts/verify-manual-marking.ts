@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { calculateManualMarking } from '../src/modules/manual-marking-calculator.ts'
+import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm } from '../src/modules/manual-marking-calculator.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -7,4 +7,14 @@ assert.equal(sample.netAreaM2, 28, '개구부 2㎡를 차감한 순면적은 28�
 assert.equal(sample.panelCount, 10, '3m × 유효폭 1m 판넬은 예상 10장입니다.')
 const pending = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '검토 필요' })
 assert.equal(pending.ready, false, '검토 필요 마킹은 산출에서 제외합니다.')
+const scale = createPageScale({ x: 0, y: 0 }, { x: .6, y: 0 }, 6000)
+assert.ok(scale, '0이 아닌 기준 치수는 축척으로 보정합니다.')
+assert.equal(measuredLengthMm([{ x: 0, y: 0 }, { x: 1, y: 0 }], scale ?? undefined), 10000, '6m 기준선으로 10m 벽체 길이를 환산합니다.')
+const scaledTakeoff = calculateManualMarking({ lengthM: (measuredLengthMm([{ x: 0, y: 0 }, { x: 1, y: 0 }], scale ?? undefined) || 0) / 1000, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
+assert.equal(scaledTakeoff.netAreaM2, 28, '축척 환산 10m 벽체와 3m 높이·2㎡ 개구부는 순면적 28㎡입니다.')
+assert.equal(measuredAreaM2([{ x: 0, y: 0 }, { x: .6, y: 0 }, { x: .6, y: .5 }, { x: 0, y: .5 }], scale ?? undefined), 30, '축척 보정 면적을 ㎡로 계산합니다.')
+assert.equal(createPageScale({ x: 0, y: 0 }, { x: 0, y: 0 }, 6000), null, '길이 0 기준선은 거부합니다.')
+assert.equal(createPageScale({ x: 0, y: 0 }, { x: .6, y: 0 }, -1), null, '음수 기준 치수는 거부합니다.')
+const invalidOpening = calculateManualMarking({ lengthM: 1, heightMm: 1000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
+assert.equal(invalidOpening.ready, false, '벽체보다 큰 개구부는 산출에서 제외합니다.')
 console.log('Manual marking calculation verification passed.')

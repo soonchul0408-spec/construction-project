@@ -3,7 +3,7 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, r
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import pdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import type { BuildingGeometry, Evidence, Opening } from '../types/domain'
-import { calculateManualMarking } from '../modules/manual-marking-calculator'
+import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, type MeasurementPoint, type PageScale } from '../modules/manual-marking-calculator'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 const Building3DViewer = defineAsyncComponent(() => import('./Building3DViewer.vue'))
@@ -36,6 +36,8 @@ interface ManualDrawing {
   specs: ManualSpec[]
   hybridModel?: HybridModelDraft
   marks?: DrawingMark[]
+  pageScales?: Record<number, PageScale>
+  measurements?: DrawingMeasurement[]
 }
 
 interface DrawingMark {
@@ -55,6 +57,23 @@ interface DrawingMark {
   openingAreaM2: number
   inventoryPanels: number
   status: ReviewStatus
+  memo: string
+}
+
+type MeasurementKind = 'wall' | 'area' | 'opening'
+interface DrawingMeasurement {
+  id: string
+  pageNumber: number
+  kind: MeasurementKind
+  points: MeasurementPoint[]
+  name: string
+  manualLengthM: number
+  heightMm: number
+  material: string
+  effectiveWidthMm: number
+  inventoryPanels: number
+  status: ReviewStatus
+  openingIds: string[]
   memo: string
 }
 
@@ -110,6 +129,10 @@ const repositioningMarkId = ref('')
 const dragStart = ref<{ x: number; y: number } | null>(null)
 const draftRect = ref<{ x: number; y: number; width: number; height: number } | null>(null)
 const isCompact = ref(false)
+const measurementMode = ref<'none' | 'scale' | MeasurementKind>('none')
+const measurementDraft = ref<MeasurementPoint[]>([])
+const scaleReferenceMm = ref(6000)
+const selectedMeasurementId = ref('')
 const updateCompactMode = () => { isCompact.value = window.matchMedia('(max-width: 700px), (pointer: coarse)').matches }
 let pdfDocument: Awaited<ReturnType<typeof pdfjsLib.getDocument>> | null = null
 let renderTask: { cancel: () => void } | null = null
@@ -137,6 +160,12 @@ const defaultHybridModel = (): HybridModelDraft => ({
 const selectedDrawing = computed(() => drawings.value.find((drawing) => drawing.id === selectedId.value) || null)
 const selectedMark = computed(() => selectedDrawing.value?.marks?.find((mark) => mark.id === selectedMarkId.value) || null)
 const pageMarks = computed(() => selectedDrawing.value?.marks?.filter((mark) => mark.pageNumber === pageNumber.value) || [])
+const pageScale = computed(() => selectedDrawing.value?.pageScales?.[pageNumber.value])
+const pageMeasurements = computed(() => selectedDrawing.value?.measurements?.filter((measurement) => measurement.pageNumber === pageNumber.value) || [])
+const selectedMeasurement = computed(() => selectedDrawing.value?.measurements?.find((measurement) => measurement.id === selectedMeasurementId.value) || null)
+const measurementLengthM = (measurement: DrawingMeasurement) => measurement.manualLengthM > 0 ? measurement.manualLengthM : (measuredLengthMm(measurement.points, selectedDrawing.value?.pageScales?.[measurement.pageNumber]) || 0) / 1000
+const measurementArea = (measurement: DrawingMeasurement) => measuredAreaM2(measurement.points, selectedDrawing.value?.pageScales?.[measurement.pageNumber]) || 0
+const linkedOpeningArea = (measurement: DrawingMeasurement) => (selectedDrawing.value?.measurements || []).filter((item) => measurement.openingIds.includes(item.id)).reduce((sum, item) => sum + measurementArea(item), 0)
 const reviewedSpecs = computed(() => selectedDrawing.value?.specs.filter((spec) => spec.status === '확인 완료') || [])
 const takeoffRows = computed(() => {
   const groups = new Map<string, { item: string; specification: string; unit: string; quantity: number; inventory: number; unitPrice: number }>()
@@ -168,7 +197,15 @@ const hybridOpeningArea = computed(() => {
   return Number(draft.openings.filter((opening) => opening.status === '확인 완료').reduce((sum, opening) => sum + finite(opening.widthMm) * finite(opening.heightMm) / 1_000_000, 0).toFixed(2))
 })
 const hybridNetWallArea = computed(() => Math.max(0, Number((hybridWallArea.value - hybridOpeningArea.value).toFixed(2))))
-const markingRows = computed(() => drawings.value.flatMap((drawing) => (drawing.marks || []).map((mark) => ({ drawing, mark, calculation: calculateManualMarking(mark) }))))
+const markingRows = computed(() => drawings.value.flatMap((drawing) => [
+  ...(drawing.marks || []).map((mark) => ({ drawing, mark, calculation: calculateManualMarking(mark) })),
+  ...(drawing.measurements || []).filter((measurement) => measurement.kind === 'wall').map((measurement) => {
+    const lengthM = measurement.manualLengthM > 0 ? measurement.manualLengthM : (measuredLengthMm(measurement.points, drawing.pageScales?.[measurement.pageNumber]) || 0) / 1000
+    const openingAreaM2 = (drawing.measurements || []).filter((item) => measurement.openingIds.includes(item.id)).reduce((sum, item) => sum + (measuredAreaM2(item.points, drawing.pageScales?.[item.pageNumber]) || 0), 0)
+    const mark = { ...measurement, color: markColor(measurement.material, measurement.heightMm), lengthM, openingAreaM2 }
+    return { drawing, mark, calculation: calculateManualMarking(mark) }
+  }),
+]))
 const markingSummary = computed(() => {
   const groups = new Map<string, { color: string; material: string; heightMm: number; lengthM: number; gross: number; net: number; panels: number; inventory: number; excluded: number }>()
   for (const row of markingRows.value) {
@@ -235,6 +272,8 @@ async function loadDrawings() {
       ...drawing,
       hybridModel: drawing.hybridModel ? { ...defaultHybridModel(), ...drawing.hybridModel, candidates: drawing.hybridModel.candidates || [], openings: drawing.hybridModel.openings || [] } : defaultHybridModel(),
       marks: drawing.marks || [],
+      pageScales: drawing.pageScales || {},
+      measurements: drawing.measurements || [],
     })).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt))
     if (drawings.value[0]) await selectDrawing(drawings.value[0].id)
   } catch {
@@ -274,6 +313,8 @@ async function persist() {
       blob: drawing.blob,
       specs: drawing.specs.map((spec) => ({ ...spec })),
       marks: (drawing.marks || []).map((mark) => ({ ...mark })),
+      pageScales: drawing.pageScales ? { ...drawing.pageScales } : {},
+      measurements: (drawing.measurements || []).map((measurement) => ({ ...measurement, points: measurement.points.map((point) => ({ ...point })), openingIds: [...measurement.openingIds] })),
       hybridModel: drawing.hybridModel ? { ...drawing.hybridModel, sourceNames: [...drawing.hybridModel.sourceNames], candidates: drawing.hybridModel.candidates.map((candidate) => ({ ...candidate })), openings: drawing.hybridModel.openings.map((opening) => ({ ...opening })) } : undefined,
     } satisfies ManualDrawing))
     await new Promise<void>((resolve, reject) => {
@@ -303,7 +344,7 @@ async function chooseFiles(files: File[]) {
       message.value = `${file.name}: 파일당 50MB 이하만 추가할 수 있습니다.`
       continue
     }
-    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [] })
+    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [], pageScales: {}, measurements: [] })
   }
   if (!accepted.length) return
   drawings.value = [...accepted, ...drawings.value]
@@ -357,7 +398,25 @@ async function renderPage() {
   canvas.value.width = Math.ceil(viewport.width)
   canvas.value.height = Math.ceil(viewport.height)
   renderTask = page.render({ canvasContext: context, viewport })
-  try { await renderTask.promise } catch (error) { if (!(error instanceof Error) || error.name !== 'RenderingCancelledException') throw error }
+  try { await renderTask.promise; drawMeasurementOverlay(context) } catch (error) { if (!(error instanceof Error) || error.name !== 'RenderingCancelledException') throw error }
+}
+
+function drawMeasurementOverlay(context: CanvasRenderingContext2D) {
+  const drawing = selectedDrawing.value
+  const element = canvas.value
+  if (!drawing || !element) return
+  const point = (value: MeasurementPoint) => [value.x * element.width, value.y * element.height] as const
+  const path = (points: MeasurementPoint[], color: string, closed: boolean) => {
+    if (!points.length) return
+    context.beginPath(); const [firstX, firstY] = point(points[0]); context.moveTo(firstX, firstY)
+    points.slice(1).forEach((value) => { const [x, y] = point(value); context.lineTo(x, y) })
+    if (closed) context.closePath()
+    context.strokeStyle = color; context.lineWidth = 4; context.setLineDash([]); context.stroke()
+    if (closed) { context.fillStyle = `${color}33`; context.fill() }
+  }
+  const scale = drawing.pageScales?.[pageNumber.value]
+  if (scale) { context.setLineDash([10, 6]); context.strokeStyle = '#ec4899'; context.lineWidth = 4; const [x1, y1] = point(scale.start); const [x2, y2] = point(scale.end); context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke(); context.setLineDash([]); context.fillStyle = '#be185d'; context.font = 'bold 16px sans-serif'; context.fillText(`${scale.referenceMm}mm`, x1 + 8, y1 - 8) }
+  ;(drawing.measurements || []).filter((measurement) => measurement.pageNumber === pageNumber.value).forEach((measurement) => path(measurement.points, measurementColor(measurement.kind), measurement.kind !== 'wall'))
 }
 
 const markColors = ['#f59e0b', '#22c55e', '#3b82f6', '#a855f7', '#ef4444', '#14b8a6']
@@ -371,6 +430,7 @@ function markColor(material: string, heightMm: number) {
   return markColors[Math.abs(hash) % markColors.length] || markColors[0]
 }
 function pointerDown(event: PointerEvent) {
+  if (measurementMode.value !== 'none') { addMeasurementPoint(markPoint(event)); return }
   if (!markingEnabled.value || isCompact.value || !selectedDrawing.value) return
   const point = markPoint(event)
   dragStart.value = point
@@ -402,6 +462,45 @@ function removeMark(id: string) { if (selectedDrawing.value) selectedDrawing.val
 function syncMarkColor(mark: DrawingMark) { if (mark.colorMode === 'auto') mark.color = markColor(mark.material, mark.heightMm); schedulePersist() }
 function setMarkHeight(value: number) { if (selectedMark.value) { selectedMark.value.heightMm = value; syncMarkColor(selectedMark.value) } }
 function setMarkMaterial(value: string) { if (selectedMark.value) { selectedMark.value.material = value; syncMarkColor(selectedMark.value) } }
+
+function startMeasurement(mode: 'scale' | MeasurementKind) {
+  if (isCompact.value) return
+  measurementMode.value = mode
+  measurementDraft.value = []
+  markingEnabled.value = false
+  message.value = mode === 'scale' ? '도면의 기준 치수 시작점과 끝점을 차례로 클릭하세요.' : '도면 위를 클릭해 점을 추가한 뒤 ‘측정 완료’를 누르세요.'
+}
+function addMeasurementPoint(point: MeasurementPoint) {
+  if (!selectedDrawing.value || isCompact.value) return
+  if (measurementMode.value === 'scale') {
+    const points = [...measurementDraft.value, point]
+    if (points.length < 2) { measurementDraft.value = points; return }
+    const scale = createPageScale(points[0], points[1], scaleReferenceMm.value)
+    if (!scale) { message.value = '기준선과 실제 길이는 0보다 커야 합니다.'; measurementDraft.value = []; return }
+    selectedDrawing.value.pageScales ||= {}
+    selectedDrawing.value.pageScales[pageNumber.value] = scale
+    measurementDraft.value = []; measurementMode.value = 'none'; message.value = `${scale.referenceMm.toLocaleString()}mm 기준선으로 이 페이지 축척을 보정했습니다.`; schedulePersist(); void nextTick(renderPage); return
+  }
+  measurementDraft.value = [...measurementDraft.value, point]
+}
+function finishMeasurement() {
+  const kind = measurementMode.value
+  if (!selectedDrawing.value || kind === 'none' || kind === 'scale') return
+  const minPoints = kind === 'wall' ? 2 : 3
+  if (measurementDraft.value.length < minPoints) { message.value = kind === 'wall' ? '벽체 길이선은 2점 이상 필요합니다.' : '면적 구역은 3점 이상 필요합니다.'; return }
+  const measurement: DrawingMeasurement = { id: crypto.randomUUID(), pageNumber: pageNumber.value, kind, points: measurementDraft.value, name: `${kind === 'wall' ? '벽체' : kind === 'opening' ? '개구부' : '면적'} ${pageMeasurements.value.length + 1}`, manualLengthM: 0, heightMm: 0, material: '', effectiveWidthMm: 1000, inventoryPanels: 0, status: '검토 필요', openingIds: [], memo: '' }
+  selectedDrawing.value.measurements ||= []; selectedDrawing.value.measurements.push(measurement)
+  selectedMeasurementId.value = measurement.id; measurementDraft.value = []; measurementMode.value = 'none'; schedulePersist(); void nextTick(renderPage)
+}
+function removeMeasurement(id: string) {
+  if (!selectedDrawing.value) return
+  selectedDrawing.value.measurements = (selectedDrawing.value.measurements || []).filter((measurement) => measurement.id !== id)
+  selectedDrawing.value.measurements.forEach((measurement) => { measurement.openingIds = measurement.openingIds.filter((openingId) => openingId !== id) })
+  if (selectedMeasurementId.value === id) selectedMeasurementId.value = ''
+  schedulePersist(); void nextTick(renderPage)
+}
+function measurementLabel(measurement: DrawingMeasurement) { return measurement.kind === 'wall' ? '벽체 길이선' : measurement.kind === 'opening' ? '개구부' : '면적 구역' }
+function measurementColor(kind: MeasurementKind) { return kind === 'wall' ? '#0f766e' : kind === 'opening' ? '#dc2626' : '#2563eb' }
 
 function addSpec() {
   if (!selectedDrawing.value) return
@@ -622,7 +721,9 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
       <aside class="manual-list" aria-label="업로드한 PDF 목록"><article v-for="drawing in drawings" :key="drawing.id" :class="{ selected: selectedId === drawing.id }"><button type="button" @click="selectDrawing(drawing.id)"><b>{{ drawing.name }}</b><small>{{ formatSize(drawing.size) }} · {{ formatDate(drawing.uploadedAt) }}</small><span>{{ drawing.status }} · {{ kindLabels[drawing.kind] }}</span></button><button type="button" class="manual-delete" :aria-label="`${drawing.name} 삭제`" @click="deleteDrawing(drawing.id)">삭제</button></article></aside>
       <div v-if="selectedDrawing" class="manual-content">
         <div class="manual-toolbar"><label>도면 유형<select v-model="selectedDrawing.kind"><option v-for="(label, key) in kindLabels" :key="key" :value="key">{{ label }}</option></select></label><span>{{ pageCount ? `${pageNumber} / ${pageCount} 페이지` : '미리보기 준비 중' }}</span><button type="button" :disabled="pageNumber <= 1" @click="pageNumber--">이전</button><button type="button" :disabled="pageNumber >= pageCount" @click="pageNumber++">다음</button><button type="button" :disabled="zoom <= .5" @click="zoom = Math.max(.5, zoom - .25)">−</button><span>{{ Math.round(zoom * 100) }}%</span><button type="button" :disabled="zoom >= 2" @click="zoom = Math.min(2, zoom + .25)">＋</button></div>
+        <section class="scale-card"><div class="manual-spec-heading"><div><span class="panel-kicker">도면 측정</span><h3>페이지별 축척 보정</h3><p>{{ pageScale ? `보정 완료 · 기준선 ${pageScale.referenceMm.toLocaleString()}mm` : '축척 설정 필요 · 기준 치수 2개 이상으로 확인을 권장합니다.' }}</p></div><div class="scale-actions"><label>기준 실제 길이(mm)<input v-model.number="scaleReferenceMm" min="1" type="number"></label><button type="button" class="outline-button" :disabled="isCompact" @click="startMeasurement('scale')">축척 설정</button></div></div><p v-if="isCompact" class="hybrid-blocked">모바일에서는 축척·측정점을 새로 만들지 않고, 기존 측정값의 조회·수정을 지원합니다.</p><div v-else class="quick-buttons"><button type="button" :class="{ active: measurementMode === 'wall' }" @click="startMeasurement('wall')">벽체 길이선</button><button type="button" :class="{ active: measurementMode === 'area' }" @click="startMeasurement('area')">면적 구역</button><button type="button" :class="{ active: measurementMode === 'opening' }" @click="startMeasurement('opening')">개구부</button><button v-if="measurementMode !== 'none' && measurementMode !== 'scale'" type="button" class="primary-button" @click="finishMeasurement">측정 완료</button><button v-if="measurementMode !== 'none'" type="button" @click="measurementMode = 'none'; measurementDraft = []">취소</button></div></section>
         <section class="marking-card"><div class="manual-spec-heading"><div><span class="panel-kicker">디지털 형광펜</span><h3>도면 구역 마킹</h3><p>사각형으로 표시한 위치는 구역 식별용입니다. 실제 산출은 아래 입력값만 사용합니다.</p></div><button type="button" class="outline-button" :disabled="isCompact" @click="markingEnabled = !markingEnabled">{{ markingEnabled ? '마킹 종료' : '사각형 마킹 시작' }}</button></div><p v-if="isCompact" class="hybrid-blocked">모바일에서는 마킹 위치를 새로 그리지 않고, 기존 마킹의 조회·수정·삭제를 지원합니다.</p><div ref="pdfStage" class="pdf-canvas-wrap pdf-stage" :class="{ marking: markingEnabled }"><canvas ref="canvas" aria-label="선택한 PDF 페이지 미리보기" /><svg v-if="canvas" class="mark-overlay" :viewBox="`0 0 ${canvas.width} ${canvas.height}`" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp"><g v-for="(mark, index) in pageMarks" :key="mark.id" @pointerdown.stop="selectMark(mark.id)"><rect :x="mark.x * canvas.width" :y="mark.y * canvas.height" :width="mark.width * canvas.width" :height="mark.height * canvas.height" :fill="mark.color" fill-opacity=".28" :stroke="mark.color" stroke-width="4" /><text :x="mark.x * canvas.width + 10" :y="mark.y * canvas.height + 28" class="mark-number">{{ index + 1 }}</text></g><rect v-if="draftRect" :x="draftRect.x * canvas.width" :y="draftRect.y * canvas.height" :width="draftRect.width * canvas.width" :height="draftRect.height * canvas.height" fill="#f59e0b" fill-opacity=".2" stroke="#d97706" stroke-width="4" /></svg></div><div v-if="selectedMark" class="mark-editor"><div class="manual-spec-heading"><b>선택 마킹 {{ pageMarks.findIndex((mark) => mark.id === selectedMark?.id) + 1 }}</b><span class="mark-chip" :style="{ background: selectedMark.color }">{{ selectedMark.zoneName || '구역명 미입력' }}</span><button type="button" class="text-button" :disabled="isCompact" @click="repositioningMarkId = selectedMark.id; markingEnabled = true">위치 다시 표시</button><button type="button" class="text-button danger-text" @click="removeMark(selectedMark.id)">삭제</button></div><div class="manual-spec-grid"><label>구역 이름<input v-model="selectedMark.zoneName" @change="schedulePersist"></label><label>벽체 길이(m)<input v-model.number="selectedMark.lengthM" min="0" step=".01" type="number" @change="schedulePersist"></label><label>높이(mm)<input v-model.number="selectedMark.heightMm" min="0" type="number" @change="syncMarkColor(selectedMark)"></label><label>자재 종류<input v-model="selectedMark.material" placeholder="예: 샌드위치패널" @change="syncMarkColor(selectedMark)"></label><label>판넬 유효 폭(mm)<input v-model.number="selectedMark.effectiveWidthMm" min="0" type="number" @change="schedulePersist"></label><label>개구부 제외 면적(㎡)<input v-model.number="selectedMark.openingAreaM2" min="0" step=".01" type="number" @change="schedulePersist"></label><label>재고/자투리 사용 가능(장)<input v-model.number="selectedMark.inventoryPanels" min="0" type="number" @change="schedulePersist"></label><label>검토 상태<select v-model="selectedMark.status" @change="schedulePersist"><option>검토 필요</option><option>확인 완료</option></select></label><label>색상<input v-model="selectedMark.color" type="color" @input="selectedMark.colorMode = 'manual'; schedulePersist()"></label><label class="manual-wide">검토 메모<input v-model="selectedMark.memo" @change="schedulePersist"></label></div><div class="quick-buttons"><span>빠른 선택</span><button v-for="height in [2400, 2700, 3000, 4200]" :key="height" type="button" @click="setMarkHeight(height)">{{ height.toLocaleString() }}mm</button><button v-for="material in ['샌드위치패널', '석고보드', '단열재']" :key="material" type="button" @click="setMarkMaterial(material)">{{ material }}</button></div><p class="mark-calculation">{{ calculateManualMarking(selectedMark).ready ? `계산: ${calculateManualMarking(selectedMark).grossAreaM2}㎡ − ${selectedMark.openingAreaM2 || 0}㎡ = ${calculateManualMarking(selectedMark).netAreaM2}㎡ · 예상 ${calculateManualMarking(selectedMark).panelCount}장` : `산출 제외: ${calculateManualMarking(selectedMark).reason}` }}</p></div></section>
+        <section class="measurement-list"><div class="manual-spec-heading"><div><span class="panel-kicker">축척 환산 측정값</span><h3>벽체·면적·개구부</h3><p>{{ pageScale ? '도면 축척 환산값입니다. 수동값으로 덮어쓸 수 있습니다.' : '축척 설정 필요: 측정값은 산출에 반영되지 않습니다.' }}</p></div></div><div v-for="measurement in pageMeasurements" :key="measurement.id" class="measurement-row"><button type="button" @click="selectedMeasurementId = measurement.id">{{ measurementLabel(measurement) }} · {{ measurement.name }}</button><span>{{ measurement.kind === 'wall' ? `${measurementLengthM(measurement).toFixed(2)}m` : `${measurementArea(measurement).toFixed(2)}㎡` }}</span><button type="button" class="text-button danger-text" @click="removeMeasurement(measurement.id)">삭제</button></div><div v-if="selectedMeasurement" class="mark-editor"><div class="manual-spec-heading"><b>{{ measurementLabel(selectedMeasurement) }} 편집</b><button type="button" class="text-button danger-text" @click="removeMeasurement(selectedMeasurement.id)">삭제</button></div><div class="manual-spec-grid"><label>이름<input v-model="selectedMeasurement.name" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">수동 길이 덮어쓰기(m)<input v-model.number="selectedMeasurement.manualLengthM" min="0" step=".01" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">높이(mm)<input v-model.number="selectedMeasurement.heightMm" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">자재 종류<input v-model="selectedMeasurement.material" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">판넬 유효 폭(mm)<input v-model.number="selectedMeasurement.effectiveWidthMm" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">재고/자투리(장)<input v-model.number="selectedMeasurement.inventoryPanels" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">연결 개구부<select v-model="selectedMeasurement.openingIds" multiple @change="schedulePersist"><option v-for="opening in selectedDrawing.measurements?.filter((item) => item.kind === 'opening') || []" :key="opening.id" :value="opening.id">{{ opening.name }} · {{ measurementArea(opening).toFixed(2) }}㎡</option></select></label><label v-if="selectedMeasurement.kind === 'wall'">검토 상태<select v-model="selectedMeasurement.status" @change="schedulePersist"><option>검토 필요</option><option>확인 완료</option></select></label><label class="manual-wide">검토 메모<input v-model="selectedMeasurement.memo" @change="schedulePersist"></label></div><p class="mark-calculation">{{ selectedMeasurement.kind === 'wall' ? (pageScale || selectedMeasurement.manualLengthM > 0 ? `길이 ${measurementLengthM(selectedMeasurement).toFixed(2)}m × 높이 ${selectedMeasurement.heightMm || '미입력'}mm − 개구부 ${linkedOpeningArea(selectedMeasurement).toFixed(2)}㎡` : '산출 제외: 축척 설정 필요 또는 수동 길이를 입력하세요.') : `도면 축척 환산 면적 ${measurementArea(selectedMeasurement).toFixed(2)}㎡` }}</p></div><p v-if="!pageMeasurements.length" class="manual-empty">이 페이지의 측정값이 없습니다.</p></section>
         <section class="marking-summary"><div class="manual-spec-heading"><div><span class="panel-kicker">마킹 자동 집계</span><h3>색상·높이·자재별 산출</h3><p>확인 완료 및 필수 입력값이 있는 마킹만 집계합니다.</p></div></div><div v-if="markingSummary.length" class="table-scroll"><table class="data-table"><thead><tr><th>색상</th><th>자재</th><th>높이</th><th>벽체 길이</th><th>총면적</th><th>순면적</th><th>예상 판넬</th><th>재고·자투리</th><th>부족/신규 발주</th><th>제외</th></tr></thead><tbody><tr v-for="row in markingSummary" :key="`${row.color}-${row.material}-${row.heightMm}`"><td><i class="color-dot" :style="{ background: row.color }" /></td><td>{{ row.material }}</td><td>{{ row.heightMm || '—' }}mm</td><td>{{ row.lengthM.toFixed(2) }}m</td><td>{{ row.gross.toFixed(2) }}㎡</td><td>{{ row.net.toFixed(2) }}㎡</td><td>{{ row.panels }}장</td><td>{{ row.inventory }}장</td><td>{{ row.shortage }}장 / {{ row.order }}장</td><td>{{ row.excluded }}건</td></tr></tbody></table></div><p v-else class="manual-empty">아직 계산 가능한 마킹이 없습니다. 길이·높이·규격을 입력하고 검토 완료로 바꾸세요.</p></section>
         <section class="hybrid-model-card" aria-labelledby="hybrid-model-title">
           <div class="manual-spec-heading"><div><span class="panel-kicker">혼합형 3D 초안</span><h3 id="hybrid-model-title">전체 도면 분석 → 검토 → 개략 3D → 산출 초안</h3><p>PDF 텍스트·파일명에서 도면 유형과 숫자 후보를 채울 수 있지만, 자동 결과는 확정값이 아닙니다.</p></div><button type="button" class="outline-button" @click="createBrowserDraft">전체 도면 분석</button></div>
@@ -650,4 +751,5 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
 .manual-workspace { margin-top: 22px; }.manual-safe-badge { color: #176341; font-weight: 800; }.manual-upload-row,.manual-toolbar,.manual-spec-heading,.manual-spec-top,.hybrid-confirmed,.hybrid-opening-heading { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.local-test-manifest { margin:14px 0; padding:14px; border:1px solid #c9ddd0; border-radius:10px; background:#f4faf6; }.local-test-manifest h3 { margin:3px 0; }.local-test-manifest p { margin:4px 0 10px; color:#587063; font-size:13px; }.local-test-manifest ol { margin:0; padding-left:22px; display:grid; gap:5px; }.local-test-manifest li { display:flex; justify-content:space-between; gap:12px; font-size:12px; }.local-test-manifest li span { white-space:nowrap; color:#61776a; }.manual-message { color:#28634c; }.manual-empty { padding:22px; border:1px dashed #b8c8bf; border-radius:10px; color:#61736a; }.manual-layout { display:grid; grid-template-columns:250px minmax(0,1fr); gap:16px; }.manual-list { display:grid; align-content:start; gap:8px; max-height:620px; overflow:auto; }.manual-list article { border:1px solid #d7e1db; border-radius:10px; padding:8px; }.manual-list article.selected { border-color:#398367; background:#f0f8f3; }.manual-list article > button:first-child { display:grid; gap:4px; width:100%; border:0; background:transparent; text-align:left; cursor:pointer; }.manual-list small,.manual-list span { color:#687b72; font-size:12px; }.manual-delete { margin-top:6px; border:0; background:transparent; color:#a73535; cursor:pointer; }.manual-content { min-width:0; }.manual-toolbar { padding:10px; background:#f6f8f6; border-radius:8px; }.manual-toolbar button { border:1px solid #c7d4cc; border-radius:6px; background:white; padding:5px 8px; }.pdf-canvas-wrap { margin-top:12px; min-height:260px; overflow:auto; background:#edf1ee; padding:14px; text-align:center; }.pdf-canvas-wrap canvas { max-width:none; background:white; box-shadow:0 2px 10px #2c41331f; }.manual-spec-heading { justify-content:space-between; margin-top:22px; }.manual-spec-heading h3 { margin:0; }.manual-spec-heading p { margin:4px 0 0; color:#64766c; }.hybrid-model-card { margin-top:22px; padding:16px; border:1px solid #bed8cc; border-radius:12px; background:#f7fbf8; }.hybrid-model-card .manual-spec-heading { margin-top:0; }.hybrid-privacy,.hybrid-source,.hybrid-blocked { margin:10px 0 0; font-size:13px; color:#526f60; }.hybrid-candidates { margin-top:12px; padding:10px; border-radius:8px; background:#edf6ef; color:#315944; font-size:13px; }.hybrid-candidates ul { margin:8px 0 0; padding-left:18px; }.hybrid-candidates li { display:flex; justify-content:space-between; gap:12px; }.hybrid-opening-heading { justify-content:space-between; margin-top:16px; }.hybrid-opening-heading p { margin:3px 0 0; font-size:12px; color:#526f60; }.hybrid-opening-row { display:grid; grid-template-columns:20px repeat(8,minmax(82px,1fr)) auto; gap:8px; align-items:end; margin-top:8px; padding:10px; border:1px solid #d7e5dc; border-radius:8px; background:#fff; }.hybrid-opening-row label { display:grid; gap:3px; font-size:11px; font-weight:700; color:#52645a; }.hybrid-opening-row input,.hybrid-opening-row select { min-width:0; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.hybrid-confirmed { justify-content:space-between; margin-top:14px; padding:10px; border-radius:8px; background:#e0f2e7; color:#185d3c; }.hybrid-blocked { padding:14px; border:1px dashed #b8c8bf; border-radius:8px; }.hybrid-viewer { margin-top:14px; min-height:380px; border-radius:10px; overflow:hidden; background:#eef4ef; }.hybrid-inputs { margin-top:14px; }.manual-spec { border-top:1px solid #dfe7e1; padding:14px 0; }.manual-spec-top { justify-content:space-between; }.manual-spec-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:10px; }.manual-spec-grid label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.manual-spec-grid input,.manual-spec-grid select,.manual-toolbar select { width:100%; box-sizing:border-box; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:white; }.manual-wide { grid-column:span 2; }.manual-takeoff { margin-top:20px; padding-top:4px; }.manual-takeoff strong { color:#176341; } @media (max-width: 850px) { .manual-layout { grid-template-columns:1fr; }.manual-list { max-height:220px; }.manual-spec-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.hybrid-opening-row { grid-template-columns:20px repeat(2,minmax(0,1fr)); }.manual-wide { grid-column:span 2; } } @media (max-width: 500px) { .local-test-manifest li,.hybrid-candidates li { display:grid; }.manual-spec-grid { grid-template-columns:1fr; }.hybrid-opening-row { grid-template-columns:1fr; }.manual-wide { grid-column:auto; } }
 .preflight-card { margin-top:22px; padding:16px; border:1px solid #d6e2d9; border-radius:12px; background:#fafcfb; }.preflight-card .manual-spec-heading { margin-top:0; }.preflight-summary { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }.preflight-summary span { padding:6px 9px; border-radius:999px; background:#edf4ef; color:#3c604a; font-size:12px; font-weight:700; }.preflight-issues { margin:12px 0 0; padding:12px 12px 12px 30px; border-radius:8px; background:#fff8e8; color:#795b1e; font-size:13px; }.preflight-issues li + li { margin-top:5px; }.preflight-ready { margin:12px 0 0; padding:12px; border-radius:8px; background:#e6f5ea; color:#24613e; font-size:13px; }
 .marking-card,.marking-summary { margin-top:18px; padding:16px; border:1px solid #f1d59a; border-radius:12px; background:#fffdf6; }.marking-card .manual-spec-heading,.marking-summary .manual-spec-heading { margin-top:0; }.pdf-stage { position:relative; display:inline-block; min-width:100%; padding:0; text-align:left; }.pdf-stage canvas { display:block; }.mark-overlay { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }.pdf-stage.marking .mark-overlay { cursor:crosshair; }.mark-editor { margin-top:14px; padding:12px; border:1px solid #eddca8; border-radius:10px; background:#fff; }.mark-editor .manual-spec-heading { margin-top:0; }.mark-number { fill:#172033; font-size:24px; font-weight:900; paint-order:stroke; stroke:#fff; stroke-width:5px; }.mark-chip { padding:4px 8px; border-radius:999px; color:#fff; font-size:12px; font-weight:800; }.quick-buttons { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:10px; }.quick-buttons span { color:#66766d; font-size:12px; font-weight:700; }.quick-buttons button { border:1px solid #d6c784; border-radius:999px; background:#fff9df; padding:5px 8px; cursor:pointer; }.mark-calculation { margin:10px 0 0; color:#2a6246; font-weight:700; font-size:13px; }.color-dot { display:inline-block; width:16px; height:16px; border-radius:50%; border:1px solid #778; vertical-align:middle; }
+.scale-card,.measurement-list { margin-top:18px; padding:16px; border:1px solid #bdd8ea; border-radius:12px; background:#f7fbff; }.scale-card .manual-spec-heading,.measurement-list .manual-spec-heading { margin-top:0; }.scale-actions { display:flex; gap:8px; align-items:end; }.scale-actions label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.scale-actions input { width:150px; border:1px solid #cbd8d0; border-radius:6px; padding:7px; }.quick-buttons button.active { background:#dceffd; border-color:#4d8fba; }.measurement-row { display:flex; gap:10px; align-items:center; padding:9px 0; border-bottom:1px solid #dce7ef; }.measurement-row > button:first-child { border:0; background:transparent; color:#1d4f72; font-weight:700; cursor:pointer; text-align:left; }.measurement-row span { color:#526f60; font-size:13px; }.measurement-line,.measurement-draft { fill:none; stroke-width:4px; stroke-linejoin:round; }.measurement-draft { stroke:#f59e0b; stroke-dasharray:8 5; }.scale-line { stroke:#ec4899; stroke-width:4px; stroke-dasharray:10 6; }
 </style>
