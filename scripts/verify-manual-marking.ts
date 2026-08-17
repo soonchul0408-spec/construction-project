@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset, validatedOpeningAreaM2 } from '../src/modules/manual-marking-calculator.ts'
+import { planWallMaterial } from '../src/modules/wall-material-layout.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -36,4 +37,13 @@ assert.deepEqual(door, { ready: true, areaM2: 2, reason: null }, '1m × 2m 문�
 assert.equal(calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: door.areaM2, effectiveWidthMm: 1000, status: '확인 완료' }).netAreaM2, 28, '문 자동 차감 후 순면적은 28㎡입니다.')
 assert.equal(validatedOpeningAreaM2(1000, 2000, 1, 30, 2, '확인 완료').ready, false, '두 벽체 중복 연결은 차감에서 제외합니다.')
 assert.equal(validatedOpeningAreaM2(10000, 4000, 1, 30, 1, '확인 완료').ready, false, '벽체보다 큰 개구부는 차감에서 제외합니다.')
+const vertical = planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28, reviewed: true, catalog: { id: 'p75', name: '75T 판넬', thicknessMm: 75, effectiveWidthMm: 1000, standardLengthMm: 3200, direction: 'vertical', cuttingAllowanceMm: 50, unitPrice: 100000 } }, [{ id: 'usable', catalogId: 'p75', thicknessMm: 75, lengthMm: 3100, direction: 'vertical', rotatable: false, approved: true }, { id: 'wrong-thickness', catalogId: 'p75', thicknessMm: 50, lengthMm: 3200, direction: 'vertical', rotatable: false, approved: true }])
+assert.equal(vertical.panelCount, 10, '세로 시공은 벽체 길이와 유효폭으로 10장을 계산합니다.')
+assert.equal(vertical.requiredLengthMm, 3050, '세로 시공 필요 길이는 높이와 절단 여유를 합산합니다.')
+assert.equal(vertical.approvedStock, 1, '규격·두께·길이가 맞고 승인된 자투리를 우선 사용합니다.')
+assert.equal(vertical.orderCount, 9, '부족한 수량만 신규 발주합니다.')
+const horizontal = planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28, reviewed: true, catalog: { id: 'p75h', name: '75T 판넬 가로', thicknessMm: 75, effectiveWidthMm: 1000, standardLengthMm: 10200, direction: 'horizontal', cuttingAllowanceMm: 50, unitPrice: 100000 } }, [])
+assert.equal(horizontal.panelCount, 3, '가로 시공은 벽체 높이와 유효폭으로 3단을 계산합니다.')
+assert.equal(horizontal.requiredLengthMm, 10050, '가로 시공 필요 길이는 벽체 길이와 절단 여유를 합산합니다.')
+assert.equal(planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28, reviewed: false }, []).ready, false, '미검토 벽체는 발주표에서 제외합니다.')
 console.log('Manual marking calculation verification passed.')

@@ -4,6 +4,7 @@ import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import pdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import type { BuildingGeometry, Evidence, Opening } from '../types/domain'
 import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, snapshotPreset, type MeasurementPoint, type PageScale } from '../modules/manual-marking-calculator'
+import { planWallMaterial, type PanelCatalogItem, type StockPiece } from '../modules/wall-material-layout'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 const Building3DViewer = defineAsyncComponent(() => import('./Building3DViewer.vue'))
@@ -40,6 +41,8 @@ interface ManualDrawing {
   measurements?: DrawingMeasurement[]
   reviewZones?: ReviewZone[]
   blockOrderForHeldZones?: boolean
+  panelCatalog?: PanelCatalogItem[]
+  panelStock?: StockPiece[]
 }
 
 interface DrawingMark {
@@ -193,6 +196,14 @@ const selectedZoneId = ref('')
 const zoneDrawingEnabled = ref(false)
 const reviewFilter = ref<'all' | 'unreviewed' | 'excluded' | 'height-missing'>('all')
 const activePreset = computed(() => presets.value.find((preset) => preset.id === activePresetId.value) || null)
+const catalog = computed(() => selectedDrawing.value?.panelCatalog || [])
+const stock = computed(() => selectedDrawing.value?.panelStock || [])
+const wallPlans = computed(() => (selectedDrawing.value?.measurements || []).filter((measurement) => measurement.kind === 'wall').map((wall) => {
+  const net = calculateManualMarking({ lengthM: measurementLengthM(wall), heightMm: wall.heightMm, openingAreaM2: linkedOpeningArea(wall), effectiveWidthMm: wall.effectiveWidthMm, status: wall.status })
+  const item = catalog.value.find((candidate) => candidate.name === wall.material)
+  return { wall, net, plan: planWallMaterial({ lengthM: measurementLengthM(wall), heightMm: wall.heightMm, netAreaM2: net.netAreaM2, reviewed: wall.status === '확인 완료' && net.ready, catalog: item }, stock.value) }
+}))
+const orderPlans = computed(() => wallPlans.value.filter((row) => row.plan.ready))
 const updateCompactMode = () => { isCompact.value = window.matchMedia('(max-width: 700px), (pointer: coarse)').matches }
 let pdfDocument: Awaited<ReturnType<typeof pdfjsLib.getDocument>> | null = null
 let renderTask: { cancel: () => void } | null = null
@@ -216,6 +227,7 @@ const defaultHybridModel = (): HybridModelDraft => ({
   openings: [],
   note: '',
 })
+const defaultPanelCatalog = (): PanelCatalogItem[] => [{ id: 'sample-panel-75', name: '샌드위치패널 75T', thicknessMm: 75, effectiveWidthMm: 1000, standardLengthMm: 3200, direction: 'vertical', cuttingAllowanceMm: 50, unitPrice: 100000 }]
 
 const selectedDrawing = computed(() => drawings.value.find((drawing) => drawing.id === selectedId.value) || null)
 const selectedMark = computed(() => selectedDrawing.value?.marks?.find((mark) => mark.id === selectedMarkId.value) || null)
@@ -379,6 +391,8 @@ async function loadDrawings() {
       measurements: drawing.measurements || [],
       reviewZones: drawing.reviewZones || [],
       blockOrderForHeldZones: drawing.blockOrderForHeldZones ?? false,
+      panelCatalog: drawing.panelCatalog || defaultPanelCatalog(),
+      panelStock: drawing.panelStock || [],
     })).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt))
     if (drawings.value[0]) await selectDrawing(drawings.value[0].id)
   } catch {
@@ -472,6 +486,7 @@ async function persist() {
       measurements: (drawing.measurements || []).map((measurement) => ({ ...measurement, points: measurement.points.map((point) => ({ ...point })), openingIds: [...measurement.openingIds] })),
       reviewZones: (drawing.reviewZones || []).map((zone) => ({ ...zone })),
       blockOrderForHeldZones: Boolean(drawing.blockOrderForHeldZones),
+      panelCatalog: (drawing.panelCatalog || []).map((item) => ({ ...item })), panelStock: (drawing.panelStock || []).map((item) => ({ ...item })),
       hybridModel: drawing.hybridModel ? { ...drawing.hybridModel, sourceNames: [...drawing.hybridModel.sourceNames], candidates: drawing.hybridModel.candidates.map((candidate) => ({ ...candidate })), openings: drawing.hybridModel.openings.map((opening) => ({ ...opening })) } : undefined,
     } satisfies ManualDrawing))
     await new Promise<void>((resolve, reject) => {
@@ -501,7 +516,7 @@ async function chooseFiles(files: File[]) {
       message.value = `${file.name}: 파일당 50MB 이하만 추가할 수 있습니다.`
       continue
     }
-    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [], pageScales: {}, measurements: [], reviewZones: [], blockOrderForHeldZones: false })
+    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [], pageScales: {}, measurements: [], reviewZones: [], blockOrderForHeldZones: false, panelCatalog: defaultPanelCatalog(), panelStock: [] })
   }
   if (!accepted.length) return
   drawings.value = [...accepted, ...drawings.value]
@@ -912,6 +927,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
         <div class="manual-spec-heading"><div><h3>사양 검토</h3><p>모든 항목은 수동 입력이며 기본 상태는 ‘검토 필요’입니다.</p></div><button type="button" class="outline-button" @click="addSpec">항목 추가</button></div>
         <div class="manual-spec-list"><article v-for="(spec, index) in selectedDrawing.specs" :key="spec.id" class="manual-spec"><div class="manual-spec-top"><b>{{ index + 1 }}번 {{ spec.origin === 'geometry-draft' ? '3D 계산 초안' : '수동 검토 항목' }}</b><button type="button" class="text-button danger-text" @click="removeSpec(spec.id)">삭제</button></div><div class="manual-spec-grid"><label>항목명<input v-model="spec.item" placeholder="예: 샌드위치패널"></label><label>규격<input v-model="spec.specification" placeholder="예: 75T"></label><label>단위<input v-model="spec.unit" placeholder="예: ㎡, 개, m"></label><label>수량<input v-model.number="spec.quantity" min="0" type="number"></label><label>단가(원)<input v-model.number="spec.unitPrice" min="0" type="number"></label><label>재고 수량<input v-model.number="spec.inventory" min="0" type="number"></label><label>신뢰도<select v-model="spec.confidence"><option>높음</option><option>중간</option><option>낮음</option></select></label><label>검토 상태<select v-model="spec.status"><option>검토 필요</option><option>확인 완료</option></select></label><label class="manual-wide">검토 메모<input v-model="spec.memo" placeholder="원본 페이지·치수 확인 내용"></label></div></article><p v-if="!selectedDrawing.specs.length" class="manual-empty">아직 사양 항목이 없습니다. ‘항목 추가’로 실제 도면의 값을 입력하세요.</p></div>
         <section class="manual-takeoff"><div class="manual-spec-heading"><div><h3>수동 자재 산출</h3><p>‘확인 완료’ 항목만 반영합니다. 단위가 다르면 별도 행으로 유지합니다.</p></div><strong>{{ formatWon(totalAmount) }}</strong></div><div v-if="takeoffRows.length" class="table-scroll"><table class="data-table"><thead><tr><th>항목</th><th>규격</th><th>단위</th><th>확인 수량</th><th>재고</th><th>부족</th><th>신규 발주</th><th>금액</th></tr></thead><tbody><tr v-for="row in takeoffRows" :key="`${row.item}-${row.specification}-${row.unit}`"><td>{{ row.item }}</td><td>{{ row.specification }}</td><td>{{ row.unit }}</td><td>{{ row.quantity }}</td><td>{{ row.inventory }}</td><td>{{ row.shortage }}</td><td>{{ row.order }}</td><td>{{ formatWon(row.amount) }}</td></tr></tbody></table></div><p v-else class="manual-empty">확인 완료된 사양 항목만 산출표에 표시됩니다.</p></section>
+        <section class="material-layout"><div class="manual-spec-heading"><div><span class="panel-kicker">벽체별 자재 배치</span><h3>재고 우선 · 절단 계획 · 발주 준비</h3><p>승인된 재고만 제안에 반영하며 자동 차감·예약은 하지 않습니다.</p></div></div><div class="catalog-row" v-for="item in catalog" :key="item.id"><b>{{ item.name }}</b><span>{{ item.thicknessMm }}T · {{ item.effectiveWidthMm }}mm · {{ item.direction === 'vertical' ? '세로' : '가로' }} · 표준 {{ item.standardLengthMm }}mm · 여유 {{ item.cuttingAllowanceMm }}mm · {{ formatWon(item.unitPrice) }}</span></div><div v-for="row in wallPlans" :key="row.wall.id" class="wall-plan"><b>{{ row.wall.name }}</b><span v-if="row.plan.ready">{{ row.plan.panelCount }}장 · 필요 {{ row.plan.requiredLengthMm }}mm · 승인 재고 {{ row.plan.approvedStock }}장 · 신규 {{ row.plan.orderCount }}장 · 자투리/폐기 {{ row.plan.wasteMm }}mm · 재고 우선 {{ formatWon(row.plan.cost) }} / 신규 위주 {{ formatWon(row.plan.newOrderOnlyCost) }}</span><span v-else class="zone-warning">발주 제외: {{ row.plan.reason }}</span></div><p v-if="!wallPlans.length" class="manual-empty">확인 완료된 벽체에 자재명을 카탈로그 항목과 동일하게 지정하면 배치 계획을 만듭니다.</p><div v-if="orderPlans.length" class="order-ready"><b>신규 발주 준비</b><span>검토 통과 벽체 {{ orderPlans.length }}곳 · 신규 수량 {{ orderPlans.reduce((sum, row) => sum + row.plan.orderCount, 0) }}장 · 예상 금액 {{ formatWon(orderPlans.reduce((sum, row) => sum + row.plan.cost, 0)) }}</span></div></section>
         <section class="preflight-card"><div class="manual-spec-heading"><div><span class="panel-kicker">발주 전 확인</span><h3>검토 상태와 보고서</h3><p>PDF 원본은 포함하지 않고 이 브라우저의 입력·검토 결과만 내보냅니다.</p></div><button type="button" class="outline-button" @click="downloadReviewReport">검토 보고서 CSV 저장</button></div><div class="preflight-summary"><span>도면 {{ projectSummary.drawingCount }}장</span><span>유형 확인 {{ projectSummary.classifiedCount }}장</span><span>확인 완료 항목 {{ projectSummary.confirmedSpecCount }}건</span><span>검토 필요 항목 {{ projectSummary.pendingSpecCount }}건</span></div><ul v-if="preflightIssues.length" class="preflight-issues"><li v-for="issue in preflightIssues" :key="issue">{{ issue }}</li></ul><p v-else class="preflight-ready">현재 선택 도면은 이 화면에서 관리하는 확인 항목을 모두 통과했습니다. 실제 발주 전에는 원본 도면·현장 조건·단가를 별도로 확인하세요.</p></section>
       </div>
     </div>
@@ -926,4 +942,5 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
 .preset-card,.preset-summary { margin-top:18px; padding:16px; border:1px solid #c9d8f0; border-radius:12px; background:#fbfcff; }.preset-card .manual-spec-heading { margin-top:0; }.preset-buttons { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }.preset-buttons button { display:flex; align-items:center; gap:6px; border:2px solid #94a3b8; border-radius:8px; background:#fff; padding:8px 10px; cursor:pointer; font-weight:700; }.preset-buttons button.active { background:#eaf4ff; box-shadow:0 0 0 2px #60a5fa; }.preset-buttons i,.preset-summary i { display:inline-block; width:12px; height:12px; border-radius:50%; }.preset-buttons small { color:#64748b; }.preset-editor { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)) auto auto; gap:8px; align-items:end; margin-top:14px; }.preset-editor label { display:grid; gap:4px; color:#52645a; font-size:11px; font-weight:700; }.preset-editor input,.preset-editor select,.preset-apply select { min-width:0; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:#fff; }.preset-manage { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }.preset-manage span { display:flex; align-items:center; gap:5px; padding:6px 8px; border-radius:7px; background:#f1f5f9; font-size:12px; }.preset-manage button { border:0; background:transparent; color:#2563eb; cursor:pointer; }.preset-manage .danger-text { color:#b91c1c; }.preset-summary { display:grid; gap:7px; color:#334155; font-size:13px; }.preset-summary div { display:flex; align-items:center; gap:6px; }.preset-apply { margin:10px 0 0; color:#36556e; font-size:13px; } @media (max-width:850px) { .preset-editor { grid-template-columns:repeat(2,minmax(0,1fr)); } } @media (max-width:500px) { .preset-editor { grid-template-columns:1fr; } }
 .review-board { margin-top:18px; padding:16px; border:1px solid #d8c6ed; border-radius:12px; background:#fcfaff; }.review-board .manual-spec-heading { margin-top:0; }.review-filters { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }.review-filters button { border:1px solid #cfc4dc; border-radius:999px; background:#fff; padding:6px 9px; cursor:pointer; }.review-filters button.active { background:#eee7f8; border-color:#8b5cb7; }.review-zone-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 0; border-top:1px solid #e5def0; font-size:13px; }.review-zone-row > button:first-child { border:0; background:transparent; color:#5b337e; font-weight:800; cursor:pointer; }.review-zone-row label { display:flex; gap:4px; align-items:center; font-size:12px; }.review-zone-row input,.review-zone-row select { border:1px solid #cfc4dc; border-radius:6px; padding:5px; background:#fff; }.zone-warning { color:#a64d17; font-weight:700; }.hold-block { display:block; margin-top:12px; color:#5b4a69; font-size:13px; }
 .opening-card { margin-top:18px; padding:16px; border:1px solid #f0c7ad; border-radius:12px; background:#fffaf7; }.opening-card .manual-spec-heading { margin-top:0; }.opening-row { display:flex; gap:8px; flex-wrap:wrap; align-items:end; padding:10px 0; border-top:1px solid #f1ded1; }.opening-row label { display:grid; gap:3px; color:#6b574b; font-size:11px; font-weight:700; }.opening-row input,.opening-row select { border:1px solid #dfc8b8; border-radius:6px; padding:6px; background:#fff; max-width:130px; }
+.material-layout { margin-top:20px; padding:16px; border:1px solid #b9d7cc; border-radius:12px; background:#f7fcf9; }.material-layout .manual-spec-heading { margin-top:0; }.catalog-row,.wall-plan,.order-ready { display:flex; gap:10px; flex-wrap:wrap; padding:9px 0; border-top:1px solid #dceae2; font-size:13px; }.catalog-row span,.wall-plan span { color:#456156; }.order-ready { margin-top:10px; padding:10px; border-radius:8px; background:#e0f2e7; color:#185d3c; border:0; }
 </style>
