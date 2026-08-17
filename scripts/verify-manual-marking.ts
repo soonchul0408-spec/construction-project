@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset } from '../src/modules/manual-marking-calculator.ts'
+import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset, validatedOpeningAreaM2 } from '../src/modules/manual-marking-calculator.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -31,4 +31,9 @@ const zones = [
 assert.equal(zones.filter((zone) => zone.status === '미검토').length, 1, '미검토 구역 필터는 1개를 표시합니다.')
 assert.deepEqual(reviewZoneWarnings(zones[1].items, zones[1].hasScale), ['높이 누락'], '높이 누락 구역을 경고합니다.')
 assert.deepEqual(reviewZoneWarnings(zones[2].items, zones[2].hasScale), [], '완료 구역은 경고 없이 통과합니다.')
+const door = validatedOpeningAreaM2(1000, 2000, 1, 30, 1, '확인 완료')
+assert.deepEqual(door, { ready: true, areaM2: 2, reason: null }, '1m × 2m 문은 연결 벽체에서 2㎡를 차감합니다.')
+assert.equal(calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: door.areaM2, effectiveWidthMm: 1000, status: '확인 완료' }).netAreaM2, 28, '문 자동 차감 후 순면적은 28㎡입니다.')
+assert.equal(validatedOpeningAreaM2(1000, 2000, 1, 30, 2, '확인 완료').ready, false, '두 벽체 중복 연결은 차감에서 제외합니다.')
+assert.equal(validatedOpeningAreaM2(10000, 4000, 1, 30, 1, '확인 완료').ready, false, '벽체보다 큰 개구부는 차감에서 제외합니다.')
 console.log('Manual marking calculation verification passed.')

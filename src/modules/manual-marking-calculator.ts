@@ -48,6 +48,15 @@ export function reviewZoneWarnings(items: ReviewZoneTestItem[], hasScale: boolea
   return warnings
 }
 
+export function validatedOpeningAreaM2(widthMm: number, heightMm: number, quantity: number, wallAreaM2: number, linkedWallCount: number, status: '검토 필요' | '확인 완료') {
+  const areaM2 = positive(widthMm) * positive(heightMm) * Math.max(1, positive(quantity)) / 1_000_000
+  if (status !== '확인 완료') return { ready: false, areaM2: 0, reason: '검토 완료된 개구부만 차감합니다.' }
+  if (!areaM2) return { ready: false, areaM2: 0, reason: '개구부 가로·세로·수량을 입력하세요.' }
+  if (linkedWallCount !== 1) return { ready: false, areaM2: 0, reason: linkedWallCount ? '개구부가 여러 벽체에 중복 연결되었습니다.' : '연결된 벽체가 없습니다.' }
+  if (areaM2 > positive(wallAreaM2)) return { ready: false, areaM2: 0, reason: '개구부 면적이 벽체 면적보다 큽니다.' }
+  return { ready: true, areaM2: Number(areaM2.toFixed(3)), reason: null }
+}
+
 const distance = (a: MeasurementPoint, b: MeasurementPoint) => Math.hypot(a.x - b.x, a.y - b.y)
 
 export function createPageScale(start: MeasurementPoint, end: MeasurementPoint, referenceMm: number): PageScale | null {
