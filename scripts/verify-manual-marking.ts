@@ -4,6 +4,7 @@ import { planWallMaterial } from '../src/modules/wall-material-layout.ts'
 import { activateVersion } from '../src/modules/drawing-versioning.ts'
 import { applyInventoryAudit, offcutCandidate } from '../src/modules/mobile-inventory-audit.ts'
 import { readMaterialCsv, rollbackImport } from '../src/modules/material-csv-import.ts'
+import { bulkReview, filterMarkingRows } from '../src/modules/marking-review-list.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -62,4 +63,7 @@ assert.ok(readMaterialCsv('자재명,수량\n,20', 'inventory').errors.some((err
 assert.ok(readMaterialCsv('자재코드,자재명,수량\nP1,판넬,1\nP1,판넬,1', 'inventory').errors.some((error) => error.reason.includes('중복')), '중복 자재를 표시합니다.')
 assert.ok(readMaterialCsv('자재명,수량\n판넬,-1', 'inventory').errors.some((error) => error.reason.includes('0 이상')), '음수 수량을 차단합니다.')
 const original = [{ name: '판넬', quantity: 20 }]; const restored = rollbackImport(original); restored[0].quantity = 15; assert.equal(original[0].quantity, 20, '가져오기 취소용 이전 데이터를 안전하게 복원합니다.')
+const listRows = Array.from({ length: 10 }, (_, index) => ({ id: String(index), drawing: '평면도.pdf', page: 1, number: `W-${index + 1}`, zone: '1층', material: index === 0 ? '' : '판넬', heightMm: index === 0 ? 0 : 3000, value: index + 1, status: '검토 필요' as const, scaled: index !== 0, linked: true, included: index !== 0 }))
+assert.equal(filterMarkingRows(listRows, 'height-missing').length, 1, '높이 누락 항목을 필터합니다.')
+assert.ok(bulkReview(listRows, ['0'], '확인 완료').reason, '필수값 누락 항목은 일괄 완료를 차단합니다.')
 console.log('Manual marking calculation verification passed.')
