@@ -38,6 +38,16 @@ export function snapshotPreset(preset: PresetSnapshot): PresetSnapshot {
   return { ...preset }
 }
 
+export interface ReviewZoneTestItem { status: '검토 필요' | '확인 완료'; heightMm?: number; material?: string; kind?: 'wall' | 'opening'; linked?: boolean }
+export function reviewZoneWarnings(items: ReviewZoneTestItem[], hasScale: boolean): string[] {
+  const warnings: string[] = []
+  if (!hasScale) warnings.push('축척 미설정')
+  if (items.some((item) => item.kind !== 'opening' && !positive(item.heightMm))) warnings.push('높이 누락')
+  if (items.some((item) => item.kind !== 'opening' && !item.material?.trim())) warnings.push('자재 누락')
+  if (items.some((item) => item.kind === 'opening' && !item.linked)) warnings.push('개구부 미확인')
+  return warnings
+}
+
 const distance = (a: MeasurementPoint, b: MeasurementPoint) => Math.hypot(a.x - b.x, a.y - b.y)
 
 export function createPageScale(start: MeasurementPoint, end: MeasurementPoint, referenceMm: number): PageScale | null {

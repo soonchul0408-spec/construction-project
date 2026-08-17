@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, snapshotPreset } from '../src/modules/manual-marking-calculator.ts'
+import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset } from '../src/modules/manual-marking-calculator.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -23,4 +23,12 @@ assert.equal(repeated.length, 3, '프리셋 하나로 벽체 3개에 연속 적�
 assert.equal(repeated.reduce((sum, item) => sum + calculateManualMarking({ lengthM: 10, heightMm: item.heightMm, openingAreaM2: 0, effectiveWidthMm: item.effectiveWidthMm, status: item.status }).netAreaM2, 0), 90, '프리셋별 3개 벽체 총면적을 합산합니다.')
 preset.material = '수정된 자재'
 assert.equal(repeated[0].material, '샌드위치패널 75T', '프리셋 수정 후에도 기존 마킹 스냅샷은 유지합니다.')
+const zones = [
+  { status: '미검토', items: [], hasScale: true },
+  { status: '마킹 중', items: [{ status: '검토 필요', heightMm: 0, material: '샌드위치패널', kind: 'wall' as const }], hasScale: true },
+  { status: '검토 완료', items: [{ status: '확인 완료', heightMm: 3000, material: '샌드위치패널', kind: 'wall' as const }], hasScale: true },
+]
+assert.equal(zones.filter((zone) => zone.status === '미검토').length, 1, '미검토 구역 필터는 1개를 표시합니다.')
+assert.deepEqual(reviewZoneWarnings(zones[1].items, zones[1].hasScale), ['높이 누락'], '높이 누락 구역을 경고합니다.')
+assert.deepEqual(reviewZoneWarnings(zones[2].items, zones[2].hasScale), [], '완료 구역은 경고 없이 통과합니다.')
 console.log('Manual marking calculation verification passed.')

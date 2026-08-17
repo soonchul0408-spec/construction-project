@@ -38,6 +38,8 @@ interface ManualDrawing {
   marks?: DrawingMark[]
   pageScales?: Record<number, PageScale>
   measurements?: DrawingMeasurement[]
+  reviewZones?: ReviewZone[]
+  blockOrderForHeldZones?: boolean
 }
 
 interface DrawingMark {
@@ -58,6 +60,7 @@ interface DrawingMark {
   inventoryPanels: number
   status: ReviewStatus
   memo: string
+  reviewZoneId?: string
 }
 
 type MeasurementKind = 'wall' | 'area' | 'opening'
@@ -78,6 +81,20 @@ interface DrawingMeasurement {
   presetId?: string
   presetName?: string
   color?: string
+  reviewZoneId?: string
+}
+
+type ZoneStatus = '미검토' | '마킹 중' | '검토 완료' | '보류'
+interface ReviewZone {
+  id: string
+  pageNumber: number
+  name: string
+  x: number
+  y: number
+  width: number
+  height: number
+  status: ZoneStatus
+  holdReason: string
 }
 
 interface SpecPreset {
@@ -152,6 +169,9 @@ const presets = ref<SpecPreset[]>([])
 const activePresetId = ref('')
 const presetDraft = ref<SpecPreset>({ id: '', name: '', material: '', heightMm: 3000, effectiveWidthMm: 1000, color: '#0f766e', status: '검토 필요' })
 const editingPresetId = ref('')
+const selectedZoneId = ref('')
+const zoneDrawingEnabled = ref(false)
+const reviewFilter = ref<'all' | 'unreviewed' | 'excluded' | 'height-missing'>('all')
 const activePreset = computed(() => presets.value.find((preset) => preset.id === activePresetId.value) || null)
 const updateCompactMode = () => { isCompact.value = window.matchMedia('(max-width: 700px), (pointer: coarse)').matches }
 let pdfDocument: Awaited<ReturnType<typeof pdfjsLib.getDocument>> | null = null
@@ -182,6 +202,7 @@ const selectedMark = computed(() => selectedDrawing.value?.marks?.find((mark) =>
 const pageMarks = computed(() => selectedDrawing.value?.marks?.filter((mark) => mark.pageNumber === pageNumber.value) || [])
 const pageScale = computed(() => selectedDrawing.value?.pageScales?.[pageNumber.value])
 const pageMeasurements = computed(() => selectedDrawing.value?.measurements?.filter((measurement) => measurement.pageNumber === pageNumber.value) || [])
+const pageZones = computed(() => selectedDrawing.value?.reviewZones?.filter((zone) => zone.pageNumber === pageNumber.value) || [])
 const selectedMeasurement = computed(() => selectedDrawing.value?.measurements?.find((measurement) => measurement.id === selectedMeasurementId.value) || null)
 const measurementLengthM = (measurement: DrawingMeasurement) => measurement.manualLengthM > 0 ? measurement.manualLengthM : (measuredLengthMm(measurement.points, selectedDrawing.value?.pageScales?.[measurement.pageNumber]) || 0) / 1000
 const measurementArea = (measurement: DrawingMeasurement) => measuredAreaM2(measurement.points, selectedDrawing.value?.pageScales?.[measurement.pageNumber]) || 0
@@ -254,6 +275,28 @@ const projectSummary = computed(() => ({
   confirmedSpecCount: drawings.value.reduce((count, drawing) => count + drawing.specs.filter((spec) => spec.status === '확인 완료').length, 0),
   pendingSpecCount: drawings.value.reduce((count, drawing) => count + drawing.specs.filter((spec) => spec.status === '검토 필요').length, 0),
 }))
+function zoneWarnings(zone: ReviewZone, drawing = selectedDrawing.value) {
+  if (!drawing) return []
+  const measurements = (drawing.measurements || []).filter((item) => item.reviewZoneId === zone.id)
+  const marks = (drawing.marks || []).filter((item) => item.reviewZoneId === zone.id)
+  const warnings: string[] = []
+  if (!drawing.pageScales?.[zone.pageNumber]) warnings.push('축척 미설정')
+  if (measurements.some((item) => item.kind === 'wall' && !finite(item.heightMm))) warnings.push('높이 누락')
+  if (measurements.some((item) => item.kind === 'wall' && !item.material.trim())) warnings.push('자재 누락')
+  if (measurements.some((item) => item.kind === 'opening') && !measurements.some((item) => item.kind === 'wall' && item.openingIds.includes(item.id))) warnings.push('개구부 미확인')
+  if (marks.some((item) => !finite(item.heightMm))) warnings.push('높이 누락')
+  if (marks.some((item) => !item.material.trim())) warnings.push('자재 누락')
+  return warnings
+}
+const zoneDashboard = computed(() => (selectedDrawing.value?.reviewZones || []).map((zone) => {
+  const measurements = (selectedDrawing.value?.measurements || []).filter((item) => item.reviewZoneId === zone.id)
+  const marks = (selectedDrawing.value?.marks || []).filter((item) => item.reviewZoneId === zone.id)
+  const all = [...measurements, ...marks]
+  const completed = all.filter((item) => item.status === '확인 완료').length
+  const pending = all.filter((item) => item.status !== '확인 완료').length
+  return { zone, total: all.length, completed, pending, warnings: zoneWarnings(zone) }
+}))
+const filteredZones = computed(() => zoneDashboard.value.filter((row) => reviewFilter.value === 'all' || (reviewFilter.value === 'unreviewed' && row.zone.status === '미검토') || (reviewFilter.value === 'excluded' && (row.pending > 0 || row.warnings.length > 0)) || (reviewFilter.value === 'height-missing' && row.warnings.includes('높이 누락'))))
 const preflightIssues = computed(() => {
   const drawing = selectedDrawing.value
   if (!drawing) return []
@@ -267,6 +310,8 @@ const preflightIssues = computed(() => {
   const excludedMarks = (drawing.marks || []).filter((mark) => !calculateManualMarking(mark).ready).length
   if (excludedMarks) issues.push(`도면 마킹 ${excludedMarks}건이 산출 제외 / 검토 필요입니다.`)
   if (!drawing.specs.some((spec) => spec.status === '확인 완료')) issues.push('확인 완료된 산출 항목이 아직 없습니다.')
+  const unfinishedZones = (drawing.reviewZones || []).filter((zone) => zone.status !== '검토 완료' && (zone.status !== '보류' || drawing.blockOrderForHeldZones))
+  if (unfinishedZones.length) issues.push(`검토 완료되지 않은 구역 ${unfinishedZones.length}곳이 있어 발주 전 확인이 필요합니다.`)
   return issues
 })
 
@@ -306,6 +351,8 @@ async function loadDrawings() {
       marks: drawing.marks || [],
       pageScales: drawing.pageScales || {},
       measurements: drawing.measurements || [],
+      reviewZones: drawing.reviewZones || [],
+      blockOrderForHeldZones: drawing.blockOrderForHeldZones ?? false,
     })).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt))
     if (drawings.value[0]) await selectDrawing(drawings.value[0].id)
   } catch {
@@ -392,6 +439,8 @@ async function persist() {
       marks: (drawing.marks || []).map((mark) => ({ ...mark })),
       pageScales: drawing.pageScales ? { ...drawing.pageScales } : {},
       measurements: (drawing.measurements || []).map((measurement) => ({ ...measurement, points: measurement.points.map((point) => ({ ...point })), openingIds: [...measurement.openingIds] })),
+      reviewZones: (drawing.reviewZones || []).map((zone) => ({ ...zone })),
+      blockOrderForHeldZones: Boolean(drawing.blockOrderForHeldZones),
       hybridModel: drawing.hybridModel ? { ...drawing.hybridModel, sourceNames: [...drawing.hybridModel.sourceNames], candidates: drawing.hybridModel.candidates.map((candidate) => ({ ...candidate })), openings: drawing.hybridModel.openings.map((opening) => ({ ...opening })) } : undefined,
     } satisfies ManualDrawing))
     await new Promise<void>((resolve, reject) => {
@@ -421,7 +470,7 @@ async function chooseFiles(files: File[]) {
       message.value = `${file.name}: 파일당 50MB 이하만 추가할 수 있습니다.`
       continue
     }
-    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [], pageScales: {}, measurements: [] })
+    accepted.push({ id: crypto.randomUUID(), name: file.name, size: file.size, uploadedAt: new Date().toISOString(), status: '검토 준비', kind: 'other', blob: file, specs: [], hybridModel: defaultHybridModel(), marks: [], pageScales: {}, measurements: [], reviewZones: [], blockOrderForHeldZones: false })
   }
   if (!accepted.length) return
   drawings.value = [...accepted, ...drawings.value]
@@ -493,6 +542,7 @@ function drawMeasurementOverlay(context: CanvasRenderingContext2D) {
   }
   const scale = drawing.pageScales?.[pageNumber.value]
   if (scale) { context.setLineDash([10, 6]); context.strokeStyle = '#ec4899'; context.lineWidth = 4; const [x1, y1] = point(scale.start); const [x2, y2] = point(scale.end); context.beginPath(); context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke(); context.setLineDash([]); context.fillStyle = '#be185d'; context.font = 'bold 16px sans-serif'; context.fillText(`${scale.referenceMm}mm`, x1 + 8, y1 - 8) }
+  ;(drawing.reviewZones || []).filter((zone) => zone.pageNumber === pageNumber.value).forEach((zone) => { const color = zone.status === '검토 완료' ? '#16a34a' : zone.status === '보류' ? '#9333ea' : zone.status === '마킹 중' ? '#d97706' : '#64748b'; const x = zone.x * element.width; const y = zone.y * element.height; const width = zone.width * element.width; const height = zone.height * element.height; context.strokeStyle = color; context.lineWidth = selectedZoneId.value === zone.id ? 5 : 3; context.setLineDash([8, 5]); context.strokeRect(x, y, width, height); context.setLineDash([]); context.fillStyle = `${color}22`; context.fillRect(x, y, width, height); context.fillStyle = color; context.font = 'bold 14px sans-serif'; context.fillText(zone.name, x + 6, y + 18) })
   ;(drawing.measurements || []).filter((measurement) => measurement.pageNumber === pageNumber.value).forEach((measurement) => path(measurement.points, measurementColor(measurement.kind, measurement.color), measurement.kind !== 'wall'))
 }
 
@@ -508,7 +558,7 @@ function markColor(material: string, heightMm: number) {
 }
 function pointerDown(event: PointerEvent) {
   if (measurementMode.value !== 'none') { addMeasurementPoint(markPoint(event)); return }
-  if (!markingEnabled.value || isCompact.value || !selectedDrawing.value) return
+  if ((!markingEnabled.value && !zoneDrawingEnabled.value) || isCompact.value || !selectedDrawing.value) return
   const point = markPoint(event)
   dragStart.value = point
   draftRect.value = { ...point, width: 0, height: 0 }
@@ -522,12 +572,15 @@ function pointerMove(event: PointerEvent) {
 function pointerUp() {
   const rectangle = draftRect.value
   if (!rectangle || rectangle.width < .01 || rectangle.height < .01 || !selectedDrawing.value) { dragStart.value = null; draftRect.value = null; return }
-  if (repositioningMarkId.value) {
+  if (zoneDrawingEnabled.value) {
+    const zone: ReviewZone = { id: crypto.randomUUID(), pageNumber: pageNumber.value, ...rectangle, name: `검토 구역 ${pageZones.value.length + 1}`, status: '미검토', holdReason: '' }
+    selectedDrawing.value.reviewZones ||= []; selectedDrawing.value.reviewZones.push(zone); selectedZoneId.value = zone.id; zoneDrawingEnabled.value = false
+  } else if (repositioningMarkId.value) {
     const mark = selectedDrawing.value.marks?.find((item) => item.id === repositioningMarkId.value)
     if (mark) Object.assign(mark, rectangle)
     repositioningMarkId.value = ''
   } else {
-    const mark: DrawingMark = { id: crypto.randomUUID(), pageNumber: pageNumber.value, ...rectangle, color: markColor('', 0), colorMode: 'auto', zoneName: `구역 ${((selectedDrawing.value.marks?.length || 0) + 1)}`, lengthM: 0, heightMm: 0, material: '', effectiveWidthMm: 1000, openingAreaM2: 0, inventoryPanels: 0, status: '검토 필요', memo: '' }
+    const mark: DrawingMark = { id: crypto.randomUUID(), pageNumber: pageNumber.value, ...rectangle, color: markColor('', 0), colorMode: 'auto', zoneName: `구역 ${((selectedDrawing.value.marks?.length || 0) + 1)}`, lengthM: 0, heightMm: 0, material: '', effectiveWidthMm: 1000, inventoryPanels: 0, status: '검토 필요', memo: '', reviewZoneId: selectedZoneId.value || undefined }
     selectedDrawing.value.marks ||= []
     selectedDrawing.value.marks.push(mark)
     selectedMarkId.value = mark.id
@@ -567,6 +620,7 @@ function finishMeasurement() {
   if (measurementDraft.value.length < minPoints) { message.value = kind === 'wall' ? '벽체 길이선은 2점 이상 필요합니다.' : '면적 구역은 3점 이상 필요합니다.'; return }
   const preset = kind === 'wall' && activePreset.value ? snapshotPreset({ presetId: activePreset.value.id, presetName: activePreset.value.name, material: activePreset.value.material, heightMm: activePreset.value.heightMm, effectiveWidthMm: activePreset.value.effectiveWidthMm, color: activePreset.value.color, status: activePreset.value.status }) : null
   const measurement: DrawingMeasurement = { id: crypto.randomUUID(), pageNumber: pageNumber.value, kind, points: measurementDraft.value, name: `${preset?.presetName || (kind === 'wall' ? '벽체' : kind === 'opening' ? '개구부' : '면적')} ${pageMeasurements.value.length + 1}`, manualLengthM: 0, heightMm: preset?.heightMm || 0, material: preset?.material || '', effectiveWidthMm: preset?.effectiveWidthMm || 1000, inventoryPanels: 0, status: preset?.status || '검토 필요', openingIds: [], memo: '', presetId: preset?.presetId, presetName: preset?.presetName, color: preset?.color }
+  measurement.reviewZoneId = selectedZoneId.value || undefined
   selectedDrawing.value.measurements ||= []; selectedDrawing.value.measurements.push(measurement)
   selectedMeasurementId.value = measurement.id; measurementDraft.value = []; measurementMode.value = preset && kind === 'wall' ? 'wall' : 'none'; schedulePersist(); void nextTick(renderPage)
 }
@@ -577,6 +631,8 @@ function removeMeasurement(id: string) {
   if (selectedMeasurementId.value === id) selectedMeasurementId.value = ''
   schedulePersist(); void nextTick(renderPage)
 }
+function removeZone(id: string) { if (!selectedDrawing.value) return; selectedDrawing.value.reviewZones = (selectedDrawing.value.reviewZones || []).filter((zone) => zone.id !== id); selectedDrawing.value.measurements.forEach((measurement) => { if (measurement.reviewZoneId === id) measurement.reviewZoneId = undefined }); selectedDrawing.value.marks.forEach((mark) => { if (mark.reviewZoneId === id) mark.reviewZoneId = undefined }); if (selectedZoneId.value === id) selectedZoneId.value = ''; schedulePersist(); void nextTick(renderPage) }
+async function goToZone(zone: ReviewZone) { selectedZoneId.value = zone.id; if (zone.pageNumber !== pageNumber.value) { pageNumber.value = zone.pageNumber; await nextTick(); await renderPage() } }
 function measurementLabel(measurement: DrawingMeasurement) { return measurement.kind === 'wall' ? '벽체 길이선' : measurement.kind === 'opening' ? '개구부' : '면적 구역' }
 function measurementColor(kind: MeasurementKind, customColor?: string) { return customColor || (kind === 'wall' ? '#0f766e' : kind === 'opening' ? '#dc2626' : '#2563eb') }
 
@@ -802,6 +858,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
         <div class="manual-toolbar"><label>도면 유형<select v-model="selectedDrawing.kind"><option v-for="(label, key) in kindLabels" :key="key" :value="key">{{ label }}</option></select></label><span>{{ pageCount ? `${pageNumber} / ${pageCount} 페이지` : '미리보기 준비 중' }}</span><button type="button" :disabled="pageNumber <= 1" @click="pageNumber--">이전</button><button type="button" :disabled="pageNumber >= pageCount" @click="pageNumber++">다음</button><button type="button" :disabled="zoom <= .5" @click="zoom = Math.max(.5, zoom - .25)">−</button><span>{{ Math.round(zoom * 100) }}%</span><button type="button" :disabled="zoom >= 2" @click="zoom = Math.min(2, zoom + .25)">＋</button></div>
         <section class="preset-card"><div class="manual-spec-heading"><div><span class="panel-kicker">반복 마킹</span><h3>사양 프리셋</h3><p>{{ activePreset ? `${activePreset.name} 연속 벽체 마킹 중 · Esc 또는 마킹 종료로 끝냅니다.` : '프리셋을 선택하면 같은 사양으로 벽체 길이선을 연속 마킹합니다.' }}</p></div><button v-if="activePreset" type="button" class="outline-button" @click="activePresetId = ''; measurementMode = 'none'; measurementDraft = []">마킹 종료</button></div><div class="preset-buttons"><button v-for="preset in presets" :key="preset.id" type="button" :class="{ active: activePresetId === preset.id }" :style="{ borderColor: preset.color }" @click="selectPreset(preset)"><i :style="{ background: preset.color }" />{{ preset.name }}<small v-if="preset.sample">샘플</small></button></div><div class="preset-editor"><label>프리셋 이름<input v-model="presetDraft.name" placeholder="예: 외벽 판넬 3m"></label><label>자재<input v-model="presetDraft.material" placeholder="예: 샌드위치패널 75T"></label><label>높이(mm)<input v-model.number="presetDraft.heightMm" min="1" type="number"></label><label>유효 폭(mm)<input v-model.number="presetDraft.effectiveWidthMm" min="1" type="number"></label><label>색상<input v-model="presetDraft.color" type="color"></label><label>기본 상태<select v-model="presetDraft.status"><option>검토 필요</option><option>확인 완료</option></select></label><button type="button" class="primary-button" @click="savePreset">{{ editingPresetId ? '프리셋 수정 저장' : '프리셋 추가' }}</button><button v-if="editingPresetId" type="button" @click="resetPresetDraft">취소</button></div><div class="preset-manage"><span v-for="preset in presets" :key="`${preset.id}-manage`"><b>{{ preset.name }}</b><button type="button" @click="editPreset(preset)">수정</button><button type="button" @click="duplicatePreset(preset)">복제</button><button type="button" class="danger-text" @click="deletePreset(preset.id)">삭제</button></span></div></section>
         <section v-if="presetSummary.length" class="preset-summary"><b>프리셋별 실시간 집계</b><div v-for="row in presetSummary" :key="row.name"><i :style="{ background: row.color }" />{{ row.name }} · {{ row.count }}개 · {{ row.lengthM.toFixed(2) }}m · 총 {{ row.gross.toFixed(2) }}㎡ · 순 {{ row.net.toFixed(2) }}㎡ · {{ row.panels }}장</div></section>
+        <section class="review-board"><div class="manual-spec-heading"><div><span class="panel-kicker">누락 방지 검토판</span><h3>검토 구역 → 프리셋 → 연속 마킹 → 완료</h3><p>도면에서 아직 확인하지 않은 구역과 누락된 사양을 점검합니다.</p></div><button type="button" class="outline-button" :disabled="isCompact" @click="zoneDrawingEnabled = !zoneDrawingEnabled; markingEnabled = false">{{ zoneDrawingEnabled ? '구역 만들기 종료' : '검토 구역 만들기' }}</button></div><div class="review-filters"><button v-for="filter in [{ id: 'all', label: '전체' }, { id: 'unreviewed', label: '미검토 구역만' }, { id: 'excluded', label: '산출 제외 항목만' }, { id: 'height-missing', label: '높이 누락만' }]" :key="filter.id" type="button" :class="{ active: reviewFilter === filter.id }" @click="reviewFilter = filter.id as typeof reviewFilter">{{ filter.label }}</button></div><div v-for="row in filteredZones" :key="row.zone.id" class="review-zone-row"><button type="button" @click="goToZone(row.zone)">{{ row.zone.name }} · {{ row.zone.pageNumber }}쪽</button><label>상태<select v-model="row.zone.status" @change="schedulePersist; nextTick(renderPage)"><option>미검토</option><option>마킹 중</option><option>검토 완료</option><option>보류</option></select></label><span>마킹 {{ row.total }} · 완료 {{ row.completed }} · 필요 {{ row.pending }}</span><span v-if="row.warnings.length" class="zone-warning">{{ row.warnings.join(', ') }}</span><label v-if="row.zone.status === '보류'">보류 사유<input v-model="row.zone.holdReason" @change="schedulePersist"></label><button type="button" class="danger-text" @click="removeZone(row.zone.id)">삭제</button></div><p v-if="!filteredZones.length" class="manual-empty">조건에 맞는 검토 구역이 없습니다.</p><label class="hold-block"><input v-model="selectedDrawing.blockOrderForHeldZones" type="checkbox" @change="schedulePersist"> 보류 구역도 발주 전 경고에 포함</label></section>
         <section class="scale-card"><div class="manual-spec-heading"><div><span class="panel-kicker">도면 측정</span><h3>페이지별 축척 보정</h3><p>{{ pageScale ? `보정 완료 · 기준선 ${pageScale.referenceMm.toLocaleString()}mm` : '축척 설정 필요 · 기준 치수 2개 이상으로 확인을 권장합니다.' }}</p></div><div class="scale-actions"><label>기준 실제 길이(mm)<input v-model.number="scaleReferenceMm" min="1" type="number"></label><button type="button" class="outline-button" :disabled="isCompact" @click="startMeasurement('scale')">축척 설정</button></div></div><p v-if="selectedMeasurement?.kind === 'wall'" class="preset-apply">선택 벽체에 다른 프리셋 적용: <select :value="selectedMeasurement.presetId" @change="applyPresetToSelected(($event.target as HTMLSelectElement).value)"><option value="">선택</option><option v-for="preset in presets" :key="preset.id" :value="preset.id">{{ preset.name }}</option></select></p><p v-if="isCompact" class="hybrid-blocked">모바일에서는 축척·측정점을 새로 만들지 않고, 기존 측정값의 조회·수정을 지원합니다.</p><div v-else class="quick-buttons"><button type="button" :class="{ active: measurementMode === 'wall' }" @click="startMeasurement('wall')">벽체 길이선</button><button type="button" :class="{ active: measurementMode === 'area' }" @click="startMeasurement('area')">면적 구역</button><button type="button" :class="{ active: measurementMode === 'opening' }" @click="startMeasurement('opening')">개구부</button><button v-if="measurementMode !== 'none' && measurementMode !== 'scale'" type="button" class="primary-button" @click="finishMeasurement">측정 완료</button><button v-if="measurementMode !== 'none'" type="button" @click="measurementMode = 'none'; measurementDraft = []">취소</button></div></section>
         <section class="marking-card"><div class="manual-spec-heading"><div><span class="panel-kicker">디지털 형광펜</span><h3>도면 구역 마킹</h3><p>사각형으로 표시한 위치는 구역 식별용입니다. 실제 산출은 아래 입력값만 사용합니다.</p></div><button type="button" class="outline-button" :disabled="isCompact" @click="markingEnabled = !markingEnabled">{{ markingEnabled ? '마킹 종료' : '사각형 마킹 시작' }}</button></div><p v-if="isCompact" class="hybrid-blocked">모바일에서는 마킹 위치를 새로 그리지 않고, 기존 마킹의 조회·수정·삭제를 지원합니다.</p><div ref="pdfStage" class="pdf-canvas-wrap pdf-stage" :class="{ marking: markingEnabled }"><canvas ref="canvas" aria-label="선택한 PDF 페이지 미리보기" /><svg v-if="canvas" class="mark-overlay" :viewBox="`0 0 ${canvas.width} ${canvas.height}`" @pointerdown="pointerDown" @pointermove="pointerMove" @pointerup="pointerUp"><g v-for="(mark, index) in pageMarks" :key="mark.id" @pointerdown.stop="selectMark(mark.id)"><rect :x="mark.x * canvas.width" :y="mark.y * canvas.height" :width="mark.width * canvas.width" :height="mark.height * canvas.height" :fill="mark.color" fill-opacity=".28" :stroke="mark.color" stroke-width="4" /><text :x="mark.x * canvas.width + 10" :y="mark.y * canvas.height + 28" class="mark-number">{{ index + 1 }}</text></g><rect v-if="draftRect" :x="draftRect.x * canvas.width" :y="draftRect.y * canvas.height" :width="draftRect.width * canvas.width" :height="draftRect.height * canvas.height" fill="#f59e0b" fill-opacity=".2" stroke="#d97706" stroke-width="4" /></svg></div><div v-if="selectedMark" class="mark-editor"><div class="manual-spec-heading"><b>선택 마킹 {{ pageMarks.findIndex((mark) => mark.id === selectedMark?.id) + 1 }}</b><span class="mark-chip" :style="{ background: selectedMark.color }">{{ selectedMark.zoneName || '구역명 미입력' }}</span><button type="button" class="text-button" :disabled="isCompact" @click="repositioningMarkId = selectedMark.id; markingEnabled = true">위치 다시 표시</button><button type="button" class="text-button danger-text" @click="removeMark(selectedMark.id)">삭제</button></div><div class="manual-spec-grid"><label>구역 이름<input v-model="selectedMark.zoneName" @change="schedulePersist"></label><label>벽체 길이(m)<input v-model.number="selectedMark.lengthM" min="0" step=".01" type="number" @change="schedulePersist"></label><label>높이(mm)<input v-model.number="selectedMark.heightMm" min="0" type="number" @change="syncMarkColor(selectedMark)"></label><label>자재 종류<input v-model="selectedMark.material" placeholder="예: 샌드위치패널" @change="syncMarkColor(selectedMark)"></label><label>판넬 유효 폭(mm)<input v-model.number="selectedMark.effectiveWidthMm" min="0" type="number" @change="schedulePersist"></label><label>개구부 제외 면적(㎡)<input v-model.number="selectedMark.openingAreaM2" min="0" step=".01" type="number" @change="schedulePersist"></label><label>재고/자투리 사용 가능(장)<input v-model.number="selectedMark.inventoryPanels" min="0" type="number" @change="schedulePersist"></label><label>검토 상태<select v-model="selectedMark.status" @change="schedulePersist"><option>검토 필요</option><option>확인 완료</option></select></label><label>색상<input v-model="selectedMark.color" type="color" @input="selectedMark.colorMode = 'manual'; schedulePersist()"></label><label class="manual-wide">검토 메모<input v-model="selectedMark.memo" @change="schedulePersist"></label></div><div class="quick-buttons"><span>빠른 선택</span><button v-for="height in [2400, 2700, 3000, 4200]" :key="height" type="button" @click="setMarkHeight(height)">{{ height.toLocaleString() }}mm</button><button v-for="material in ['샌드위치패널', '석고보드', '단열재']" :key="material" type="button" @click="setMarkMaterial(material)">{{ material }}</button></div><p class="mark-calculation">{{ calculateManualMarking(selectedMark).ready ? `계산: ${calculateManualMarking(selectedMark).grossAreaM2}㎡ − ${selectedMark.openingAreaM2 || 0}㎡ = ${calculateManualMarking(selectedMark).netAreaM2}㎡ · 예상 ${calculateManualMarking(selectedMark).panelCount}장` : `산출 제외: ${calculateManualMarking(selectedMark).reason}` }}</p></div></section>
         <section class="measurement-list"><div class="manual-spec-heading"><div><span class="panel-kicker">축척 환산 측정값</span><h3>벽체·면적·개구부</h3><p>{{ pageScale ? '도면 축척 환산값입니다. 수동값으로 덮어쓸 수 있습니다.' : '축척 설정 필요: 측정값은 산출에 반영되지 않습니다.' }}</p></div></div><div v-for="measurement in pageMeasurements" :key="measurement.id" class="measurement-row"><button type="button" @click="selectedMeasurementId = measurement.id">{{ measurementLabel(measurement) }} · {{ measurement.name }}</button><span>{{ measurement.kind === 'wall' ? `${measurementLengthM(measurement).toFixed(2)}m` : `${measurementArea(measurement).toFixed(2)}㎡` }}</span><button type="button" class="text-button danger-text" @click="removeMeasurement(measurement.id)">삭제</button></div><div v-if="selectedMeasurement" class="mark-editor"><div class="manual-spec-heading"><b>{{ measurementLabel(selectedMeasurement) }} 편집</b><button type="button" class="text-button danger-text" @click="removeMeasurement(selectedMeasurement.id)">삭제</button></div><div class="manual-spec-grid"><label>이름<input v-model="selectedMeasurement.name" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">수동 길이 덮어쓰기(m)<input v-model.number="selectedMeasurement.manualLengthM" min="0" step=".01" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">높이(mm)<input v-model.number="selectedMeasurement.heightMm" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">자재 종류<input v-model="selectedMeasurement.material" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">판넬 유효 폭(mm)<input v-model.number="selectedMeasurement.effectiveWidthMm" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">재고/자투리(장)<input v-model.number="selectedMeasurement.inventoryPanels" min="0" type="number" @change="schedulePersist"></label><label v-if="selectedMeasurement.kind === 'wall'">연결 개구부<select v-model="selectedMeasurement.openingIds" multiple @change="schedulePersist"><option v-for="opening in selectedDrawing.measurements?.filter((item) => item.kind === 'opening') || []" :key="opening.id" :value="opening.id">{{ opening.name }} · {{ measurementArea(opening).toFixed(2) }}㎡</option></select></label><label v-if="selectedMeasurement.kind === 'wall'">검토 상태<select v-model="selectedMeasurement.status" @change="schedulePersist"><option>검토 필요</option><option>확인 완료</option></select></label><label class="manual-wide">검토 메모<input v-model="selectedMeasurement.memo" @change="schedulePersist"></label></div><p class="mark-calculation">{{ selectedMeasurement.kind === 'wall' ? (pageScale || selectedMeasurement.manualLengthM > 0 ? `길이 ${measurementLengthM(selectedMeasurement).toFixed(2)}m × 높이 ${selectedMeasurement.heightMm || '미입력'}mm − 개구부 ${linkedOpeningArea(selectedMeasurement).toFixed(2)}㎡` : '산출 제외: 축척 설정 필요 또는 수동 길이를 입력하세요.') : `도면 축척 환산 면적 ${measurementArea(selectedMeasurement).toFixed(2)}㎡` }}</p></div><p v-if="!pageMeasurements.length" class="manual-empty">이 페이지의 측정값이 없습니다.</p></section>
@@ -834,4 +891,5 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
 .marking-card,.marking-summary { margin-top:18px; padding:16px; border:1px solid #f1d59a; border-radius:12px; background:#fffdf6; }.marking-card .manual-spec-heading,.marking-summary .manual-spec-heading { margin-top:0; }.pdf-stage { position:relative; display:inline-block; min-width:100%; padding:0; text-align:left; }.pdf-stage canvas { display:block; }.mark-overlay { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }.pdf-stage.marking .mark-overlay { cursor:crosshair; }.mark-editor { margin-top:14px; padding:12px; border:1px solid #eddca8; border-radius:10px; background:#fff; }.mark-editor .manual-spec-heading { margin-top:0; }.mark-number { fill:#172033; font-size:24px; font-weight:900; paint-order:stroke; stroke:#fff; stroke-width:5px; }.mark-chip { padding:4px 8px; border-radius:999px; color:#fff; font-size:12px; font-weight:800; }.quick-buttons { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:10px; }.quick-buttons span { color:#66766d; font-size:12px; font-weight:700; }.quick-buttons button { border:1px solid #d6c784; border-radius:999px; background:#fff9df; padding:5px 8px; cursor:pointer; }.mark-calculation { margin:10px 0 0; color:#2a6246; font-weight:700; font-size:13px; }.color-dot { display:inline-block; width:16px; height:16px; border-radius:50%; border:1px solid #778; vertical-align:middle; }
 .scale-card,.measurement-list { margin-top:18px; padding:16px; border:1px solid #bdd8ea; border-radius:12px; background:#f7fbff; }.scale-card .manual-spec-heading,.measurement-list .manual-spec-heading { margin-top:0; }.scale-actions { display:flex; gap:8px; align-items:end; }.scale-actions label { display:grid; gap:4px; font-size:12px; font-weight:700; color:#52645a; }.scale-actions input { width:150px; border:1px solid #cbd8d0; border-radius:6px; padding:7px; }.quick-buttons button.active { background:#dceffd; border-color:#4d8fba; }.measurement-row { display:flex; gap:10px; align-items:center; padding:9px 0; border-bottom:1px solid #dce7ef; }.measurement-row > button:first-child { border:0; background:transparent; color:#1d4f72; font-weight:700; cursor:pointer; text-align:left; }.measurement-row span { color:#526f60; font-size:13px; }.measurement-line,.measurement-draft { fill:none; stroke-width:4px; stroke-linejoin:round; }.measurement-draft { stroke:#f59e0b; stroke-dasharray:8 5; }.scale-line { stroke:#ec4899; stroke-width:4px; stroke-dasharray:10 6; }
 .preset-card,.preset-summary { margin-top:18px; padding:16px; border:1px solid #c9d8f0; border-radius:12px; background:#fbfcff; }.preset-card .manual-spec-heading { margin-top:0; }.preset-buttons { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }.preset-buttons button { display:flex; align-items:center; gap:6px; border:2px solid #94a3b8; border-radius:8px; background:#fff; padding:8px 10px; cursor:pointer; font-weight:700; }.preset-buttons button.active { background:#eaf4ff; box-shadow:0 0 0 2px #60a5fa; }.preset-buttons i,.preset-summary i { display:inline-block; width:12px; height:12px; border-radius:50%; }.preset-buttons small { color:#64748b; }.preset-editor { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)) auto auto; gap:8px; align-items:end; margin-top:14px; }.preset-editor label { display:grid; gap:4px; color:#52645a; font-size:11px; font-weight:700; }.preset-editor input,.preset-editor select,.preset-apply select { min-width:0; border:1px solid #cbd8d0; border-radius:6px; padding:7px; background:#fff; }.preset-manage { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }.preset-manage span { display:flex; align-items:center; gap:5px; padding:6px 8px; border-radius:7px; background:#f1f5f9; font-size:12px; }.preset-manage button { border:0; background:transparent; color:#2563eb; cursor:pointer; }.preset-manage .danger-text { color:#b91c1c; }.preset-summary { display:grid; gap:7px; color:#334155; font-size:13px; }.preset-summary div { display:flex; align-items:center; gap:6px; }.preset-apply { margin:10px 0 0; color:#36556e; font-size:13px; } @media (max-width:850px) { .preset-editor { grid-template-columns:repeat(2,minmax(0,1fr)); } } @media (max-width:500px) { .preset-editor { grid-template-columns:1fr; } }
+.review-board { margin-top:18px; padding:16px; border:1px solid #d8c6ed; border-radius:12px; background:#fcfaff; }.review-board .manual-spec-heading { margin-top:0; }.review-filters { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }.review-filters button { border:1px solid #cfc4dc; border-radius:999px; background:#fff; padding:6px 9px; cursor:pointer; }.review-filters button.active { background:#eee7f8; border-color:#8b5cb7; }.review-zone-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 0; border-top:1px solid #e5def0; font-size:13px; }.review-zone-row > button:first-child { border:0; background:transparent; color:#5b337e; font-weight:800; cursor:pointer; }.review-zone-row label { display:flex; gap:4px; align-items:center; font-size:12px; }.review-zone-row input,.review-zone-row select { border:1px solid #cfc4dc; border-radius:6px; padding:5px; background:#fff; }.zone-warning { color:#a64d17; font-weight:700; }.hold-block { display:block; margin-top:12px; color:#5b4a69; font-size:13px; }
 </style>
