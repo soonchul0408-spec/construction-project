@@ -110,6 +110,7 @@ const repositioningMarkId = ref('')
 const dragStart = ref<{ x: number; y: number } | null>(null)
 const draftRect = ref<{ x: number; y: number; width: number; height: number } | null>(null)
 const isCompact = ref(false)
+const updateCompactMode = () => { isCompact.value = window.matchMedia('(max-width: 700px), (pointer: coarse)').matches }
 let pdfDocument: Awaited<ReturnType<typeof pdfjsLib.getDocument>> | null = null
 let renderTask: { cancel: () => void } | null = null
 let saveTimer: ReturnType<typeof setTimeout> | null = null
@@ -605,13 +606,13 @@ function downloadReviewReport() {
 
 watch([pageNumber, zoom], () => void nextTick(renderPage))
 watch(drawings, schedulePersist, { deep: true })
-onMounted(() => { isCompact.value = window.matchMedia('(max-width: 700px), (pointer: coarse)').matches; void loadDrawings(); void loadLocalTestManifest() })
-onBeforeUnmount(() => { pdfDocument?.destroy(); renderTask?.cancel(); if (saveTimer) clearTimeout(saveTimer); blobUrls.forEach((url) => URL.revokeObjectURL(url)) })
+onMounted(() => { updateCompactMode(); window.addEventListener('resize', updateCompactMode); void loadDrawings(); void loadLocalTestManifest() })
+onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode); pdfDocument?.destroy(); renderTask?.cancel(); if (saveTimer) clearTimeout(saveTimer); blobUrls.forEach((url) => URL.revokeObjectURL(url)) })
 </script>
 
 <template>
   <section class="manual-workspace panel-card" aria-labelledby="manual-pdf-title">
-    <div class="panel-heading"><div><span class="panel-kicker">1차 구현 테스트</span><h2 id="manual-pdf-title">수동 PDF 검토·자재 산출</h2><p>PDF 원본과 입력값은 이 브라우저의 IndexedDB에만 저장됩니다. 자동 판독, 3D 생성, 발주 전송은 추후 연동입니다.</p></div><span class="manual-safe-badge">서버 업로드 없음</span></div>
+    <div class="panel-heading"><div><span class="panel-kicker">1차 구현 테스트</span><h2 id="manual-pdf-title">수동 PDF 검토·자재 산출</h2><p>PDF 원본과 입력값은 이 브라우저의 IndexedDB에만 저장됩니다. 수동 마킹·산출과 보조 분석은 로컬에서 처리하며, 실제 발주 전송은 추후 연동입니다.</p></div><span class="manual-safe-badge">서버 업로드 없음</span></div>
     <div class="manual-upload-row"><input ref="fileInput" class="visually-hidden" type="file" accept="application/pdf,.pdf" multiple @change="onInput"><button type="button" class="primary-button" @click="fileInput?.click()">PDF 여러 개 추가</button><small>PDF만 · 파일당 50MB 이하 · 새로고침 후에도 유지</small></div>
     <section v-if="localTestManifest" class="local-test-manifest"><div><span class="panel-kicker">로컬 개발 전용 테스트 프로젝트</span><h3>{{ localTestManifest.projectName }}</h3><p>아래 목록은 이 Mac의 파일명·용량만 표시합니다. 원본은 선택 전까지 브라우저가 읽지 않으며 GitHub에 포함되지 않습니다.</p></div><ol><li v-for="drawing in localTestManifest.drawings" :key="drawing.name"><b>{{ drawing.name }}</b><span>{{ drawing.kind ? kindLabels[drawing.kind] : '유형 미지정' }} · {{ formatSize(drawing.size) }}</span></li></ol></section>
     <p v-if="message" class="manual-message">{{ message }}</p>
