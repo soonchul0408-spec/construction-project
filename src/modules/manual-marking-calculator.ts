@@ -23,6 +23,21 @@ export interface PageScale {
   normalizedPxPerMm: number
 }
 
+export interface PresetSnapshot {
+  presetId: string
+  presetName: string
+  material: string
+  heightMm: number
+  effectiveWidthMm: number
+  color: string
+  status: '검토 필요' | '확인 완료'
+}
+
+/** Copy values so later preset edits/deletes never mutate completed markings. */
+export function snapshotPreset(preset: PresetSnapshot): PresetSnapshot {
+  return { ...preset }
+}
+
 const distance = (a: MeasurementPoint, b: MeasurementPoint) => Math.hypot(a.x - b.x, a.y - b.y)
 
 export function createPageScale(start: MeasurementPoint, end: MeasurementPoint, referenceMm: number): PageScale | null {

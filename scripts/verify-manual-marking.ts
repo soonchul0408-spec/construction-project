@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm } from '../src/modules/manual-marking-calculator.ts'
+import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, snapshotPreset } from '../src/modules/manual-marking-calculator.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -17,4 +17,10 @@ assert.equal(createPageScale({ x: 0, y: 0 }, { x: 0, y: 0 }, 6000), null, '길�
 assert.equal(createPageScale({ x: 0, y: 0 }, { x: .6, y: 0 }, -1), null, '음수 기준 치수는 거부합니다.')
 const invalidOpening = calculateManualMarking({ lengthM: 1, heightMm: 1000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(invalidOpening.ready, false, '벽체보다 큰 개구부는 산출에서 제외합니다.')
+const preset = { presetId: 'panel-3m', presetName: '외벽 3m', material: '샌드위치패널 75T', heightMm: 3000, effectiveWidthMm: 1000, color: '#0f766e', status: '확인 완료' as const }
+const repeated = [snapshotPreset(preset), snapshotPreset(preset), snapshotPreset(preset)]
+assert.equal(repeated.length, 3, '프리셋 하나로 벽체 3개에 연속 적용합니다.')
+assert.equal(repeated.reduce((sum, item) => sum + calculateManualMarking({ lengthM: 10, heightMm: item.heightMm, openingAreaM2: 0, effectiveWidthMm: item.effectiveWidthMm, status: item.status }).netAreaM2, 0), 90, '프리셋별 3개 벽체 총면적을 합산합니다.')
+preset.material = '수정된 자재'
+assert.equal(repeated[0].material, '샌드위치패널 75T', '프리셋 수정 후에도 기존 마킹 스냅샷은 유지합니다.')
 console.log('Manual marking calculation verification passed.')
