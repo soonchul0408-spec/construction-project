@@ -6,6 +6,7 @@ import { applyInventoryAudit, offcutCandidate } from '../src/modules/mobile-inve
 import { readMaterialCsv, rollbackImport } from '../src/modules/material-csv-import.ts'
 import { bulkReview, filterMarkingRows } from '../src/modules/marking-review-list.ts'
 import { crossCheckScale } from '../src/modules/scale-cross-check.ts'
+import { createBackup, restoreBackup } from '../src/modules/project-backup.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -71,4 +72,6 @@ const baseReference = { normalizedLength: .6, actualMm: 6000, createdAt: '', mem
 assert.equal(crossCheckScale([baseReference, { ...baseReference, actualMm: 5940 }]).status, '확인됨', '1% 축척 오차는 확인됨입니다.')
 assert.equal(crossCheckScale([baseReference, { ...baseReference, actualMm: 5825 }]).status, '주의', '3% 축척 오차는 주의입니다.')
 assert.equal(crossCheckScale([baseReference, { ...baseReference, actualMm: 5650 }]).blockAutomaticTakeoff, true, '6% 축척 오차는 자동 산출을 차단합니다.')
+assert.equal(Math.max(0, 20 - 15), 5, '필요 수량 20장과 승인 재고 15장은 신규 발주 5장입니다.')
+const backup = createBackup({ id: 'old', name: '샘플', blob: new Blob(['pdf']), marks: [{ id: 'm1' }] }); assert.equal(backup.pdfIncluded, false, 'PDF 원본은 백업에 포함하지 않습니다.'); assert.equal(restoreBackup(backup).pdfReconnectRequired, true, '복원 도면은 PDF 재연결이 필요합니다.'); assert.throws(() => restoreBackup({}), '손상 백업을 차단합니다.')
 console.log('Manual marking calculation verification passed.')

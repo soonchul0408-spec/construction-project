@@ -413,6 +413,7 @@ export interface Wall {
   heightSourceDimensionId?: string
   conflicts?: DimensionConflict[]
   validationStatus?: ConsistencyStatus
+  manualSource?: { drawingId: string; measurementId: string; versionNumber: number; pageNumber: number; material: string; stale: boolean }
 }
 
 export interface VectorSegment {
@@ -1037,6 +1038,55 @@ export interface BuildingGeometry {
   blockedWallIds?: string[]
 }
 
+/**
+ * Canonical, serializable record of a drawing that originated in the legacy
+ * manual PDF workspace. PDF Blobs deliberately remain in the legacy IndexedDB
+ * only: localStorage is the project source of truth for review data, while the
+ * old store is retained as a non-destructive preview-file archive.
+ */
+export interface ManualProjectDrawing {
+  id: string
+  name: string
+  size: number
+  uploadedAt: string
+  kind: 'floor' | 'elevation' | 'section' | 'detail' | 'other'
+  status: '검토 준비' | '검토 중'
+  drawingGroup: string
+  versionNumber: number
+  isCurrentVersion: boolean
+  migrationStatus: 'imported-review' | 'migration-review'
+  legacyStorage: 'indexeddb:drawing-manual-review-v1'
+  pages: number[]
+  marks: Array<Record<string, unknown> & { id: string; status: '검토 필요' | '확인 완료' }>
+  measurements: Array<Record<string, unknown> & {
+    id: string
+    kind: 'wall' | 'area' | 'opening'
+    name: string
+    status: '검토 필요' | '확인 완료'
+    pageNumber: number
+    heightMm?: number
+    manualLengthM?: number
+    material?: string
+    openingWidthMm?: number
+    openingHeightMm?: number
+    openingQuantity?: number
+    linkedWallId?: string
+    points?: Array<{ x: number; y: number }>
+    openingIds?: string[]
+    promotionStatus?: 'not-included' | 'eligible' | 'promoted' | 'blocked' | 'recalculation-required'
+    promotionReasons?: string[]
+  }>
+  reviewZones: Array<Record<string, unknown>>
+  specs: Array<Record<string, unknown>>
+}
+
+export interface ManualReviewState {
+  storage: 'project-localStorage'
+  migratedAt: string | null
+  legacyReadAt: string | null
+  drawings: ManualProjectDrawing[]
+}
+
 export interface ProjectState {
   id: string
   status: ProjectStatus
@@ -1059,6 +1109,8 @@ export interface ProjectState {
   model: BuildingGeometry
   optimization: OptimizationState
   consistencyValidation: ConsistencyValidation
+  /** Manual-workspace review records, migrated from IndexedDB without deleting it. */
+  manualReview: ManualReviewState
   restoredFromStorage: boolean
 }
 

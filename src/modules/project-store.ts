@@ -104,6 +104,14 @@ function migrateProject(project: ProjectState): ProjectState {
     consistencyValidation: project.consistencyValidation
       ? { ...emptyConsistencyValidation(), ...project.consistencyValidation, tolerances: { ...emptyConsistencyValidation().tolerances, ...project.consistencyValidation.tolerances } }
       : emptyConsistencyValidation(),
+    manualReview: project.manualReview
+      ? {
+          storage: 'project-localStorage',
+          migratedAt: project.manualReview.migratedAt || null,
+          legacyReadAt: project.manualReview.legacyReadAt || null,
+          drawings: project.manualReview.drawings || [],
+        }
+      : { storage: 'project-localStorage', migratedAt: null, legacyReadAt: null, drawings: [] },
     optimization: project.optimization
       ? {
           ...emptyOptimizationState(),

@@ -2,13 +2,15 @@
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs'
 import pdfWorker from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
-import type { BuildingGeometry, Evidence, Opening } from '../types/domain'
+import type { BuildingGeometry, Evidence, ManualProjectDrawing, Opening } from '../types/domain'
 import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, snapshotPreset, type MeasurementPoint, type PageScale } from '../modules/manual-marking-calculator'
 import { planWallMaterial, type PanelCatalogItem, type StockPiece } from '../modules/wall-material-layout'
 import { activateVersion } from '../modules/drawing-versioning'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker
 const Building3DViewer = defineAsyncComponent(() => import('./Building3DViewer.vue'))
+const props = defineProps<{ manualDrawings: ManualProjectDrawing[] }>()
+const emit = defineEmits<{ 'project-sync': [drawings: ManualProjectDrawing[], legacyReadAt: string] }>()
 
 type DrawingKind = 'floor' | 'elevation' | 'section' | 'detail' | 'other'
 type ReviewStatus = '검토 필요' | '확인 완료'
@@ -205,6 +207,42 @@ const reviewFilter = ref<'all' | 'unreviewed' | 'excluded' | 'height-missing'>('
 const versionCopySourceId = ref('')
 const undoStack = ref<string[]>([])
 const redoStack = ref<string[]>([])
+let applyingCanonical = false
+function projectDrawing(drawing: ManualDrawing): ManualProjectDrawing {
+  return {
+    id: drawing.id,
+    name: drawing.name,
+    size: drawing.size,
+    uploadedAt: drawing.uploadedAt,
+    kind: drawing.kind,
+    status: drawing.status,
+    drawingGroup: drawing.drawingGroup || drawing.name.replace(/\.[^.]+$/, ''),
+    versionNumber: drawing.versionNumber || 1,
+    isCurrentVersion: drawing.isCurrentVersion ?? true,
+    // Imported manual records never become an automatic procurement source.
+    migrationStatus: 'imported-review',
+    legacyStorage: 'indexeddb:drawing-manual-review-v1',
+    pages: [...new Set([...(drawing.marks || []).map((item) => item.pageNumber), ...(drawing.measurements || []).map((item) => item.pageNumber)])],
+    marks: (drawing.marks || []).map((item) => ({ ...item })),
+    measurements: (drawing.measurements || []).map((item) => ({ ...item, points: item.points.map((point) => ({ ...point })), openingIds: [...item.openingIds] })),
+    reviewZones: (drawing.reviewZones || []).map((item) => ({ ...item })),
+    specs: drawing.specs.map((item) => ({ ...item })),
+  }
+}
+function syncProjectState() {
+  emit('project-sync', drawings.value.map(projectDrawing), new Date().toISOString())
+}
+function applyProjectDrawing(target: ManualDrawing, source: ManualProjectDrawing) {
+  target.kind = source.kind
+  target.status = source.status
+  target.drawingGroup = source.drawingGroup
+  target.versionNumber = source.versionNumber
+  target.isCurrentVersion = source.isCurrentVersion
+  target.marks = source.marks.map((item) => ({ ...item })) as DrawingMark[]
+  target.measurements = source.measurements.map((item) => ({ ...item, points: Array.isArray(item.points) ? item.points.map((point) => ({ ...(point as MeasurementPoint) })) : [], openingIds: Array.isArray(item.openingIds) ? [...item.openingIds] as string[] : [] })) as DrawingMeasurement[]
+  target.reviewZones = source.reviewZones.map((item) => ({ ...item })) as ReviewZone[]
+  target.specs = source.specs.map((item) => ({ ...item })) as ManualSpec[]
+}
 function snapshotWork() { return selectedDrawing.value ? JSON.stringify({ marks: selectedDrawing.value.marks, measurements: selectedDrawing.value.measurements, reviewZones: selectedDrawing.value.reviewZones }) : '' }
 function recordUndo() { const snapshot = snapshotWork(); if (snapshot) { undoStack.value = [...undoStack.value.slice(-29), snapshot]; redoStack.value = [] } }
 function restoreWork(snapshot: string) { if (!selectedDrawing.value) return; const value = JSON.parse(snapshot) as { marks?: DrawingMark[]; measurements?: DrawingMeasurement[]; reviewZones?: ReviewZone[] }; selectedDrawing.value.marks = value.marks || []; selectedDrawing.value.measurements = value.measurements || []; selectedDrawing.value.reviewZones = value.reviewZones || []; schedulePersist(); void nextTick(renderPage) }
@@ -213,6 +251,10 @@ function redoWork() { const current = snapshotWork(); const next = redoStack.val
 const activePreset = computed(() => presets.value.find((preset) => preset.id === activePresetId.value) || null)
 const catalog = computed(() => selectedDrawing.value?.panelCatalog || [])
 const stock = computed(() => selectedDrawing.value?.panelStock || [])
+const inventoryDraft = ref({ catalogId: '', quantity: 0, approved: true })
+const inventoryNeeds = computed(() => catalog.value.map((item) => { const needed = wallPlans.value.filter((row) => row.wall.material === item.name && row.plan.ready).reduce((sum, row) => sum + row.plan.panelCount, 0); const approved = stock.value.filter((piece) => piece.catalogId === item.id && piece.approved).length; return { item, needed, approved, order: Math.max(0, needed - approved) } }))
+function addInventoryStock() { const drawing = selectedDrawing.value; const item = catalog.value.find((candidate) => candidate.id === inventoryDraft.value.catalogId); if (!drawing || !item || inventoryDraft.value.quantity < 0) return; drawing.panelStock ||= []; drawing.panelStock.push(...Array.from({ length: inventoryDraft.value.quantity }, () => ({ id: crypto.randomUUID(), catalogId: item.id, thicknessMm: item.thicknessMm, lengthMm: item.standardLengthMm, direction: item.direction, rotatable: false, approved: inventoryDraft.value.approved }))); inventoryDraft.value.quantity = 0; schedulePersist() }
+function removeInventoryStock(id: string) { if (!selectedDrawing.value) return; selectedDrawing.value.panelStock = selectedDrawing.value.panelStock?.filter((piece) => piece.id !== id) || []; schedulePersist() }
 const wallPlans = computed(() => (selectedDrawing.value?.measurements || []).filter((measurement) => measurement.kind === 'wall').map((wall) => {
   const net = calculateManualMarking({ lengthM: measurementLengthM(wall), heightMm: wall.heightMm, openingAreaM2: linkedOpeningArea(wall), effectiveWidthMm: wall.effectiveWidthMm, status: wall.status })
   const item = catalog.value.find((candidate) => candidate.name === wall.material)
@@ -413,6 +455,14 @@ async function loadDrawings() {
       reportInfo: drawing.reportInfo || { siteName: '', projectName: '', author: '', version: 'v1.0', lastPrintedAt: '' },
       drawingGroup: drawing.drawingGroup || drawing.name.replace(/\.[^.]+$/, ''), versionNumber: drawing.versionNumber || 1, versionMemo: drawing.versionMemo || '', changeReason: drawing.changeReason || '', isCurrentVersion: drawing.isCurrentVersion ?? true,
     })).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt))
+    // Prefer the canonical ProjectState review fields after the first
+    // migration; IndexedDB stays intact solely as the legacy PDF-Blob archive.
+    const canonical = new Map(props.manualDrawings.map((drawing) => [drawing.id, drawing]))
+    drawings.value.forEach((drawing) => {
+      const source = canonical.get(drawing.id)
+      if (source) applyProjectDrawing(drawing, source)
+    })
+    syncProjectState()
     if (drawings.value[0]) await selectDrawing(drawings.value[0].id)
   } catch {
     message.value = '브라우저 저장소를 열지 못했습니다. 개인정보 보호 모드에서는 저장이 제한될 수 있습니다.'
@@ -515,6 +565,7 @@ async function persist() {
       transaction.onerror = () => reject(transaction.error)
     })
     db.close()
+    syncProjectState()
   } catch {
     message.value = '입력값을 브라우저에 저장하지 못했습니다. 저장 공간을 확인하세요.'
   }
@@ -915,7 +966,16 @@ function printFieldReport() { reportInfo.value.lastPrintedAt = new Date().toISOS
 function activateDrawingVersion(copyMarks: boolean) { const drawing = selectedDrawing.value; if (!drawing) return; const source = copyMarks ? drawings.value.find((item) => item.id === versionCopySourceId.value) : undefined; const plain = drawings.value.map((item) => ({ id: item.id, group: item.drawingGroup || item.name, version: item.versionNumber || 1, current: Boolean(item.isCurrentVersion), marks: item.marks || [], printedAt: item.reportInfo?.lastPrintedAt })); const result = activateVersion(plain, drawing.id, source?.id); result.drawings.forEach((state) => { const target = drawings.value.find((item) => item.id === state.id); if (target) target.isCurrentVersion = state.current }); if (source) { drawing.marks = result.drawings.find((item) => item.id === drawing.id)?.marks || []; drawing.measurements = (source.measurements || []).map((item) => ({ ...item, status: '검토 필요', memo: `${item.memo ? `${item.memo} · ` : ''}이전 도면에서 가져온 값 / 재확인 필요` })); drawing.reviewZones = (source.reviewZones || []).map((item) => ({ ...item, id: crypto.randomUUID(), status: '마킹 중' })); } if (result.reprintRecommended) message.value = '도면 변경 이후 재출력 권장: 이전 버전의 발주 준비서를 다시 확인하세요.'; schedulePersist() }
 
 watch([pageNumber, zoom], () => void nextTick(renderPage))
-watch(drawings, schedulePersist, { deep: true })
+watch(drawings, () => { schedulePersist(); if (!applyingCanonical) syncProjectState() }, { deep: true })
+watch(() => props.manualDrawings, (canonical) => {
+  const byId = new Map(canonical.map((drawing) => [drawing.id, drawing]))
+  applyingCanonical = true
+  drawings.value.forEach((drawing) => {
+    const source = byId.get(drawing.id)
+    if (source) applyProjectDrawing(drawing, source)
+  })
+  void nextTick(() => { applyingCanonical = false })
+}, { deep: true })
 const stopContinuousMarking = (event: KeyboardEvent) => { if (event.metaKey && event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) redoWork(); else undoWork(); return } if (event.key === 'Escape') { measurementMode.value = 'none'; measurementDraft.value = []; activePresetId.value = ''; selectedMarkId.value = ''; selectedMeasurementId.value = ''; selectedZoneId.value = '' } }
 onMounted(() => { updateCompactMode(); window.addEventListener('resize', updateCompactMode); window.addEventListener('keydown', stopContinuousMarking); void loadDrawings(); void loadLocalTestManifest(); void loadPresets(); void loadOpeningPresets() })
 onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode); window.removeEventListener('keydown', stopContinuousMarking); pdfDocument?.destroy(); renderTask?.cancel(); if (saveTimer) clearTimeout(saveTimer); blobUrls.forEach((url) => URL.revokeObjectURL(url)) })
@@ -923,7 +983,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
 
 <template>
   <section class="manual-workspace panel-card" aria-labelledby="manual-pdf-title">
-    <div class="panel-heading"><div><span class="panel-kicker">1차 구현 테스트</span><h2 id="manual-pdf-title">수동 PDF 검토·자재 산출</h2><p>PDF 원본과 입력값은 이 브라우저의 IndexedDB에만 저장됩니다. 수동 마킹·산출과 보조 분석은 로컬에서 처리하며, 실제 발주 전송은 추후 연동입니다.</p></div><span class="manual-safe-badge">서버 업로드 없음</span></div>
+    <div class="panel-heading"><div><span class="panel-kicker">통합 이전 검토</span><h2 id="manual-pdf-title">수동 PDF 검토·자재 산출</h2><p>PDF 원본은 기존 IndexedDB에 보존하고, 마킹·벽체·개구부·검토 상태는 ProjectState로 동기화합니다. 이 작업공간의 독립 재고·CSV는 참고용이며 발주 기준이 아닙니다.</p></div><span class="manual-safe-badge">참고용 / 발주 기준 아님</span></div>
     <div class="manual-upload-row"><input ref="fileInput" class="visually-hidden" type="file" accept="application/pdf,.pdf" multiple @change="onInput"><button type="button" class="primary-button" @click="fileInput?.click()">PDF 여러 개 추가</button><small>PDF만 · 파일당 50MB 이하 · 새로고침 후에도 유지</small></div>
     <section v-if="localTestManifest" class="local-test-manifest"><div><span class="panel-kicker">로컬 개발 전용 테스트 프로젝트</span><h3>{{ localTestManifest.projectName }}</h3><p>아래 목록은 이 Mac의 파일명·용량만 표시합니다. 원본은 선택 전까지 브라우저가 읽지 않으며 GitHub에 포함되지 않습니다.</p></div><ol><li v-for="drawing in localTestManifest.drawings" :key="drawing.name"><b>{{ drawing.name }}</b><span>{{ drawing.kind ? kindLabels[drawing.kind] : '유형 미지정' }} · {{ formatSize(drawing.size) }}</span></li></ol></section>
     <p v-if="message" class="manual-message">{{ message }}</p>
@@ -959,11 +1019,12 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
         <div class="manual-spec-list"><article v-for="(spec, index) in selectedDrawing.specs" :key="spec.id" class="manual-spec"><div class="manual-spec-top"><b>{{ index + 1 }}번 {{ spec.origin === 'geometry-draft' ? '3D 계산 초안' : '수동 검토 항목' }}</b><button type="button" class="text-button danger-text" @click="removeSpec(spec.id)">삭제</button></div><div class="manual-spec-grid"><label>항목명<input v-model="spec.item" placeholder="예: 샌드위치패널"></label><label>규격<input v-model="spec.specification" placeholder="예: 75T"></label><label>단위<input v-model="spec.unit" placeholder="예: ㎡, 개, m"></label><label>수량<input v-model.number="spec.quantity" min="0" type="number"></label><label>단가(원)<input v-model.number="spec.unitPrice" min="0" type="number"></label><label>재고 수량<input v-model.number="spec.inventory" min="0" type="number"></label><label>신뢰도<select v-model="spec.confidence"><option>높음</option><option>중간</option><option>낮음</option></select></label><label>검토 상태<select v-model="spec.status"><option>검토 필요</option><option>확인 완료</option></select></label><label class="manual-wide">검토 메모<input v-model="spec.memo" placeholder="원본 페이지·치수 확인 내용"></label></div></article><p v-if="!selectedDrawing.specs.length" class="manual-empty">아직 사양 항목이 없습니다. ‘항목 추가’로 실제 도면의 값을 입력하세요.</p></div>
         <section class="manual-takeoff"><div class="manual-spec-heading"><div><h3>수동 자재 산출</h3><p>‘확인 완료’ 항목만 반영합니다. 단위가 다르면 별도 행으로 유지합니다.</p></div><strong>{{ formatWon(totalAmount) }}</strong></div><div v-if="takeoffRows.length" class="table-scroll"><table class="data-table"><thead><tr><th>항목</th><th>규격</th><th>단위</th><th>확인 수량</th><th>재고</th><th>부족</th><th>신규 발주</th><th>금액</th></tr></thead><tbody><tr v-for="row in takeoffRows" :key="`${row.item}-${row.specification}-${row.unit}`"><td>{{ row.item }}</td><td>{{ row.specification }}</td><td>{{ row.unit }}</td><td>{{ row.quantity }}</td><td>{{ row.inventory }}</td><td>{{ row.shortage }}</td><td>{{ row.order }}</td><td>{{ formatWon(row.amount) }}</td></tr></tbody></table></div><p v-else class="manual-empty">확인 완료된 사양 항목만 산출표에 표시됩니다.</p></section>
         <section class="material-layout"><div class="manual-spec-heading"><div><span class="panel-kicker">벽체별 자재 배치</span><h3>재고 우선 · 절단 계획 · 발주 준비</h3><p>승인된 재고만 제안에 반영하며 자동 차감·예약은 하지 않습니다.</p></div></div><div class="catalog-row" v-for="item in catalog" :key="item.id"><b>{{ item.name }}</b><span>{{ item.thicknessMm }}T · {{ item.effectiveWidthMm }}mm · {{ item.direction === 'vertical' ? '세로' : '가로' }} · 표준 {{ item.standardLengthMm }}mm · 여유 {{ item.cuttingAllowanceMm }}mm · {{ formatWon(item.unitPrice) }}</span></div><div v-for="row in wallPlans" :key="row.wall.id" class="wall-plan"><b>{{ row.wall.name }}</b><span v-if="row.plan.ready">{{ row.plan.panelCount }}장 · 필요 {{ row.plan.requiredLengthMm }}mm · 승인 재고 {{ row.plan.approvedStock }}장 · 신규 {{ row.plan.orderCount }}장 · 자투리/폐기 {{ row.plan.wasteMm }}mm · 재고 우선 {{ formatWon(row.plan.cost) }} / 신규 위주 {{ formatWon(row.plan.newOrderOnlyCost) }}</span><span v-else class="zone-warning">발주 제외: {{ row.plan.reason }}</span></div><p v-if="!wallPlans.length" class="manual-empty">확인 완료된 벽체에 자재명을 카탈로그 항목과 동일하게 지정하면 배치 계획을 만듭니다.</p><div v-if="orderPlans.length" class="order-ready"><b>신규 발주 준비</b><span>검토 통과 벽체 {{ orderPlans.length }}곳 · 신규 수량 {{ orderPlans.reduce((sum, row) => sum + row.plan.orderCount, 0) }}장 · 예상 금액 {{ formatWon(orderPlans.reduce((sum, row) => sum + row.plan.cost, 0)) }}</span></div></section>
-        <section class="print-card"><div class="manual-spec-heading"><div><span class="panel-kicker">현장 검토서·발주 준비서</span><h3>출력 및 CSV</h3><p>자동 확정 아님 / 현장 최종 확인 필요 · PDF 원본은 포함하지 않습니다.</p></div><button type="button" class="primary-button" @click="printFieldReport">인쇄 미리보기</button></div><div class="manual-spec-grid"><label>현장명<input v-model="reportInfo.siteName" @change="schedulePersist"></label><label>프로젝트명<input v-model="reportInfo.projectName" @change="schedulePersist"></label><label>작성자<input v-model="reportInfo.author" @change="schedulePersist"></label><label>버전<input v-model="reportInfo.version" @change="schedulePersist"></label></div><div class="quick-buttons"><button type="button" @click="downloadWallCsv">벽체별 산출 근거 CSV</button><button type="button" @click="downloadStockCsv">재고·자투리 CSV</button><button type="button" @click="downloadOrderCsv" :disabled="!orderPlans.length">신규 발주 CSV</button><button type="button" @click="downloadWarningsCsv">검토 필요·보류 CSV</button></div><p v-if="reportInfo.lastPrintedAt">마지막 출력: {{ formatDate(reportInfo.lastPrintedAt) }}</p></section>
+        <section class="print-card"><div class="manual-spec-heading"><div><span class="panel-kicker">현장 검토서 · 참고용</span><h3>출력 및 CSV</h3><p>발주 기준 아님 · 자동 확정 아님 · PDF 원본은 포함하지 않습니다.</p></div><button type="button" class="primary-button" @click="printFieldReport">참고용 인쇄 미리보기</button></div><div class="manual-spec-grid"><label>현장명<input v-model="reportInfo.siteName" @change="schedulePersist"></label><label>프로젝트명<input v-model="reportInfo.projectName" @change="schedulePersist"></label><label>작성자<input v-model="reportInfo.author" @change="schedulePersist"></label><label>버전<input v-model="reportInfo.version" @change="schedulePersist"></label></div><div class="quick-buttons"><button type="button" @click="downloadWallCsv">참고용 벽체 CSV</button><button type="button" @click="downloadStockCsv">참고용 재고 CSV</button><button type="button" @click="downloadOrderCsv" :disabled="!orderPlans.length">참고용 신규 수량 CSV</button><button type="button" @click="downloadWarningsCsv">검토 필요·보류 CSV</button></div><p v-if="reportInfo.lastPrintedAt">마지막 출력: {{ formatDate(reportInfo.lastPrintedAt) }}</p></section>
         <section class="preflight-card"><div class="manual-spec-heading"><div><span class="panel-kicker">발주 전 확인</span><h3>검토 상태와 보고서</h3><p>PDF 원본은 포함하지 않고 이 브라우저의 입력·검토 결과만 내보냅니다.</p></div><button type="button" class="outline-button" @click="downloadReviewReport">검토 보고서 CSV 저장</button></div><div class="preflight-summary"><span>도면 {{ projectSummary.drawingCount }}장</span><span>유형 확인 {{ projectSummary.classifiedCount }}장</span><span>확인 완료 항목 {{ projectSummary.confirmedSpecCount }}건</span><span>검토 필요 항목 {{ projectSummary.pendingSpecCount }}건</span></div><ul v-if="preflightIssues.length" class="preflight-issues"><li v-for="issue in preflightIssues" :key="issue">{{ issue }}</li></ul><p v-else class="preflight-ready">현재 선택 도면은 이 화면에서 관리하는 확인 항목을 모두 통과했습니다. 실제 발주 전에는 원본 도면·현장 조건·단가를 별도로 확인하세요.</p></section>
       </div>
     </div>
   </section>
+  <section v-if="selectedDrawing" class="inventory-panel"><h3>현장 재고 · 참고용 / 발주 기준 아님</h3><p>이 독립 재고는 ProjectState 재고·절단·발주 수량에 반영되지 않습니다.</p><select v-model="inventoryDraft.catalogId"><option value="">자재 선택</option><option v-for="item in catalog" :key="item.id" :value="item.id">{{ item.name }}</option></select><input v-model.number="inventoryDraft.quantity" min="0" type="number" placeholder="보유 수량"><label><input v-model="inventoryDraft.approved" type="checkbox"> 승인 재고</label><button type="button" @click="addInventoryStock">재고 추가</button><div v-for="row in inventoryNeeds" :key="row.item.id">{{ row.item.name }} · 필요 {{ row.needed }}장 / 승인 재고 {{ row.approved }}장 / 신규 발주 {{ row.order }}장</div><div v-for="piece in stock" :key="piece.id"><label><input v-model="piece.approved" type="checkbox" @change="schedulePersist"> 승인</label> {{ catalog.find((item) => item.id === piece.catalogId)?.name }} · <input v-model.number="piece.lengthMm" min="1" type="number" @change="schedulePersist">mm <button type="button" @click="removeInventoryStock(piece.id)">삭제</button></div></section>
 </template>
 
 <style scoped>
@@ -977,4 +1038,5 @@ onBeforeUnmount(() => { window.removeEventListener('resize', updateCompactMode);
 .material-layout { margin-top:20px; padding:16px; border:1px solid #b9d7cc; border-radius:12px; background:#f7fcf9; }.material-layout .manual-spec-heading { margin-top:0; }.catalog-row,.wall-plan,.order-ready { display:flex; gap:10px; flex-wrap:wrap; padding:9px 0; border-top:1px solid #dceae2; font-size:13px; }.catalog-row span,.wall-plan span { color:#456156; }.order-ready { margin-top:10px; padding:10px; border-radius:8px; background:#e0f2e7; color:#185d3c; border:0; }
 .print-card { margin-top:20px; padding:16px; border:1px solid #b9d3e8; border-radius:12px; background:#f8fcff; }.print-card .manual-spec-heading { margin-top:0; } @media print { .manual-upload-row,.manual-list,.manual-toolbar,.preset-card,.opening-card,.review-board,.scale-card button,.quick-buttons,.outline-button,.primary-button,.text-button { display:none !important; }.manual-layout { display:block; }.manual-content { width:100%; }.pdf-canvas-wrap { break-inside:avoid; background:white; }.material-layout,.print-card,.preflight-card,.marking-summary { break-inside:avoid; border-color:#aaa; }.data-table { font-size:10px; } }
 .version-card { margin-top:16px; padding:16px; border:1px solid #d7c7a1; border-radius:12px; background:#fffdf7; }.version-card .manual-spec-heading { margin-top:0; }
+.inventory-panel { margin:20px; padding:16px; border:1px solid #9bc8b0; border-radius:12px; background:#f3fbf6; display:grid; gap:9px; }.inventory-panel select,.inventory-panel input { border:1px solid #b8d2c1; border-radius:6px; padding:7px; }.inventory-panel button { width:max-content; border:1px solid #5b9572; border-radius:6px; background:#fff; padding:6px 9px; cursor:pointer; }
 </style>

@@ -44,6 +44,8 @@ import {
 import { assessProjectWorkflow, statusForAnalysisStage } from './modules/project-workflow'
 import { emptyConsistencyValidation, validateConsistency } from './modules/consistency-validator'
 import { clearProject, loadProject, saveProject } from './modules/project-store'
+import { emptyManualReview, mergeManualReview } from './modules/manual-review-state'
+import { promotedManualWall, promotionReasons } from './modules/manual-wall-promotion'
 import {
   downloadCsv,
   downloadCuttingMembersCsv,
@@ -81,6 +83,7 @@ import type {
   OwnedMaterial,
   MaterialCatalogItem,
   MaterialSettings,
+  ManualProjectDrawing,
   OptimizationReviewItem,
   ScrapPiece,
   ProjectStatus,
@@ -139,6 +142,10 @@ function makeProject(): ProjectState {
     },
     optimization: emptyOptimizationState(),
     consistencyValidation: emptyConsistencyValidation(),
+    // ProjectState/localStorage is the canonical source for all review data.
+    // Legacy manual PDF blobs remain in IndexedDB only for preview and are not
+    // deleted during migration.
+    manualReview: emptyManualReview(),
     restoredFromStorage: false,
   }
 }
@@ -146,6 +153,11 @@ function makeProject(): ProjectState {
 const project = ref<ProjectState>(makeProject())
 const fileInput = ref<HTMLInputElement | null>(null)
 const sourceFiles = new Map<string, File>()
+const manualReviewSummary = computed(() => ({
+  drawings: project.value.manualReview.drawings.length,
+  walls: project.value.manualReview.drawings.reduce((sum, drawing) => sum + drawing.measurements.filter((item) => item.kind === 'wall').length, 0),
+  openings: project.value.manualReview.drawings.reduce((sum, drawing) => sum + drawing.measurements.filter((item) => item.kind === 'opening').length, 0),
+}))
 type WorkflowSection = 'upload' | 'analysis' | 'model' | 'takeoff' | 'optimization'
 
 const isDragging = ref(false)
@@ -503,6 +515,34 @@ function setNotice(message: string) {
   window.setTimeout(() => {
     if (notice.value === message) notice.value = ''
   }, 5000)
+}
+
+function syncManualReview(drawings: ManualProjectDrawing[], legacyReadAt: string) {
+  project.value.manualReview = mergeManualReview(project.value.manualReview, drawings, legacyReadAt)
+  project.value.updatedAt = new Date().toISOString()
+  saveProject(project.value)
+}
+
+function updateManualReviewStatus(drawingId: string, measurementId: string, status: '검토 필요' | '확인 완료') {
+  const drawing = project.value.manualReview.drawings.find((item) => item.id === drawingId)
+  const measurement = drawing?.measurements.find((item) => item.id === measurementId)
+  if (!drawing || !measurement) return
+  measurement.status = status
+  drawing.migrationStatus = 'migration-review'
+  project.value.updatedAt = new Date().toISOString()
+  saveProject(project.value)
+}
+
+function promoteManualWall(drawingId: string, measurementId: string) {
+  const drawing = project.value.manualReview.drawings.find((item) => item.id === drawingId)
+  const measurement = drawing?.measurements.find((item) => item.id === measurementId && item.kind === 'wall')
+  if (!drawing || !measurement) return
+  const reasons = promotionReasons(drawing, measurement)
+  measurement.promotionReasons = reasons
+  measurement.promotionStatus = reasons.length ? 'blocked' : 'promoted'
+  resetWorkflow('수동 벽체 승격이 변경되어 기존 산출을 재계산해야 합니다.')
+  recompute()
+  saveProject(project.value)
 }
 
 function setProjectStatus(status: ProjectStatus, message = PROJECT_STATUS_DESCRIPTIONS[status]) {
@@ -1422,7 +1462,11 @@ function recompute() {
   })
   const levelDimensions = deriveLevelHeightDimensions(dimensions)
   project.value.dimensions = [...dimensions, ...levelDimensions]
-  project.value.walls = buildWalls(project.value.files, project.value.dimensions)
+  const automaticWalls = buildWalls(project.value.files, project.value.dimensions)
+  const manualWalls = project.value.manualReview.drawings.flatMap((drawing) => drawing.measurements
+    .filter((measurement) => measurement.kind === 'wall' && measurement.promotionStatus === 'promoted')
+    .map((measurement) => promotedManualWall(drawing, measurement.id)).filter((wall): wall is NonNullable<typeof wall> => Boolean(wall)))
+  project.value.walls = [...automaticWalls, ...manualWalls]
   const conflictDimensionIds = new Set(project.value.walls.flatMap((wall) => (wall.conflicts || []).flatMap((conflict) => conflict.values.map((value) => value.dimensionId))))
   if (conflictDimensionIds.size) {
     project.value.dimensions = project.value.dimensions.map((dimension) => conflictDimensionIds.has(dimension.id) && !dimension.userEdited
@@ -2308,7 +2352,27 @@ onMounted(() => {
           </div>
           <div class="upload-guidance"><span class="lightbulb">✦</span><span><b>평면도·입면도·단면도를 함께 올리면</b> 높이와 3차원 모델 정확도가 올라갑니다.</span><small class="future-format-note">캐드 도면(DWG·DXF)·건물 모델(IFC) 연결 구조 준비 · 현재 자동 분석 불가</small></div>
 
-          <ManualPdfReviewWorkspace />
+          <section class="manual-source-notice panel-card">
+            <strong>현재 프로젝트 데이터 원천: ProjectState · 브라우저 localStorage</strong>
+            <span>수동 PDF 원본은 기존 IndexedDB에 보존하며, 마킹·벽체·개구부·검토 상태는 이 프로젝트에 이전해 동기화합니다. 수동 작업공간의 재고·발주 CSV는 참고용이며 발주 기준이 아닙니다.</span>
+            <small>이전 수동 도면 {{ manualReviewSummary.drawings }}개 · 벽체 {{ manualReviewSummary.walls }}개 · 개구부 {{ manualReviewSummary.openings }}개</small>
+          </section>
+          <ManualPdfReviewWorkspace :manual-drawings="project.manualReview.drawings" @project-sync="syncManualReview" />
+
+          <section v-if="project.manualReview.drawings.length" class="manual-project-list panel-card">
+            <div class="panel-heading"><div><span class="panel-kicker">통합 수동 검토 데이터</span><h3>프로젝트 도면·벽체·개구부 목록</h3></div><span class="review-pill review">이전 검토 필요</span></div>
+            <p>수동 마킹은 ProjectState에 저장되어 양쪽 화면에서 같은 검토 상태를 사용합니다. 자동 산출·재고·발주 수량에는 반영하지 않습니다.</p>
+            <article v-for="drawing in project.manualReview.drawings" :key="drawing.id" class="manual-project-drawing">
+              <strong>{{ drawing.name }} · {{ drawing.drawingGroup }} v{{ drawing.versionNumber }}</strong>
+              <small>{{ drawing.isCurrentVersion ? '현재 수동 버전' : '이전 수동 버전' }} · IndexedDB 원본 보존 · {{ drawing.migrationStatus === 'migration-review' ? '이전 검토 필요' : '이전됨 · 검토 필요' }}</small>
+              <div v-for="measurement in drawing.measurements.filter((item) => item.kind === 'wall' || item.kind === 'opening')" :key="measurement.id" class="manual-project-row">
+                <span>{{ measurement.kind === 'wall' ? '벽체' : '개구부' }} · {{ measurement.name }} · {{ measurement.kind === 'wall' ? `${measurement.heightMm || '높이 미입력'}mm` : `${measurement.openingWidthMm || '폭 미입력'}×${measurement.openingHeightMm || '높이 미입력'}mm` }}</span>
+                <select :value="measurement.status" @change="updateManualReviewStatus(drawing.id, measurement.id, ($event.target as HTMLSelectElement).value as '검토 필요' | '확인 완료')"><option>검토 필요</option><option>확인 완료</option></select>
+                <button v-if="measurement.kind === 'wall'" type="button" class="outline-button" @click="promoteManualWall(drawing.id, measurement.id)">메인 산출에 반영</button>
+                <small v-if="measurement.kind === 'wall'">{{ measurement.promotionStatus === 'promoted' ? '승격됨 · 재산출 필요' : measurement.promotionReasons?.join(' · ') || '검토 후 승격 가능' }}</small>
+              </div>
+            </article>
+          </section>
 
           <div v-if="project.files.length" class="file-list" aria-live="polite">
             <div class="file-list-heading"><span>올린 파일 <b>{{ project.files.length }}개</b></span><button type="button" class="text-button" :aria-expanded="showFileList" aria-controls="uploaded-file-list" @click="showFileList = !showFileList">{{ showFileList ? '파일 목록 닫기' : '파일 목록 자세히 보기' }}</button><span class="analysis-pulse" :class="{ active: isAnalyzing }"><i /> {{ isAnalyzing ? '분석 진행 중' : '분석 상태 확인' }}</span></div>
