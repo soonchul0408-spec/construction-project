@@ -3,6 +3,7 @@ import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLength
 import { planWallMaterial } from '../src/modules/wall-material-layout.ts'
 import { activateVersion } from '../src/modules/drawing-versioning.ts'
 import { applyInventoryAudit, offcutCandidate } from '../src/modules/mobile-inventory-audit.ts'
+import { readMaterialCsv, rollbackImport } from '../src/modules/material-csv-import.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -56,4 +57,9 @@ assert.equal(audit.applied && audit.next.appliedQty, 15, '장부 20장에서 실
 assert.equal(applyInventoryAudit({ ledgerQty: 20, actualDraftQty: 2, appliedQty: 20, reservedQty: 3, reason: '' }).applied, false, '예약 수량보다 낮은 실사는 경고합니다.')
 assert.equal(offcutCandidate({ id: 'ok', material: '판넬', thicknessMm: 75, widthMm: 1000, lengthMm: 3100, quantity: 1, grain: 'vertical', location: 'A', photoNote: false, approved: true }, '판넬', 75, 1000, 3050, 'vertical'), '사용 가능', '조건 일치 승인 자투리는 후보입니다.')
 assert.equal(offcutCandidate({ id: 'bad', material: '판넬', thicknessMm: 50, widthMm: 1000, lengthMm: 3100, quantity: 1, grain: 'vertical', location: 'A', photoNote: false, approved: true }, '판넬', 75, 1000, 3050, 'vertical'), '조건 불일치', '두께 불일치 자투리는 제외합니다.')
+assert.equal(readMaterialCsv('자재코드,자재명,수량\nP75,판넬,20', 'inventory').errors.length, 0, '정상 재고 CSV를 미리보기로 읽습니다.')
+assert.ok(readMaterialCsv('자재명,수량\n,20', 'inventory').errors.some((error) => error.reason.includes('자재명')), '필수 자재명 누락을 표시합니다.')
+assert.ok(readMaterialCsv('자재코드,자재명,수량\nP1,판넬,1\nP1,판넬,1', 'inventory').errors.some((error) => error.reason.includes('중복')), '중복 자재를 표시합니다.')
+assert.ok(readMaterialCsv('자재명,수량\n판넬,-1', 'inventory').errors.some((error) => error.reason.includes('0 이상')), '음수 수량을 차단합니다.')
+const original = [{ name: '판넬', quantity: 20 }]; const restored = rollbackImport(original); restored[0].quantity = 15; assert.equal(original[0].quantity, 20, '가져오기 취소용 이전 데이터를 안전하게 복원합니다.')
 console.log('Manual marking calculation verification passed.')
