@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { calculateManualMarking, createPageScale, measuredAreaM2, measuredLengthMm, reviewZoneWarnings, snapshotPreset, validatedOpeningAreaM2 } from '../src/modules/manual-marking-calculator.ts'
 import { planWallMaterial } from '../src/modules/wall-material-layout.ts'
 import { activateVersion } from '../src/modules/drawing-versioning.ts'
+import { applyInventoryAudit, offcutCandidate } from '../src/modules/mobile-inventory-audit.ts'
 
 const sample = calculateManualMarking({ lengthM: 10, heightMm: 3000, openingAreaM2: 2, effectiveWidthMm: 1000, status: '확인 완료' })
 assert.equal(sample.grossAreaM2, 30, '10m × 3,000mm 벽체는 30㎡입니다.')
@@ -50,4 +51,9 @@ assert.equal(planWallMaterial({ lengthM: 10, heightMm: 3000, netAreaM2: 28, revi
 const versions = activateVersion([{ id: 'v1', group: '평면도', version: 1, current: true, printedAt: '2026-08-17', marks: [{ status: '확인 완료' as const, memo: '' }] }, { id: 'v2', group: '평면도', version: 2, current: false, marks: [] }], 'v2', 'v1')
 assert.equal(versions.drawings[1].marks[0].status, '검토 필요', '이전 버전 마킹 복사본은 재검토 필요입니다.')
 assert.equal(versions.reprintRecommended, true, '이전 도면 출력 후 버전 전환은 재출력 경고를 만듭니다.')
+const audit = applyInventoryAudit({ ledgerQty: 20, actualDraftQty: 15, appliedQty: 20, reservedQty: 3, reason: '현장 실사' }, '2026-08-17T00:00:00.000Z')
+assert.equal(audit.applied && audit.next.appliedQty, 15, '장부 20장에서 실제 15장 실사를 확인 반영합니다.')
+assert.equal(applyInventoryAudit({ ledgerQty: 20, actualDraftQty: 2, appliedQty: 20, reservedQty: 3, reason: '' }).applied, false, '예약 수량보다 낮은 실사는 경고합니다.')
+assert.equal(offcutCandidate({ id: 'ok', material: '판넬', thicknessMm: 75, widthMm: 1000, lengthMm: 3100, quantity: 1, grain: 'vertical', location: 'A', photoNote: false, approved: true }, '판넬', 75, 1000, 3050, 'vertical'), '사용 가능', '조건 일치 승인 자투리는 후보입니다.')
+assert.equal(offcutCandidate({ id: 'bad', material: '판넬', thicknessMm: 50, widthMm: 1000, lengthMm: 3100, quantity: 1, grain: 'vertical', location: 'A', photoNote: false, approved: true }, '판넬', 75, 1000, 3050, 'vertical'), '조건 불일치', '두께 불일치 자투리는 제외합니다.')
 console.log('Manual marking calculation verification passed.')
