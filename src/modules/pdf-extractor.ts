@@ -232,7 +232,11 @@ export function extractPdfVectorSegments(
 
 async function renderPage(page: any) {
   const unscaled = page.getViewport({ scale: 1 })
-  const scale = Math.min(1.6, Math.max(0.9, 1400 / unscaled.width))
+  // CAD-exported PDFs commonly contain outlined lettering instead of a text
+  // layer. Render the longest side at roughly 3,200px so local OCR can read
+  // small dimensions without sending a construction drawing to a server.
+  const longestSide = Math.max(unscaled.width, unscaled.height)
+  const scale = Math.min(3, Math.max(1, 3200 / Math.max(1, longestSide)))
   const viewport = page.getViewport({ scale })
   const canvas = document.createElement('canvas')
   canvas.width = Math.ceil(viewport.width)

@@ -177,6 +177,11 @@ interface RecognitionInput {
   scale?: number
 }
 
+interface OcrOrientation {
+  canvas: HTMLCanvasElement
+  rotation: 0 | 90 | 180 | 270
+}
+
 async function recognizeCanvases(inputs: RecognitionInput[], onProgress?: (progress: number) => void) {
   // Tesseract is loaded only when an image is uploaded so the first screen remains light.
   const { createWorker } = await import('tesseract.js')
@@ -221,18 +226,84 @@ async function recognizeCanvases(inputs: RecognitionInput[], onProgress?: (progr
   }
 }
 
+function rotateCanvas(source: HTMLCanvasElement, rotation: 90 | 180 | 270): HTMLCanvasElement {
+  const quarterTurn = rotation === 90 || rotation === 270
+  const canvas = document.createElement('canvas')
+  canvas.width = quarterTurn ? source.height : source.width
+  canvas.height = quarterTurn ? source.width : source.height
+  const context = canvas.getContext('2d', { willReadFrequently: true })
+  if (!context) throw new Error('회전 OCR용 캔버스를 만들지 못했습니다.')
+  if (rotation === 90) {
+    context.translate(canvas.width, 0)
+    context.rotate(Math.PI / 2)
+  } else if (rotation === 180) {
+    context.translate(canvas.width, canvas.height)
+    context.rotate(Math.PI)
+  } else {
+    context.translate(0, canvas.height)
+    context.rotate(-Math.PI / 2)
+  }
+  context.drawImage(source, 0, 0)
+  return canvas
+}
+
+function originalPoint(point: { x: number; y: number }, sourceWidth: number, sourceHeight: number, rotation: OcrOrientation['rotation']) {
+  if (rotation === 90) return { x: point.y, y: sourceHeight - point.x }
+  if (rotation === 180) return { x: sourceWidth - point.x, y: sourceHeight - point.y }
+  if (rotation === 270) return { x: sourceWidth - point.y, y: point.x }
+  return point
+}
+
+function mapWordsToOriginal(words: RecognizedWord[], sourceWidth: number, sourceHeight: number, rotation: OcrOrientation['rotation']) {
+  if (rotation === 0) return words
+  return words.map((word) => {
+    const corners = [
+      originalPoint({ x: word.bbox.x0, y: word.bbox.y0 }, sourceWidth, sourceHeight, rotation),
+      originalPoint({ x: word.bbox.x1, y: word.bbox.y0 }, sourceWidth, sourceHeight, rotation),
+      originalPoint({ x: word.bbox.x0, y: word.bbox.y1 }, sourceWidth, sourceHeight, rotation),
+      originalPoint({ x: word.bbox.x1, y: word.bbox.y1 }, sourceWidth, sourceHeight, rotation),
+    ]
+    return {
+      ...word,
+      bbox: {
+        x0: Math.max(0, Math.min(...corners.map((point) => point.x))),
+        y0: Math.max(0, Math.min(...corners.map((point) => point.y))),
+        x1: Math.min(sourceWidth, Math.max(...corners.map((point) => point.x))),
+        y1: Math.min(sourceHeight, Math.max(...corners.map((point) => point.y))),
+      },
+    }
+  })
+}
+
 export async function recognizeCanvas(canvas: HTMLCanvasElement, onProgress?: (progress: number) => void) {
-  let result = mergeRecognizedResults(await recognizeCanvases([{ canvas }], (progress) => onProgress?.(Math.round(progress * 0.55))))
+  // Architectural drawings are often plotted sideways. Try the original first,
+  // then select the best free local OCR orientation before splitting it into tiles.
+  const originalWidth = canvas.width
+  const originalHeight = canvas.height
+  let selected: OcrOrientation & { result: ReturnType<typeof mergeRecognizedResults> } = {
+    canvas,
+    rotation: 0,
+    result: mergeRecognizedResults(await recognizeCanvases([{ canvas }], (progress) => onProgress?.(Math.round(progress * 0.42)))),
+  }
+  if (ocrQuality(selected.result) < 1120) {
+    const rotations: Array<90 | 180 | 270> = [90, 180, 270]
+    for (const [index, rotation] of rotations.entries()) {
+      const rotated = rotateCanvas(canvas, rotation)
+      const result = mergeRecognizedResults(await recognizeCanvases([{ canvas: rotated }], (progress) => onProgress?.(42 + Math.round(index * 19 + progress * 0.19))))
+      if (ocrQuality(result) > ocrQuality(selected.result)) selected = { canvas: rotated, rotation, result }
+    }
+  }
+  let result = selected.result
   if (shouldRunTileOcr(result.text, result.words)) {
-    const tileResults = await recognizeCanvases(createTiles(canvas), (progress) => onProgress?.(55 + Math.round(progress * 0.3)))
+    const tileResults = await recognizeCanvases(createTiles(selected.canvas), (progress) => onProgress?.(80 + Math.round(progress * 0.12)))
     result = mergeRecognizedResults([result, ...tileResults])
   }
-  const focusTiles = createNumericFocusTiles(canvas, result.words)
+  const focusTiles = createNumericFocusTiles(selected.canvas, result.words)
   if (focusTiles.length) {
-    const focusResults = await recognizeCanvases(focusTiles, (progress) => onProgress?.(85 + Math.round(progress * 0.15)))
+    const focusResults = await recognizeCanvases(focusTiles, (progress) => onProgress?.(92 + Math.round(progress * 0.08)))
     result = mergeRecognizedResults([result, ...focusResults])
   }
-  return result
+  return { ...result, words: mapWordsToOriginal(result.words, originalWidth, originalHeight, selected.rotation) }
 }
 
 function mergeRecognizedResults(results: Array<{ text: string; confidence: number; words: RecognizedWord[] }>) {

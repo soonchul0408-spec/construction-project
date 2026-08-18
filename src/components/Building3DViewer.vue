@@ -63,9 +63,9 @@ function canCutOpening(opening: Opening, lengthMm: number, heightMm: number) {
 }
 
 function validationColor(status?: BuildingGeometry['walls'][number]['validationStatus']) {
-  if (status === '일부 검증 완료') return '#d39a35'
-  if (status === '확인 필요') return '#c44c5c'
-  if (status === '계산 불가' || status === '분석 실패') return '#87928c'
+  if (status === '일부 검증 완료') return '#174ea6'
+  if (status === '확인 필요') return '#bf1e2e'
+  if (status === '계산 불가' || status === '분석 실패') return '#6b6b6b'
   return null
 }
 
@@ -308,14 +308,14 @@ function addGround(model: BuildingGeometry, group: THREE.Group) {
   const groundSize = Math.max(bounds.size * 1.8, 12)
   const ground = new THREE.Mesh(
     new THREE.PlaneGeometry(groundSize, groundSize),
-    new THREE.MeshStandardMaterial({ color: '#edf4f0', roughness: 1 }),
+    new THREE.MeshStandardMaterial({ color: '#f2f2f2', roughness: 1 }),
   )
   ground.rotation.x = -Math.PI / 2
   ground.position.set(bounds.center.x, -0.004, bounds.center.z)
   ground.receiveShadow = true
   group.add(ground)
   const divisions = Math.min(40, Math.max(10, Math.round(groundSize)))
-  const grid = new THREE.GridHelper(groundSize, divisions, '#b7cbc1', '#d8e5df')
+  const grid = new THREE.GridHelper(groundSize, divisions, '#777777', '#d8d8d8')
   grid.position.set(bounds.center.x, 0, bounds.center.z)
   group.add(grid)
 }
@@ -439,7 +439,7 @@ function startRenderer() {
     const webglContext = probeCanvas.getContext('webgl2') || probeCanvas.getContext('webgl') || probeCanvas.getContext('experimental-webgl')
     if (!webglContext) throw new Error('브라우저가 3D 기능을 지원하지 않습니다. 브라우저 설정 또는 그래픽 가속을 확인하세요. 2D 도면과 표로 계속 확인할 수 있습니다.')
     scene = new THREE.Scene()
-    scene.background = new THREE.Color('#f3f8f5')
+    scene.background = new THREE.Color('#f6f6f6')
     camera = new THREE.PerspectiveCamera(42, 1, 0.01, 1000)
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
     renderer.shadowMap.enabled = true
@@ -456,14 +456,14 @@ function startRenderer() {
     controls.maxDistance = 10000
     controls.enablePan = true
 
-    const hemisphere = new THREE.HemisphereLight('#ffffff', '#aec3b8', 1.8)
+    const hemisphere = new THREE.HemisphereLight('#ffffff', '#8b8b8b', 1.8)
     scene.add(hemisphere)
     const keyLight = new THREE.DirectionalLight('#ffffff', 2.4)
     keyLight.position.set(30, 50, 25)
     keyLight.castShadow = true
     keyLight.shadow.mapSize.set(2048, 2048)
     scene.add(keyLight)
-    const fillLight = new THREE.DirectionalLight('#cce7ff', 0.8)
+    const fillLight = new THREE.DirectionalLight('#dce7ff', 0.8)
     fillLight.position.set(-25, 18, -20)
     scene.add(fillLight)
 

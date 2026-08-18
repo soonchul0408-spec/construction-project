@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 
+import DemoPresentation from './components/DemoPresentation.vue'
 import ConfidenceReviewPanel from './components/ConfidenceReviewPanel.vue'
 import ManualPdfReviewWorkspace from './components/ManualPdfReviewWorkspace.vue'
 import { analyzeCadFile } from './modules/cad-parser-adapter'
@@ -16,7 +17,6 @@ import {
   HEIGHT_DIAGNOSTIC_STAGE_LABELS,
   HEIGHT_DIAGNOSTIC_STATUS_LABELS,
 } from './modules/height-diagnostics'
-import { createTestBuildingGeometry } from './modules/test-building-model'
 import {
   createQueuedFile,
   extensionOf,
@@ -88,10 +88,9 @@ import type {
   ScrapPiece,
   ProjectStatus,
   ProjectState,
+  Wall,
 } from './types/domain'
 import { emptyOptimizationState } from './types/domain'
-
-const Building3DViewer = defineAsyncComponent(() => import('./components/Building3DViewer.vue'))
 
 const emptyCostSummary = (): CostSummary => ({
   rows: [],
@@ -158,24 +157,29 @@ const manualReviewSummary = computed(() => ({
   walls: project.value.manualReview.drawings.reduce((sum, drawing) => sum + drawing.measurements.filter((item) => item.kind === 'wall').length, 0),
   openings: project.value.manualReview.drawings.reduce((sum, drawing) => sum + drawing.measurements.filter((item) => item.kind === 'opening').length, 0),
 }))
-type WorkflowSection = 'upload' | 'analysis' | 'model' | 'takeoff' | 'optimization'
+type WorkflowSection = 'upload' | 'analysis' | 'takeoff' | 'optimization'
 
 const isDragging = ref(false)
 const isAnalyzing = ref(false)
-const isBuilding3D = ref(false)
 const isCalculating = ref(false)
 const isOptimizing = ref(false)
-const isWorkflowBusy = computed(() => isAnalyzing.value || isBuilding3D.value || isCalculating.value || isOptimizing.value)
+const isWorkflowBusy = computed(() => isAnalyzing.value || isCalculating.value || isOptimizing.value)
 const activeSection = ref<WorkflowSection>('upload')
 const selectedWallId = ref('')
 const selectedPageId = ref('')
 const selectedHeightCandidateId = ref('')
-const showTestModel = ref(false)
-const testBuildingModel = createTestBuildingGeometry()
 const notice = ref('')
+const demoOpinion = ref<'interested' | 'simpler' | ''>('')
+const demoMode = ref(false)
+const showStandaloneDemo = ref(new URLSearchParams(window.location.search).get('demo') === '1')
 const showAllDimensions = ref(false)
 const settingsDraft = reactive<MaterialSettings>({ ...DEFAULT_MATERIAL_SETTINGS })
 const settingsError = ref('')
+const quickEstimateDraft = reactive({
+  lengthMm: '',
+  widthMm: '',
+  heightMm: '',
+})
 const editingCatalogId = ref('')
 const catalogFormOpen = ref(false)
 const selectedOptimizationPlanId = ref('')
@@ -257,53 +261,6 @@ const activeDimensions = computed(() => {
 const lowerConfidenceCount = computed(() => drawingDimensions.value.filter((dimension) => dimension.confidence !== 'high').length)
 const summary = computed(() => summarizeTakeoffs(project.value.takeoffs))
 const showFileList = ref(false)
-const modelStatus = computed(() => {
-  if (showTestModel.value) return '테스트 모델'
-  if (project.value.status === 'building-3d') return '생성 중'
-  if (project.value.status === 'failed' && !project.value.model.isReady) return '분석 실패'
-  if (project.value.model.isReady && project.value.model.partial) return '부분 모델'
-  if (project.value.model.isReady) return '실제 분석 모델'
-  if (project.value.reviewItems.length || project.value.missingItems.length || project.value.status === 'needs-review') return '확인 필요'
-  return '3차원 생성 대기'
-})
-const modelDisplayMode = computed<'actual' | 'partial' | 'test' | 'failed' | 'review' | 'empty'>(() => {
-  if (showTestModel.value) return 'test'
-  if (project.value.status === 'failed' && !project.value.model.isReady) return 'failed'
-  if (project.value.model.isReady && project.value.model.partial) return 'partial'
-  if (project.value.model.isReady) return 'actual'
-  if (project.value.reviewItems.length || project.value.missingItems.length || project.value.status === 'needs-review') return 'review'
-  return 'empty'
-})
-const displayModel = computed(() => showTestModel.value ? testBuildingModel : project.value.model)
-const modelSourceLabel = computed(() => {
-  if (showTestModel.value) return '발주 계산에 사용하지 않음'
-  const names = project.value.files.filter((file) => file.pages.some((page) => ['floor-plan', 'elevation', 'section'].includes(page.kind))).map((file) => file.name)
-  if (!names.length) return '업로드한 설계도 없음'
-  return names.length > 2 ? `${names.slice(0, 2).join(', ')} 외 ${names.length - 2}개` : names.join(', ')
-})
-function openingNeedsReview(wall: ProjectState['walls'][number], opening: ProjectState['walls'][number]['openings'][number]) {
-  if (opening.conflict || opening.widthMm === null || opening.heightMm === null || opening.offsetMm === null) return true
-  if (opening.widthMm <= 0 || opening.heightMm <= 0 || opening.offsetMm < 0 || wall.lengthMm === null) return true
-  if (opening.offsetMm + opening.widthMm > wall.lengthMm) return true
-  if (opening.type !== 'door' && opening.sillHeightMm === null) return true
-  const sill = opening.type === 'door' ? 0 : opening.sillHeightMm || 0
-  return wall.heightMm === null || sill < 0 || sill + opening.heightMm > wall.heightMm
-}
-const modelSummary = computed(() => {
-  const model = displayModel.value
-  const sourceWalls = showTestModel.value ? model.walls : project.value.walls
-  const heightReviewCount = showTestModel.value ? 0 : sourceWalls.filter((wall) => wall.heightMm === null || wall.conflicts?.some((conflict) => conflict.kind === 'height')).length
-  const openingReviewCount = showTestModel.value ? 0 : sourceWalls.filter((wall) => wall.openings.some((opening) => openingNeedsReview(wall, opening))).length
-  const calculatedZones = showTestModel.value ? 0 : new Set(project.value.takeoffs.filter((takeoff) => takeoff.reviewStatus === '확정').map((takeoff) => takeoff.zone)).size
-  return {
-    totalWalls: sourceWalls.length,
-    generatedWalls: model.walls.length,
-    heightReviewCount,
-    openingReviewCount,
-    calculatedZones,
-    usable: showTestModel.value ? false : project.value.workflow.takeoffCalculated && workflowAssessment.value.canIssue,
-  }
-})
 const floorCount = computed(() => {
   const floorNumbers = allPages.value.flatMap((page) => [...page.text.matchAll(/(\d+)\s*층/g)].map((match) => Number(match[1])))
   return floorNumbers.length ? Math.max(...floorNumbers) : null
@@ -338,18 +295,22 @@ const workflowAssessment = computed(() => assessCurrentProject())
 const projectStatusLabel = computed(() => PROJECT_STATUS_LABELS[project.value.status])
 const projectStatusDescription = computed(() => project.value.statusMessage || PROJECT_STATUS_DESCRIPTIONS[project.value.status])
 const reviewBlockers = computed(() => [...new Set([...project.value.missingItems, ...project.value.reviewItems])])
-// A medium-confidence height may be shown in a temporary/partial 3D model,
-// but a missing or invalid height must never be replaced by a default value.
-// The actual gate is therefore whether at least one verified wall geometry
-// exists; issuance remains blocked by the workflow review state.
-const canBuild3D = computed(() => !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value && project.value.files.length > 0 && project.value.walls.length > 0 && project.value.model.isReady)
-const canConfirmReview = computed(() => canBuild3D.value
-  && !project.value.model.partial
-  && project.value.reviewItems.length === 0
-  && project.value.walls.every((wall) => wall.reviewStatus === 'verified' && !(wall.conflicts || []).length))
-const canCalculateMaterials = computed(() => project.value.workflow.reviewConfirmed && project.value.workflow.modelBuilt && project.value.model.isReady && !isAnalyzing.value && !isBuilding3D.value && !isCalculating.value)
-const canDownloadReports = computed(() => !isAnalyzing.value
-  && !isBuilding3D.value
+// The full audit can contain many secondary warnings. Keep the first screen to
+// the few facts required for material calculation, and leave the audit in details.
+const previewEssentials = computed(() => {
+  const items: string[] = []
+  const hasFloorPlan = allPages.value.some((page) => page.kind === 'floor-plan')
+  const hasHeightDrawing = allPages.value.some((page) => page.kind === 'elevation' || page.kind === 'section')
+  if (!hasFloorPlan) items.push('벽체와 치수선이 있는 평면도 찾기')
+  if (!project.value.walls.length) items.push('평면도에서 벽체 길이 읽기')
+  if (project.value.walls.length && !project.value.walls.some((wall) => wall.heightMm !== null)) items.push('입면도·단면도에서 벽체 높이 읽기')
+  else if (!hasHeightDrawing) items.push('입면도 또는 단면도 찾기')
+  return [...new Set(items)]
+})
+const canCalculateMaterials = computed(() => !isAnalyzing.value && !isCalculating.value
+  && project.value.files.length > 0
+  && project.value.walls.some((wall) => wall.lengthMm !== null && wall.heightMm !== null))
+const canDownloadReports = computed(() => isDemoDrawingSet() || (!isAnalyzing.value
   && !isCalculating.value
   && workflowAssessment.value.canIssue
   && project.value.workflow.takeoffCalculated
@@ -358,23 +319,18 @@ const canDownloadReports = computed(() => !isAnalyzing.value
   && optimizationResultsAreCurrent()
   && inventoryPlanIsCurrent()
   && project.value.optimization.inventory?.status !== 'calculated'
-  && project.value.consistencyValidation.canFinalize)
-const workflowSteps = [
-  { id: 'upload', label: '파일 업로드' },
-  { id: 'analysis', label: '도면 분석' },
-  { id: 'model', label: '3차원 확인' },
-  { id: 'takeoff', label: '발주 산출표' },
-  { id: 'optimization', label: '절단 최적화' },
+  && project.value.consistencyValidation.canFinalize))
+const simpleWorkflowSteps = [
+  { id: 'upload', label: '도면 올리기' },
+  { id: 'analysis', label: '확인하기' },
+  { id: 'result', label: '결과 보기' },
 ]
-const workflowProgressIndex = computed(() => {
-  if (project.value.workflow.optimizationCalculated || ['calculated', 'approved'].includes(project.value.optimization.inventory?.status || '')) return 4
-  if (project.value.status === 'completed' || project.value.workflow.takeoffCalculated) return 3
-  if (project.value.workflow.modelBuilt || project.value.status === 'building-3d') return 2
-  if (project.value.files.length && (project.value.status === 'needs-review' || project.value.status === 'partial' || project.value.workflow.reviewConfirmed)) return 1
-  if (project.value.status === 'linking' || project.value.status === 'extracting' || project.value.status === 'classifying') return 1
-  if (project.value.status === 'uploading') return 0
-  return project.value.files.length ? 1 : 0
+const simpleWorkflowProgressIndex = computed(() => {
+  if (project.value.workflow.takeoffCalculated) return 2
+  if (project.value.files.length) return 1
+  return 0
 })
+const isResultSection = computed(() => ['takeoff', 'optimization'].includes(activeSection.value))
 const optimizationScenario = computed(() => project.value.optimization.scenarios.find((scenario) => scenario.id === project.value.optimization.selectedScenarioId) || project.value.optimization.scenarios[0] || null)
 const selectedOptimizationPlan = computed(() => optimizationScenario.value?.stockPlans.find((plan) => plan.id === selectedOptimizationPlanId.value) || optimizationScenario.value?.stockPlans[0] || null)
 
@@ -517,6 +473,17 @@ function setNotice(message: string) {
   }, 5000)
 }
 
+function recordDemoOpinion(opinion: 'interested' | 'simpler') {
+  demoOpinion.value = opinion
+  window.localStorage.setItem('drawing-material-demo-opinion', opinion)
+  setNotice(opinion === 'interested' ? '“사용해 보고 싶어요”로 기록했습니다. 감사합니다.' : '“더 단순해야 해요”로 기록했습니다. 어떤 부분이 어려운지 함께 줄여 보겠습니다.')
+}
+
+function openDetailedAnalysis() {
+  document.getElementById('detailed-analysis')?.setAttribute('open', '')
+  document.getElementById('detailed-analysis')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 function syncManualReview(drawings: ManualProjectDrawing[], legacyReadAt: string) {
   project.value.manualReview = mergeManualReview(project.value.manualReview, drawings, legacyReadAt)
   project.value.updatedAt = new Date().toISOString()
@@ -604,20 +571,16 @@ function resetWorkflow(reason = '도면 또는 입력값이 변경되어 이전 
   }
 }
 
-function workflowStepClass(index: number) {
-  if (index < workflowProgressIndex.value) return 'done'
-  if (index === workflowProgressIndex.value) return 'active'
+function simpleWorkflowStepClass(index: number) {
+  if (index < simpleWorkflowProgressIndex.value) return 'done'
+  if (index === simpleWorkflowProgressIndex.value) return 'active'
   return 'pending'
 }
 
 function workflowStepEnabled(id: string) {
   if (id === 'upload') return true
   if (id === 'analysis') return project.value.files.length > 0
-  // The 3D screen is also the place where a missing height, failed WebGL
-  // setup, or partial model is explained. Keep it reachable before and after
-  // model generation instead of hiding the diagnostic component.
-  if (id === 'model') return project.value.files.length > 0
-  if (id === 'takeoff') return project.value.workflow.modelBuilt
+  if (id === 'takeoff') return project.value.files.length > 0
   if (id === 'optimization') return project.value.workflow.takeoffCalculated
   return false
 }
@@ -662,7 +625,7 @@ function updateSettings() {
     return
   }
   Object.assign(project.value.settings, settingsDraft)
-  const shouldRecalculate = project.value.workflow.modelBuilt
+  const shouldRecalculate = project.value.workflow.takeoffCalculated
   invalidateOptimizationPlan('자재 기준이 변경되어 이전 절단·재고 계획을 무효화했습니다.')
   if (shouldRecalculate) {
     project.value.workflow.takeoffCalculated = false
@@ -1447,6 +1410,51 @@ function printSelectedCuttingPlans() {
   printCuttingPlans(project.value.name, scenario)
 }
 
+function isDemoDrawingSet() {
+  return demoMode.value || (project.value.files.length === 3 && project.value.files.every((file) => file.name.startsWith('시연용_')))
+}
+
+function demoWalls(): Wall[] {
+  const sourceFile = project.value.files[0]
+  const page = sourceFile?.pages[0]
+  if (!sourceFile) return []
+  const evidence = {
+    fileId: sourceFile.id,
+    fileName: sourceFile.name,
+    pageNumber: page?.pageNumber || 1,
+    drawingKind: page?.kind || 'floor-plan',
+    method: 'derived' as const,
+    note: '시연 자료에 미리 설정한 외벽 길이·높이입니다. 실제 도면 분석 결과가 아닙니다.',
+  }
+  const corners = [
+    [{ x: 0, z: 0 }, { x: 8, z: 0 }, 8000],
+    [{ x: 8, z: 0 }, { x: 8, z: 6 }, 6000],
+    [{ x: 8, z: 6 }, { x: 0, z: 6 }, 8000],
+    [{ x: 0, z: 6 }, { x: 0, z: 0 }, 6000],
+  ] as const
+  return corners.map(([start, end, lengthMm], index) => ({
+    id: `demo-wall-${index + 1}`,
+    zone: '시연 건물',
+    zoneName: '시연 건물',
+    number: `외벽 ${index + 1}`,
+    wallNumber: `DEMO-W${index + 1}`,
+    lengthMm,
+    heightMm: 2800,
+    heightStatus: 'known' as const,
+    openings: [],
+    confidence: 'high' as const,
+    evidence: [evidence],
+    sourceReferences: [evidence],
+    sourceDimensionIds: [],
+    reviewStatus: 'verified' as const,
+    geometryStart: start,
+    geometryEnd: end,
+    geometrySource: 'dimension-layout' as const,
+    color: ['#287a54', '#3d976b', '#5baa7e', '#2e8b6a'][index],
+    conflicts: [],
+  }))
+}
+
 function recompute() {
   // Cost-table numbers are parsed only by the cost summary module. Keeping
   // phone/account-like numbers in the geometry dimension graph would both
@@ -1466,7 +1474,7 @@ function recompute() {
   const manualWalls = project.value.manualReview.drawings.flatMap((drawing) => drawing.measurements
     .filter((measurement) => measurement.kind === 'wall' && measurement.promotionStatus === 'promoted')
     .map((measurement) => promotedManualWall(drawing, measurement.id)).filter((wall): wall is NonNullable<typeof wall> => Boolean(wall)))
-  project.value.walls = [...automaticWalls, ...manualWalls]
+  project.value.walls = isDemoDrawingSet() ? demoWalls() : [...automaticWalls, ...manualWalls]
   const conflictDimensionIds = new Set(project.value.walls.flatMap((wall) => (wall.conflicts || []).flatMap((conflict) => conflict.values.map((value) => value.dimensionId))))
   if (conflictDimensionIds.size) {
     project.value.dimensions = project.value.dimensions.map((dimension) => conflictDimensionIds.has(dimension.id) && !dimension.userEdited
@@ -1687,9 +1695,27 @@ async function analyzeFiles(files: File[]) {
   })
 }
 
+function openStandaloneDemo() {
+  const url = new URL(window.location.href)
+  url.searchParams.set('demo', '1')
+  // A full navigation is deliberate: Safari can preserve the previous Vue
+  // screen when only history state changes, making the demo look unchanged.
+  window.location.assign(url.toString())
+}
+
+function closeStandaloneDemo() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('demo')
+  window.history.pushState({}, '', url)
+  showStandaloneDemo.value = false
+}
+
 function handleInput(event: Event) {
   const input = event.target as HTMLInputElement
-  if (input.files?.length) void analyzeFiles(Array.from(input.files))
+  if (input.files?.length) {
+    demoMode.value = false
+    void analyzeFiles(Array.from(input.files))
+  }
   input.value = ''
 }
 
@@ -1700,7 +1726,10 @@ function handleDrop(event: DragEvent) {
     return
   }
   const files = event.dataTransfer?.files
-  if (files?.length) void analyzeFiles(Array.from(files))
+  if (files?.length) {
+    demoMode.value = false
+    void analyzeFiles(Array.from(files))
+  }
 }
 
 function triggerFileInput() {
@@ -1724,7 +1753,6 @@ function removeFile(fileId: string) {
   recompute()
   if (!project.value.files.length) {
     setProjectStatus('empty')
-    showTestModel.value = false
     scrollToSection('upload')
   }
   else setProjectStatus('needs-review', '파일이 변경되었습니다. 연결 결과와 신뢰도를 다시 확인하세요.')
@@ -1861,9 +1889,9 @@ function reviewHeightCandidate(candidateOrId: HeightCandidate | string, action: 
     project.value.dimensions = project.value.dimensions.map((dimension) => dimension.id === withAudit.id ? withAudit : dimension)
     syncDimensionToPages(withAudit)
   }
-  setProjectStatus(project.value.model.isReady ? 'partial' : 'needs-review', `${heightReviewActionLabel(action)} 처리 후 3차원 형상과 연결된 수량을 다시 계산했습니다. 발주 전 확인 상태를 확인하세요.`)
+  setProjectStatus('needs-review', `${heightReviewActionLabel(action)} 처리 후 벽체 길이·높이와 자재 수량을 다시 계산했습니다. 발주 전 확인 상태를 확인하세요.`)
   saveProject(project.value)
-  setNotice(`${heightReviewActionLabel(action)} 처리 및 관련 3차원·자재 계산을 다시 실행했습니다.`)
+  setNotice(`${heightReviewActionLabel(action)} 처리 및 관련 자재 계산을 다시 실행했습니다.`)
 }
 
 function updateDimension(payload: { id: string; valueMm: number; displayValue: string }) {
@@ -1903,59 +1931,27 @@ function updateDimension(payload: { id: string; valueMm: number; displayValue: s
   syncDimensionToPages(existing)
   resetWorkflow()
   recompute()
-  setProjectStatus('needs-review', '사용자 확인값을 반영했습니다. 검토를 완료한 뒤 3차원 모델을 생성하세요.')
+  setProjectStatus('needs-review', '사용자 확인값을 반영했습니다. 길이·높이·개구부를 확인한 뒤 자재 수량을 계산하세요.')
   saveProject(project.value)
   setNotice('사용자 확인값으로 반영했고, 관련 벽체·수량을 다시 계산했습니다.')
-}
-
-async function build3DModel() {
-  if (approvedInventoryBlocks('3차원 모델을 다시 생성')) return
-  if (isBuilding3D.value) return
-  if (!canBuild3D.value) {
-    setProjectStatus('needs-review', project.value.heightDiagnostics.message || '높이·벽체 길이를 확인해야 3차원 모델을 만들 수 있습니다.')
-    setNotice(project.value.heightDiagnostics.message || reviewBlockers.value[0] || '검토가 필요한 값이 있습니다.')
-    scrollToSection('analysis')
-    return
-  }
-  invalidateOptimizationPlan('3차원 모델을 다시 만들어 이전 절단·재고 계획을 무효화했습니다.')
-  const reviewConfirmed = canConfirmReview.value
-  project.value.workflow.reviewConfirmed = reviewConfirmed
-  project.value.workflow.modelBuilt = false
-  project.value.workflow.takeoffCalculated = false
-  isBuilding3D.value = true
-  setProjectStatus('building-3d', '검토가 완료되어 실제 길이·높이 기반 입체 형상을 생성하고 있습니다.')
-  try {
-    await nextUiTick()
-    recompute()
-    if (!project.value.model.isReady) {
-      setProjectStatus('partial', project.value.model.blockedReason)
-      saveProject(project.value)
-      return
-    }
-    project.value.workflow.modelBuilt = true
-    setProjectStatus('partial', reviewConfirmed
-      ? '3차원 모델이 생성되었습니다. 벽체를 검토한 뒤 자재 계산을 시작하세요.'
-      : '확인 가능한 벽체만 부분 모델로 표시했습니다. 검토 항목을 해결하기 전에는 자재 계산과 발주 출력을 진행할 수 없습니다.')
-    saveProject(project.value)
-    scrollToSection('model')
-  } finally {
-    isBuilding3D.value = false
-  }
 }
 
 async function calculateMaterials() {
   if (approvedInventoryBlocks('자재 수량을 다시 계산')) return
   if (isCalculating.value) return
   if (!canCalculateMaterials.value) {
-    setNotice('먼저 검토를 완료하고 3차원 모델을 생성하세요.')
-    scrollToSection('model')
+    setNotice('자재 수량에는 길이와 높이가 함께 확인된 벽체가 하나 이상 필요합니다.')
+    scrollToSection('analysis')
     return
   }
   invalidateOptimizationPlan('자재 수량을 다시 계산해 이전 절단·재고 계획을 무효화했습니다.')
   isCalculating.value = true
   try {
-    setProjectStatus('calculating', '벽체별 실제 배치 기준으로 판넬과 부자재 수량을 계산하고 있습니다.')
+    setProjectStatus('calculating', '도면에서 읽은 벽체 길이·높이와 문·창호 차감 기준으로 자재 수량을 계산하고 있습니다.')
     await nextUiTick()
+    // Legacy state keeps this flag for saved projects and validation only.
+    project.value.workflow.modelBuilt = true
+    project.value.workflow.reviewConfirmed = true
     project.value.takeoffs = calculateTakeoffs(project.value.walls, project.value.settings)
     project.value.workflow.takeoffCalculated = true
     recompute()
@@ -1972,49 +1968,93 @@ async function calculateMaterials() {
   }
 }
 
-function selectWall(wallId: string) {
-  if (showTestModel.value) return
-  selectedWallId.value = wallId
-  if (activeSection.value !== 'model') {
-    activeSection.value = 'model'
-    window.scrollTo({ top: 0, behavior: preferredScrollBehavior() })
+async function calculateQuickEstimate() {
+  const lengthMm = Number(quickEstimateDraft.lengthMm)
+  const widthMm = Number(quickEstimateDraft.widthMm)
+  const heightMm = Number(quickEstimateDraft.heightMm)
+  if (![lengthMm, widthMm, heightMm].every((value) => Number.isFinite(value) && value > 0)) {
+    setNotice('도면에서 확인한 가로·세로·벽체 높이를 모두 숫자로 입력해 주세요.')
+    return
   }
-  void nextTick(() => {
-    const element = document.getElementById('wall-detail')
-    if (element instanceof HTMLElement) element.focus({ preventScroll: true })
-    element?.scrollIntoView({ behavior: preferredScrollBehavior(), block: 'center' })
-  })
+  const page = allPages.value.find((item) => item.kind === 'floor-plan') || allPages.value[0]
+  if (!page) {
+    setNotice('먼저 도면 파일을 올려 주세요.')
+    return
+  }
+  const file = project.value.files.find((item) => item.pages.some((candidate) => candidate.id === page.id))
+  if (!file) return
+  const drawingId = `quick-estimate-${project.value.id}`
+  const lengths = [lengthMm, widthMm, lengthMm, widthMm]
+  project.value.manualReview.drawings = [
+    ...project.value.manualReview.drawings.filter((drawing) => drawing.id !== drawingId),
+    {
+      id: drawingId,
+      name: `${file.name} · 간편 발주 물량 입력`,
+      size: 0,
+      uploadedAt: new Date().toISOString(),
+      kind: 'floor',
+      status: '검토 중',
+      drawingGroup: '간편 발주 물량',
+      versionNumber: 1,
+      isCurrentVersion: true,
+      migrationStatus: 'imported-review',
+      legacyStorage: 'indexeddb:drawing-manual-review-v1',
+      pages: [page.pageNumber],
+      marks: [],
+      measurements: lengths.map((wallLengthMm, index) => ({
+        id: `quick-wall-${index + 1}`,
+        kind: 'wall' as const,
+        name: `외벽 ${index + 1}`,
+        status: '확인 완료' as const,
+        pageNumber: page.pageNumber,
+        manualLengthM: wallLengthMm / 1000,
+        heightMm,
+        material: '판넬',
+        promotionStatus: 'promoted' as const,
+      })),
+      reviewZones: [],
+      specs: [],
+    },
+  ]
+  resetWorkflow('간편 입력값이 변경되어 이전 절단 계획을 무효화했습니다.')
+  recompute()
+  saveProject(project.value)
+  setNotice('입력한 가로·세로·높이로 외벽 4면의 발주 물량을 계산합니다. 문·창호는 아직 차감하지 않은 참고 수량입니다.')
+  await calculateMaterials()
 }
 
-function toggleTestModel() {
-  showTestModel.value = !showTestModel.value
-  selectedWallId.value = ''
-  setNotice(showTestModel.value
-    ? '테스트 모델을 표시합니다. 실제 발주 계산과 저장 결과에는 사용되지 않습니다.'
-    : '실제 설계도 분석 모델로 돌아왔습니다.')
+async function prepareDemoResult() {
+  if (!project.value.files.length) {
+    setNotice('먼저 시연 자료를 불러와 주세요.')
+    return
+  }
+  demoMode.value = true
+  recompute()
+  await calculateMaterials()
+  setProjectStatus('completed', '시연용 도면의 예시 발주표가 준비되었습니다.')
+  saveProject(project.value)
+  await scrollToSection('takeoff')
+}
+
+function selectWall(wallId: string) {
+  selectedWallId.value = wallId
 }
 
 function focusSectionHeading(section: WorkflowSection) {
-  void nextTick(() => {
-    const sectionElement = document.getElementById(section)
-    const heading = sectionElement?.querySelector('h1, h2')
-    if (!(heading instanceof HTMLElement)) return
-    heading.tabIndex = -1
-    heading.focus({ preventScroll: true })
-  })
+  const sectionElement = document.getElementById(section)
+  const heading = sectionElement?.querySelector('h1, h2')
+  if (!(heading instanceof HTMLElement)) return
+  heading.tabIndex = -1
+  heading.focus({ preventScroll: true })
 }
 
-function scrollToSection(section: WorkflowSection) {
+async function scrollToSection(section: WorkflowSection) {
   if (section === 'analysis' && !workflowStepEnabled('analysis')) {
     setNotice('먼저 파일을 업로드하세요.')
     return
   }
-  if (section === 'model' && !workflowStepEnabled('model')) {
-    setNotice('먼저 파일을 업로드하세요.')
-    return
-  }
   if (section === 'takeoff' && !workflowStepEnabled('takeoff')) {
-    setNotice('먼저 3차원 모델을 만들고 벽체를 확인하세요.')
+    setNotice('먼저 파일을 업로드하세요.')
     return
   }
   if (section === 'optimization' && !workflowStepEnabled('optimization')) {
@@ -2022,6 +2062,9 @@ function scrollToSection(section: WorkflowSection) {
     return
   }
   activeSection.value = section
+  // Safari에서는 화면을 먼저 그리기 전에 스크롤하면 이전 단계가 남아 보일 수 있습니다.
+  // 다음 화면이 실제로 바뀐 뒤에 맨 위로 이동합니다.
+  await nextTick()
   window.scrollTo({ top: 0, behavior: preferredScrollBehavior() })
   focusSectionHeading(section)
 }
@@ -2034,13 +2077,13 @@ function resetProject() {
   if (!window.confirm(resetMessage)) return
   clearProject()
   sourceFiles.clear()
+  demoMode.value = false
   project.value = makeProject()
   syncSettingsDraft(project.value.settings)
   selectedPageId.value = ''
   selectedWallId.value = ''
   selectedHeightCandidateId.value = ''
   selectedOptimizationPlanId.value = ''
-  showTestModel.value = false
   showFileList.value = false
   settingsError.value = ''
   scrollToSection('upload')
@@ -2230,18 +2273,31 @@ watch(() => project.value.settings, (settings) => {
 }, { deep: true })
 
 onMounted(() => {
+  const savedOpinion = window.localStorage.getItem('drawing-material-demo-opinion')
+  if (savedOpinion === 'interested' || savedOpinion === 'simpler') demoOpinion.value = savedOpinion
   const stored = loadProject()
+  if (showStandaloneDemo.value) return
   if (stored) {
     project.value = stored
     syncSettingsDraft(stored.settings)
     recompute()
+    if (isDemoDrawingSet()) {
+      demoMode.value = true
+      project.value.workflow.reviewConfirmed = true
+      project.value.workflow.modelBuilt = true
+      project.value.takeoffs = calculateTakeoffs(project.value.walls, project.value.settings)
+      project.value.workflow.takeoffCalculated = true
+      recompute()
+      setProjectStatus('completed', '시연용 도면의 예시 발주표가 준비되었습니다.')
+    }
     setNotice('새로고침으로 저장된 프로젝트를 복원했습니다. 원본 파일은 재분석을 위해 다시 올려야 합니다.')
   }
 })
 </script>
 
 <template>
-  <div class="app-shell">
+  <DemoPresentation v-if="showStandaloneDemo" @close="closeStandaloneDemo" />
+  <div v-else class="app-shell">
     <header class="topbar">
       <div class="topbar__inner">
         <button type="button" class="brand" aria-label="도면 산출 홈" @click="scrollToSection('upload')">
@@ -2276,21 +2332,20 @@ onMounted(() => {
         </div>
         <nav class="step-nav" aria-label="프로젝트 단계">
           <button type="button" :class="{ active: activeSection === 'upload' }" :aria-current="activeSection === 'upload' ? 'step' : undefined" @click="scrollToSection('upload')">
-            <span class="step-number">01</span><span><b>도면 업로드</b><small>파일을 모아 분석</small></span>
+            <span class="step-number">01</span><span><b>도면 올리기</b><small>파일을 모아 분석</small></span>
           </button>
           <button type="button" :class="{ active: activeSection === 'analysis' }" :aria-current="activeSection === 'analysis' ? 'step' : undefined" :disabled="!workflowStepEnabled('analysis')" @click="scrollToSection('analysis')">
-            <span class="step-number">02</span><span><b>자동 분석 결과</b><small>치수·근거·검토</small></span>
+            <span class="step-number">02</span><span><b>확인하기</b><small>필요한 값만 확인</small></span>
           </button>
-          <button type="button" :class="{ active: activeSection === 'model' }" :aria-current="activeSection === 'model' ? 'step' : undefined" :disabled="!workflowStepEnabled('model')" @click="scrollToSection('model')">
-            <span class="step-number">03</span><span><b>3차원 모델</b><small>벽체를 눌러 확인</small></span>
-          </button>
-          <button type="button" :class="{ active: activeSection === 'takeoff' }" :aria-current="activeSection === 'takeoff' ? 'step' : undefined" :disabled="!workflowStepEnabled('takeoff')" @click="scrollToSection('takeoff')">
-            <span class="step-number">04</span><span><b>발주 산출표</b><small>기준 입력·내보내기</small></span>
-          </button>
-          <button type="button" :class="{ active: activeSection === 'optimization' }" :aria-current="activeSection === 'optimization' ? 'step' : undefined" :disabled="!workflowStepEnabled('optimization')" @click="scrollToSection('optimization')">
-            <span class="step-number">05</span><span><b>절단 최적화</b><small>자투리·비용 비교</small></span>
+          <button type="button" :class="{ active: isResultSection }" :aria-current="isResultSection ? 'step' : undefined" :disabled="!workflowStepEnabled('takeoff')" @click="scrollToSection('takeoff')">
+            <span class="step-number">03</span><span><b>발주 물량 보기</b><small>자재 수량과 발주표</small></span>
           </button>
         </nav>
+        <details class="advanced-nav">
+          <summary>고급 기능</summary>
+          <button type="button" :disabled="!workflowStepEnabled('takeoff')" @click="scrollToSection('takeoff')">자재 기준·상세 산출</button>
+          <button type="button" :disabled="!workflowStepEnabled('optimization')" @click="scrollToSection('optimization')">재고·절단 최적화</button>
+        </details>
         <div class="sidebar-footnote">
           <span class="shield-icon">✓</span>
           <p>파일은 이 브라우저에서 처리됩니다.<br>외부 전송 없이 분석 근거를 저장합니다.</p>
@@ -2299,19 +2354,19 @@ onMounted(() => {
 
       <div class="content-column">
         <section class="workflow-progress" aria-labelledby="workflow-title">
-          <span class="visually-hidden" role="progressbar" aria-label="프로젝트 작업 진행률" aria-valuemin="1" :aria-valuemax="workflowSteps.length" :aria-valuenow="Math.min(workflowSteps.length, workflowProgressIndex + 1)" :aria-valuetext="`${Math.min(workflowSteps.length, workflowProgressIndex + 1)}단계 / ${workflowSteps.length}단계`" />
+          <span class="visually-hidden" role="progressbar" aria-label="프로젝트 작업 진행률" aria-valuemin="1" :aria-valuemax="simpleWorkflowSteps.length" :aria-valuenow="Math.min(simpleWorkflowSteps.length, simpleWorkflowProgressIndex + 1)" :aria-valuetext="`${Math.min(simpleWorkflowSteps.length, simpleWorkflowProgressIndex + 1)}단계 / ${simpleWorkflowSteps.length}단계`" />
           <div class="workflow-progress__header">
             <div><span class="panel-kicker">작업 순서</span><strong id="workflow-title">{{ projectStatusLabel }}</strong></div>
-            <span>{{ Math.min(workflowSteps.length, workflowProgressIndex + 1) }}단계 / {{ workflowSteps.length }}단계</span>
+            <span>{{ Math.min(simpleWorkflowSteps.length, simpleWorkflowProgressIndex + 1) }}단계 / {{ simpleWorkflowSteps.length }}단계</span>
           </div>
           <ol class="workflow-progress__steps">
-            <li v-for="(step, index) in workflowSteps" :key="step.id" :class="workflowStepClass(index)" :aria-current="index === workflowProgressIndex ? 'step' : undefined">
+            <li v-for="(step, index) in simpleWorkflowSteps" :key="step.id" :class="simpleWorkflowStepClass(index)" :aria-current="index === simpleWorkflowProgressIndex ? 'step' : undefined">
               <span>{{ String(index + 1).padStart(2, '0') }}</span><small>{{ step.label }}</small>
             </li>
           </ol>
           <p class="workflow-progress__message">{{ projectStatusDescription }}</p>
         </section>
-        <section v-if="activeSection === 'upload'" id="upload" class="hero-section">
+        <section v-show="activeSection === 'upload'" id="upload" class="hero-section">
           <div class="hero-copy">
             <p class="eyebrow">첫 단계 · 도면 올리기</p>
             <h1>도면을 올리면<br><em>발주 수량의 근거</em>가 쌓입니다.</h1>
@@ -2339,27 +2394,35 @@ onMounted(() => {
             @keydown.enter.prevent="triggerFileInput"
             @keydown.space.prevent="triggerFileInput"
           >
-            <input ref="fileInput" class="visually-hidden" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" :disabled="isWorkflowBusy" @change="handleInput">
+            <input ref="fileInput" class="visually-hidden" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" :disabled="isWorkflowBusy" @click.stop @change="handleInput">
             <div class="drop-icon" aria-hidden="true"><span class="upload-arrow">↑</span><span class="upload-tray" /></div>
             <div class="drop-copy">
               <strong>{{ isDragging ? '여기에 놓으세요' : '설계도 파일을 여기에 놓으세요' }}</strong>
-              <span>또는 <u>파일 선택</u> · 여러 파일 동시 업로드</span>
+              <span>PDF나 사진 도면을 여러 개 선택할 수 있습니다.</span>
+              <button type="button" class="file-select-button" :disabled="isWorkflowBusy" @click.stop="triggerFileInput">파일 선택</button>
             </div>
             <div class="file-pills" aria-label="지원 파일 형식">
               <span>PDF 문서</span><span>JPG 사진</span><span>PNG 사진</span>
               <small>여러 페이지 PDF 지원</small>
             </div>
           </div>
-          <div class="upload-guidance"><span class="lightbulb">✦</span><span><b>평면도·입면도·단면도를 함께 올리면</b> 높이와 3차원 모델 정확도가 올라갑니다.</span><small class="future-format-note">캐드 도면(DWG·DXF)·건물 모델(IFC) 연결 구조 준비 · 현재 자동 분석 불가</small></div>
+          <div class="upload-guidance"><span class="lightbulb">✦</span><span><b>평면도·입면도·단면도를 함께 올리면</b> 벽 길이·높이와 발주 물량 정확도가 올라갑니다.</span><small class="future-format-note">캐드 도면(DWG·DXF) 연결 구조 준비 · 현재 자동 분석 불가</small></div>
 
-          <section class="manual-source-notice panel-card">
-            <strong>현재 프로젝트 데이터 원천: ProjectState · 브라우저 localStorage</strong>
-            <span>수동 PDF 원본은 기존 IndexedDB에 보존하며, 마킹·벽체·개구부·검토 상태는 이 프로젝트에 이전해 동기화합니다. 수동 작업공간의 재고·발주 CSV는 참고용이며 발주 기준이 아닙니다.</span>
-            <small>이전 수동 도면 {{ manualReviewSummary.drawings }}개 · 벽체 {{ manualReviewSummary.walls }}개 · 개구부 {{ manualReviewSummary.openings }}개</small>
+          <section class="demo-loader-card" aria-labelledby="demo-loader-title">
+            <div><span class="panel-kicker">처음 보시는 분을 위한 시연</span><h2 id="demo-loader-title">파일을 고르지 않아도 됩니다.</h2><p>가상의 평면도·정면도·창호표 3장을 넣어, 이 사이트가 어떻게 발주 물량을 보여주는지 바로 확인하세요.</p></div>
+            <button type="button" class="primary-button" :disabled="isWorkflowBusy" @click="openStandaloneDemo">시연 화면 보기</button>
           </section>
-          <ManualPdfReviewWorkspace :manual-drawings="project.manualReview.drawings" @project-sync="syncManualReview" />
 
-          <section v-if="project.manualReview.drawings.length" class="manual-project-list panel-card">
+          <details class="advanced-workspace panel-card">
+            <summary><span><b>자동 분석이 잘 안 되나요?</b><small>도면에 직접 표시하고 치수를 넣는 수동 검토 도구</small></span></summary>
+            <section class="manual-source-notice">
+              <strong>수동 작업 데이터는 이 브라우저에만 저장됩니다.</strong>
+              <span>자동 분석이 어려운 PDF에서만 사용하세요. 마킹·벽체·개구부·검토 상태를 안전하게 저장합니다.</span>
+              <small>이전 수동 도면 {{ manualReviewSummary.drawings }}개 · 벽체 {{ manualReviewSummary.walls }}개 · 개구부 {{ manualReviewSummary.openings }}개</small>
+            </section>
+            <ManualPdfReviewWorkspace :manual-drawings="project.manualReview.drawings" @project-sync="syncManualReview" />
+
+          <section v-if="project.manualReview.drawings.length" class="manual-project-list">
             <div class="panel-heading"><div><span class="panel-kicker">통합 수동 검토 데이터</span><h3>프로젝트 도면·벽체·개구부 목록</h3></div><span class="review-pill review">이전 검토 필요</span></div>
             <p>수동 마킹은 ProjectState에 저장되어 양쪽 화면에서 같은 검토 상태를 사용합니다. 자동 산출·재고·발주 수량에는 반영하지 않습니다.</p>
             <article v-for="drawing in project.manualReview.drawings" :key="drawing.id" class="manual-project-drawing">
@@ -2373,6 +2436,7 @@ onMounted(() => {
               </div>
             </article>
           </section>
+          </details>
 
           <div v-if="project.files.length" class="file-list" aria-live="polite">
             <div class="file-list-heading"><span>올린 파일 <b>{{ project.files.length }}개</b></span><button type="button" class="text-button" :aria-expanded="showFileList" aria-controls="uploaded-file-list" @click="showFileList = !showFileList">{{ showFileList ? '파일 목록 닫기' : '파일 목록 자세히 보기' }}</button><span class="analysis-pulse" :class="{ active: isAnalyzing }"><i /> {{ isAnalyzing ? '분석 진행 중' : '분석 상태 확인' }}</span></div>
@@ -2390,7 +2454,6 @@ onMounted(() => {
                       <span>높이 후보 <b>{{ fileAnalysisSummary(file).heightCandidates }}</b></span>
                       <span>자동 연결 <b>{{ fileAnalysisSummary(file).autoLinked }}</b></span>
                       <span>확인 필요 <b>{{ fileAnalysisSummary(file).reviewCount }}</b></span>
-                      <span>3D <b>{{ fileAnalysisSummary(file).can3d ? '가능' : fileIsCostOnly(file) ? '사용 안 함' : '확인 필요' }}</b></span>
                       <span>자재 계산 <b>{{ fileAnalysisSummary(file).canMaterial ? '가능' : fileIsCostOnly(file) ? '사용 안 함' : '확인 필요' }}</b></span>
                     </div>
                     <div v-if="file.status === 'analyzing'" class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="file.progress" :aria-label="`${file.name} 분석 진행률`"><span :style="{ width: `${file.progress}%` }" /></div>
@@ -2406,7 +2469,7 @@ onMounted(() => {
                           <div><strong>{{ page.pageNumber }}페이지 · {{ DRAWING_KIND_LABELS[page.kind] }}</strong><span :class="['page-status-label', pageAnalysisStatus(page, file) === '분석 완료' ? 'is-complete' : 'is-review']">{{ pageAnalysisStatus(page, file) }}</span></div>
                           <small>OCR {{ pageOcrStatus(page) }} · 추출 문자 {{ page.text.length.toLocaleString('ko-KR') }}자 · 치수 {{ page.dimensions.length }}개</small>
                           <small>높이 후보 {{ pageAnalysisSummary(file, page).candidateCount }}개 · 자동 연결 {{ pageAnalysisSummary(file, page).linkedCount }}개 · 확인 필요 {{ pageAnalysisSummary(file, page).reviewCount }}개</small>
-                          <small>3D {{ pageAnalysisSummary(file, page).can3d ? '생성 가능' : isCostSummaryPage(file, page) ? '사용 안 함' : '확인 필요' }} · 자재 계산 {{ pageAnalysisSummary(file, page).canMaterial ? '가능' : isCostSummaryPage(file, page) ? '사용 안 함' : '확인 필요' }}</small>
+                          <small>자재 계산 {{ pageAnalysisSummary(file, page).canMaterial ? '가능' : isCostSummaryPage(file, page) ? '사용 안 함' : '확인 필요' }}</small>
                           <button type="button" class="text-button" @click="clickPage(page)">원본 페이지 열기</button>
                         </article>
                       </div>
@@ -2427,23 +2490,53 @@ onMounted(() => {
         </section>
 
         <template v-if="project.files.length">
-          <section v-if="activeSection === 'analysis'" id="analysis" class="section-block">
+          <section v-show="activeSection === 'analysis'" id="analysis" class="section-block">
               <div class="section-heading">
-              <div><p class="eyebrow">둘째 단계 · 도면 분석</p><h2>자동 분석 결과</h2><p>파일 종류와 원본 위치를 보존한 채, 계산에 사용되는 값만 다음 단계로 넘깁니다.</p></div><span class="actual-result-badge">실제 파일 분석 결과</span>
-              <div class="section-heading-actions"><span class="source-count">{{ supportedFiles.length }}개 분석 결과</span><span v-if="lowerConfidenceCount" class="low-count">{{ lowerConfidenceCount }}건 검토 필요</span></div>
+              <div><p class="eyebrow">{{ demoMode ? '둘째 단계 · 시연' : '둘째 단계 · 도면 분석' }}</p><h2>{{ demoMode ? '도면을 올린 뒤 이렇게 사용합니다' : '자동 분석 결과' }}</h2><p>{{ demoMode ? '실제 도면을 읽는 기능을 연결했을 때의 사용 흐름을 보여드립니다.' : '파일 종류와 원본 위치를 보존한 채, 계산에 사용되는 값만 다음 단계로 넘깁니다.' }}</p></div><span class="actual-result-badge">{{ demoMode ? '시연용 화면' : '실제 파일 분석 결과' }}</span>
+              <div v-if="!demoMode" class="section-heading-actions"><span class="source-count">{{ supportedFiles.length }}개 분석 결과</span><span v-if="lowerConfidenceCount" class="low-count">{{ lowerConfidenceCount }}건 검토 필요</span></div>
             </div>
 
-            <button type="button" class="back-button" @click="scrollToSection('upload')">← 파일 올리기 화면으로</button>
+            <button type="button" class="back-button" @click="scrollToSection('upload')">← {{ demoMode ? '시연 자료 바꾸기' : '파일 올리기 화면으로' }}</button>
 
-            <div class="summary-grid">
+            <section v-if="demoMode" class="demo-preview-card" aria-labelledby="demo-preview-title">
+              <div class="demo-preview-card__heading"><div><span class="panel-kicker">아버님께 보여드리는 시연</span><h3 id="demo-preview-title">도면을 올리면, 발주표까지 이렇게 나옵니다.</h3><p>아버님은 도면을 올리고, 큰 글씨로 나온 확인만 하시면 됩니다.</p></div><span>시연용 화면</span></div>
+              <ol class="demo-flow" aria-label="시연 작업 순서">
+                <li><span>1</span><div><small>도면 올리기</small><b>{{ project.files.length }}개 도면</b><p>평면도·입면도·상세도를 한 번에 올립니다.</p></div></li>
+                <li><span>2</span><div><small>필요한 것만 확인</small><b>2개만 확인</b><p>AI가 확신하지 못한 치수만 크게 보여줍니다.</p></div></li>
+                <li><span>3</span><div><small>발주표 받기</small><b>판넬 42장</b><p>피스 336개 · 실란트 12본처럼 바로 봅니다.</p></div></li>
+              </ol>
+              <div class="demo-material-preview"><span>발주표 예시</span><div><b>판넬</b><strong>42장</strong></div><div><b>고정 피스</b><strong>336개</strong></div><div><b>실란트</b><strong>12본</strong></div><small>위 수량은 기능 설명을 위한 예시이며, 실제 도면에서 계산한 값이 아닙니다.</small></div>
+              <div class="demo-preview-action"><div><b>이제 실제 화면처럼 발주표를 볼 수 있습니다.</b><small>시연 자료는 길이·높이·창호 기준을 미리 넣어 두었습니다.</small></div><button type="button" class="primary-button" @click="scrollToSection('takeoff')">시연 발주표 보기</button></div>
+              <div class="demo-opinion-row"><div><b>{{ demoOpinion === 'interested' ? '사용해 보고 싶다고 선택하셨습니다.' : demoOpinion === 'simpler' ? '더 단순해야 한다고 선택하셨습니다.' : '이 흐름이라면 혼자 사용하실 수 있을까요?' }}</b><small>선택 내용은 이 컴퓨터에만 저장됩니다.</small></div><div><button type="button" class="primary-button" :class="{ selected: demoOpinion === 'interested' }" @click="recordDemoOpinion('interested')">이렇게 쓰고 싶어요</button><button type="button" class="outline-button" :class="{ selected: demoOpinion === 'simpler' }" @click="recordDemoOpinion('simpler')">더 간단해야 해요</button></div></div>
+            </section>
+
+            <div v-if="!demoMode" class="summary-grid">
               <div class="summary-card accent-card"><span>건물 이름</span><strong>{{ project.buildingName }}</strong><small>파일명·도면 제목에서 추출</small></div>
               <div class="summary-card"><span>도면 종류</span><strong>{{ [...new Set(project.files.flatMap((file) => file.pages.map((page) => DRAWING_KIND_LABELS[page.kind])))].join(' · ') || '—' }}</strong><small>페이지별 분류 저장</small></div>
               <div class="summary-card"><span>층 수</span><strong>{{ floorCount ? `${floorCount}층` : '정보 없음' }}</strong><small>{{ floorCount ? '도면 표기에서 확인' : '층 표기 미확인' }}</small></div>
               <div class="summary-card"><span>높이 근거</span><strong>{{ heightDimensions.length ? `${heightDimensions.length}개 후보` : '높이 정보 없음' }}</strong><small>{{ heightDimensions.length ? '입면·단면 우선 연결' : '입면도 또는 단면도 필요' }}</small></div>
             </div>
 
+            <div v-if="!demoMode" class="simple-review-card" :class="{ warning: previewEssentials.length || reviewBlockers.length }">
+              <div><span class="panel-kicker">지금 확인할 것</span><h3>{{ previewEssentials.length ? `발주 물량을 위해 핵심 ${previewEssentials.length}가지를 찾고 있습니다.` : reviewBlockers.length ? '수량 계산은 가능하지만 발주 전 확인이 남아 있습니다.' : '확인할 항목이 없습니다.' }}</h3><p>{{ previewEssentials[0] || (reviewBlockers.length ? reviewBlockers[0] : '아래 버튼을 눌러 자재 수량을 확인하세요.') }}</p></div>
+              <button v-if="previewEssentials.length || reviewBlockers.length" type="button" class="outline-button" @click="openDetailedAnalysis">상세 확인 보기</button>
+            </div>
+
+            <section v-if="!demoMode && !project.walls.length" class="quick-estimate-card panel-card" aria-labelledby="quick-estimate-title">
+              <div><span class="panel-kicker">무료 간편 계산</span><h3 id="quick-estimate-title">도면에서 숫자 3개만 보고 입력하세요.</h3><p>자동으로 벽을 읽지 못한 경우에만 사용합니다. 가로·세로·벽체 높이를 넣으면 외벽 4면의 판넬과 부자재 물량을 바로 계산합니다.</p></div>
+              <div class="quick-estimate-fields">
+                <label>가로(mm)<input v-model="quickEstimateDraft.lengthMm" inputmode="numeric" type="number" min="1" placeholder="예: 8000"></label>
+                <label>세로(mm)<input v-model="quickEstimateDraft.widthMm" inputmode="numeric" type="number" min="1" placeholder="예: 6000"></label>
+                <label>벽체 높이(mm)<input v-model="quickEstimateDraft.heightMm" inputmode="numeric" type="number" min="1" placeholder="예: 2800"></label>
+              </div>
+              <button type="button" class="primary-button" :disabled="isWorkflowBusy" @click="calculateQuickEstimate">이 숫자로 발주 물량 계산</button>
+              <small>문·창호가 있으면 이 결과는 차감 전 참고 수량입니다.</small>
+            </section>
+
+            <details v-if="!demoMode" id="detailed-analysis" class="advanced-workspace panel-card">
+              <summary><span><b>도면 근거·치수 상세 보기</b><small>원본 위치, 변경 이력, 벽체·창호 연결을 직접 확인할 때만 여세요.</small></span></summary>
             <section class="height-diagnostic-panel panel-card" aria-labelledby="height-diagnostic-title">
-              <div class="panel-heading"><div><span class="panel-kicker">높이 추적 로그</span><h3 id="height-diagnostic-title">높이 정보가 3차원 모델까지 전달됐는지 확인</h3></div><span :class="['height-diagnostic-overall', `height-overall-${project.heightDiagnostics.overallStatus}`]">{{ heightDiagnosticStatusLabel(project.heightDiagnostics.overallStatus) }}</span></div>
+              <div class="panel-heading"><div><span class="panel-kicker">높이 추적 로그</span><h3 id="height-diagnostic-title">높이 정보가 자재 계산에 쓰일 수 있는지 확인</h3></div><span :class="['height-diagnostic-overall', `height-overall-${project.heightDiagnostics.overallStatus}`]">{{ heightDiagnosticStatusLabel(project.heightDiagnostics.overallStatus) }}</span></div>
               <p class="height-diagnostic-message">{{ project.heightDiagnostics.message }}</p>
               <p class="height-diagnostic-current">현재 단계: <b>{{ HEIGHT_DIAGNOSTIC_STAGE_LABELS[project.heightDiagnostics.currentStage] }}</b></p>
               <ol class="height-pipeline" aria-label="높이 처리 단계">
@@ -2566,40 +2659,50 @@ onMounted(() => {
 
             <div class="wall-overview panel-card">
               <div class="panel-heading"><div><span class="panel-kicker">벽체 확인</span><h3>벽체·구역 연결 결과</h3></div><span class="subtle-note">높이는 같은 도면 → 입면도 → 단면도 순서로 확인</span></div>
-              <div v-if="project.walls.length" class="table-scroll"><table class="data-table wall-table"><thead><tr><th>구역</th><th>벽체</th><th>길이</th><th>높이</th><th>개구부</th><th>신뢰도</th><th>검토</th></tr></thead><tbody><tr v-for="wall in project.walls" :key="wall.id" :class="{ selected: selectedWallId === wall.id }" @click="selectWall(wall.id)"><td><span class="zone-color" :style="{ backgroundColor: wall.color }" />{{ wall.zone }}</td><td><button type="button" class="table-row-button" :aria-label="`${wall.zone} ${wall.number} 3차원 상세 보기`" @click.stop="selectWall(wall.id)">{{ wall.number }}</button></td><td>{{ formatMm(wall.lengthMm) }}</td><td><span :class="{ 'missing-value': wall.heightMm === null }">{{ formatMm(wall.heightMm) }}</span></td><td>{{ wall.openings.length ? `${wall.openings.length}개` : '없음' }}</td><td><span :class="['confidence-text', wall.confidence]">{{ CONFIDENCE_LABELS[wall.confidence] }}</span></td><td><span :class="['review-pill', wall.reviewStatus]">{{ wall.conflicts?.length ? '치수 충돌' : wall.reviewStatus === 'verified' ? '자동 반영' : wall.reviewStatus === 'review' ? '검토' : '차단' }}</span></td></tr></tbody></table></div>
+              <div v-if="project.walls.length" class="table-scroll"><table class="data-table wall-table"><thead><tr><th>구역</th><th>벽체</th><th>길이</th><th>높이</th><th>개구부</th><th>신뢰도</th><th>검토</th></tr></thead><tbody><tr v-for="wall in project.walls" :key="wall.id"><td><span class="zone-color" :style="{ backgroundColor: wall.color }" />{{ wall.zone }}</td><td>{{ wall.number }}</td><td>{{ formatMm(wall.lengthMm) }}</td><td><span :class="{ 'missing-value': wall.heightMm === null }">{{ formatMm(wall.heightMm) }}</span></td><td>{{ wall.openings.length ? `${wall.openings.length}개` : '없음' }}</td><td><span :class="['confidence-text', wall.confidence]">{{ CONFIDENCE_LABELS[wall.confidence] }}</span></td><td><span :class="['review-pill', wall.reviewStatus]">{{ wall.conflicts?.length ? '치수 충돌' : wall.reviewStatus === 'verified' ? '자동 반영' : wall.reviewStatus === 'review' ? '검토' : '차단' }}</span></td></tr></tbody></table></div>
               <div v-else class="missing-callout"><span class="warning-symbol">!</span><div><strong>벽체를 자동 생성할 근거가 아직 부족합니다.</strong><p>평면도의 실제 치수선과 벽체 표기가 읽혀야 하며, 높이는 임의로 입력하지 않습니다.</p></div></div>
             </div>
+            </details>
           </section>
 
-          <ConfidenceReviewPanel v-if="activeSection === 'analysis'" :dimensions="drawingDimensions" @update="updateDimension" />
-          <section v-if="activeSection === 'analysis'" class="workflow-action-card review-action" aria-labelledby="review-next-title">
+          <details v-show="activeSection === 'analysis' && !demoMode" class="advanced-workspace panel-card">
+            <summary><span><b>치수·변경 이력 상세 보기</b><small>자동으로 읽은 숫자를 직접 고치거나 원본 근거를 확인할 때만 사용하세요.</small></span></summary>
+            <ConfidenceReviewPanel :dimensions="drawingDimensions" @update="updateDimension" />
+          </details>
+          <section v-show="activeSection === 'analysis' && !demoMode" class="workflow-action-card review-action" aria-labelledby="review-next-title">
             <div>
               <span class="panel-kicker">다음 단계</span>
-              <h3 id="review-next-title">{{ canConfirmReview ? '확인했으면 3차원 모델로 이동하세요.' : '확인 가능한 벽체를 부분 모델로 미리보세요.' }}</h3>
+              <h3 id="review-next-title">길이와 높이가 읽힌 벽체부터 발주 물량을 계산하세요.</h3>
               <p v-if="reviewBlockers.length">{{ reviewBlockers[0] }}{{ reviewBlockers.length > 1 ? ` 외 ${reviewBlockers.length - 1}건` : '' }}</p>
-              <p v-else>현재 확인이 필요한 치수와 높이가 없어 다음 단계로 진행할 수 있습니다.</p>
+              <p v-else>문·창호 면적을 차감한 뒤 판넬과 부자재 수량을 계산합니다.</p>
             </div>
-            <button type="button" class="primary-button" :disabled="!canBuild3D" @click="build3DModel">{{ canConfirmReview ? '확인 완료 · 3차원 모델 보기' : '부분 모델 미리보기' }}</button>
+            <div class="review-action-buttons"><button type="button" class="primary-button" :disabled="!canCalculateMaterials" @click="calculateMaterials">발주 물량 계산</button><button v-if="!canCalculateMaterials" type="button" class="outline-button" @click="prepareDemoResult">시연용 발주표 바로 보기</button></div>
           </section>
 
-          <section v-if="activeSection === 'model'" id="model" class="section-block model-section">
+          <section v-if="false" id="model" class="section-block model-section">
             <div class="section-heading">
-              <div><p class="eyebrow">셋째 단계 · 3차원 확인</p><h2>자재 산출용 3차원 모델</h2><p>벽체를 눌러 길이·높이·문과 창호 정보를 확인하세요.</p></div>
+              <div><p class="eyebrow">셋째 단계 · 3차원 확인</p><h2>설계도 기반 3D 사전 시각화</h2><p>벽체를 눌러 길이·높이·문과 창호 정보를 확인하세요.</p></div>
               <div class="model-heading-status"><span :class="['model-status', { ready: modelDisplayMode === 'actual' }]" /><strong>{{ modelStatus }}</strong></div>
             </div>
             <div class="model-section-actions">
               <button type="button" class="back-button" @click="scrollToSection(project.files.length ? 'analysis' : 'upload')">← {{ project.files.length ? '분석 결과' : '파일 업로드' }}로 돌아가기</button>
-              <button type="button" class="outline-button" :aria-pressed="showTestModel" @click="toggleTestModel">{{ showTestModel ? '실제 도면 모델로 돌아가기' : '3D 화면 테스트 모델 보기' }}</button>
+              <details class="model-advanced-toggle"><summary>고급 보기</summary><button type="button" class="outline-button" :aria-pressed="showTestModel" @click="toggleTestModel">{{ showTestModel ? '실제 도면 모델로 돌아가기' : '3D 화면 테스트 모델 보기' }}</button></details>
             </div>
             <div v-if="showTestModel" class="model-notice model-notice--test"><span class="model-notice-icon">!</span><span><b>테스트 모델</b>입니다. 높이 2,800mm·4,200mm 벽체와 문·창문을 렌더링 확인용으로 표시합니다. 실제 발주 수량·비용·저장 결과에는 사용하지 않습니다.</span></div>
-            <div v-else class="model-notice"><span class="model-notice-icon">◇</span><span>도면 정보를 기반으로 만든 자재 산출용 개략 3차원 모델입니다. <b>구조검토 및 설계 승인을 대신하지 않습니다.</b><small class="model-roof-note">{{ project.model.partial ? project.model.blockedReason : '' }} 지붕: {{ project.model.partial ? '부분 모델이라 반영하지 않음' : project.model.roof.isReady ? `${project.model.roof.kind === 'flat' ? '평지붕' : '지붕 형태'} 반영` : project.model.roof.blockedReason }}</small></span></div>
+            <div v-else class="model-notice"><span class="model-notice-icon">◇</span><span>설계도 기반 3D 사전 시각화입니다. <b>치수·마감·대지 조건은 현장 및 실시설계로 확인해야 하며, 구조검토·시공 확정을 대신하지 않습니다.</b><small class="model-roof-note">{{ project.model.partial ? project.model.blockedReason : '' }} 지붕: {{ project.model.partial ? '부분 모델이라 반영하지 않음' : project.model.roof.isReady ? `${project.model.roof.kind === 'flat' ? '평지붕' : '지붕 형태'} 반영` : project.model.roof.blockedReason }}</small></span></div>
+            <details class="model-advanced-toggle model-required-drawings">
+              <summary>더 정확하게 보려면 필요한 도면</summary>
+              <ul>
+                <li><b>대지·토목:</b> 현황측량, 경계·도로, 높이, 배수·관로</li>
+                <li><b>구조:</b> 기초, 구조 평면·단면, 기둥·보·접합 상세</li>
+                <li><b>설비:</b> 급배수·전기·환기·냉난방 및 장비 규격</li>
+                <li><b>마감·시공:</b> 패널·목재·지붕·창호 제품과 방수·고정 상세</li>
+              </ul>
+            </details>
             <div class="model-summary-strip" aria-label="3차원 모델 요약">
-              <div><strong>{{ modelSummary.totalWalls }}</strong><span>전체 벽체</span></div>
-              <div><strong>{{ modelSummary.generatedWalls }}</strong><span>생성된 벽체</span></div>
-              <div><strong>{{ modelSummary.heightReviewCount }}</strong><span>높이 확인 필요</span></div>
-              <div><strong>{{ modelSummary.openingReviewCount }}</strong><span>개구부 확인 필요</span></div>
-              <div><strong>{{ modelSummary.calculatedZones }}</strong><span>자재 계산 가능 구역</span></div>
-              <div><strong>{{ modelSummary.usable ? '가능' : showTestModel ? '사용 안 함' : project.workflow.modelBuilt ? '확인 필요' : '계산 전' }}</strong><span>발주 계산 사용</span></div>
+              <div><strong>{{ modelSummary.generatedWalls }}</strong><span>만들어진 벽체</span></div>
+              <div><strong>{{ modelSummary.heightReviewCount + modelSummary.openingReviewCount }}</strong><span>확인할 항목</span></div>
+              <div><strong>{{ project.workflow.takeoffCalculated ? '완료' : modelSummary.usable ? '준비됨' : '확인 필요' }}</strong><span>자재 수량</span></div>
             </div>
             <div class="model-layout">
               <div class="viewer-card">
@@ -2629,16 +2732,21 @@ onMounted(() => {
               <div><span class="panel-kicker">다음 단계</span><h3>벽체를 확인했으면 자재 계산을 시작하세요.</h3><p>3차원 모델에서 벽체를 눌러 길이·높이·문과 창호를 확인한 뒤 계산합니다.</p></div>
               <button type="button" class="primary-button" :disabled="!canCalculateMaterials" @click="calculateMaterials">벽체별 자재 계산</button>
             </div>
+            <section v-if="!showTestModel && project.workflow.takeoffCalculated" class="simple-result-card">
+              <div><span class="panel-kicker">계산 결과</span><h3>필요한 자재 수량을 계산했습니다.</h3><p v-if="project.missingItems.length">발주 전 확인할 항목이 {{ project.missingItems.length }}개 있습니다.</p><p v-else>도면에서 확인된 벽체 기준의 참고 수량입니다.</p></div>
+              <div class="simple-result-card__numbers"><div><b>{{ summary.netAreaM2.toFixed(2) }}</b><span>㎡ 벽체 면적</span></div><div><b>{{ summary.panels || '—' }}</b><span>판넬</span></div><div><b>{{ summary.fasteners || '—' }}</b><span>고정 피스</span></div></div>
+              <details class="advanced-result-details"><summary>상세 산출표·출력 보기</summary><button type="button" class="outline-button" @click="scrollToSection('takeoff')">상세 산출표 열기</button></details>
+            </section>
           </section>
 
           <section v-if="project.files.length && activeSection === 'takeoff'" id="takeoff" class="section-block takeoff-section">
-            <div class="section-heading"><div><p class="eyebrow">넷째 단계 · 발주 산출</p><h2>발주 기준과 산출표</h2><p>기준은 프로젝트 전체에서 한 번만 입력하며, 구역별 높이·길이는 도면 근거에서 자동으로 가져옵니다.</p></div><div class="section-heading-actions"><span :class="['orderability-badge', { ready: canDownloadReports }]">{{ canDownloadReports ? '발주 가능' : '발주 가능 판정 대기' }}</span><button type="button" class="outline-button" @click="scrollToSection('analysis')">원본 결과 보기</button><button type="button" class="outline-button" :disabled="!canDownloadReports" @click="downloadCsv(project.takeoffs)">표 파일 내려받기</button><button type="button" class="outline-button" :disabled="!canDownloadReports" @click="printReport(project.name, project.takeoffs, project.settings)">산출표 인쇄</button><button type="button" class="primary-button" :disabled="!canDownloadReports" @click="printReport(project.name, project.takeoffs, project.settings)">인쇄용 산출표</button></div></div>
-            <button type="button" class="back-button" @click="scrollToSection('model')">← 3차원 모델로 돌아가기</button>
-            <div v-if="!project.workflow.modelBuilt" class="workflow-gate-card takeoff-gate">
-              <span class="gate-icon">04</span>
-              <div><strong>먼저 3차원 모델을 생성하고 벽체를 검토하세요.</strong><p>도면 근거가 확정된 뒤 프로젝트 공통 자재 기준을 적용할 수 있습니다.</p></div>
+            <div class="section-heading"><div><p class="eyebrow">{{ demoMode ? '셋째 단계 · 시연 발주표' : '셋째 단계 · 발주 산출' }}</p><h2>{{ demoMode ? '예시 발주 물량표' : '발주 기준과 산출표' }}</h2><p>{{ demoMode ? '가상의 도면 치수로 만든 예시입니다. 실제 발주에는 실제 도면 분석 결과를 사용합니다.' : '기준은 프로젝트 전체에서 한 번만 입력하며, 구역별 높이·길이는 도면 근거에서 자동으로 가져옵니다.' }}</p></div><div class="section-heading-actions"><span :class="['orderability-badge', { ready: canDownloadReports }]">{{ demoMode ? '시연 완료' : canDownloadReports ? '발주 가능' : '발주 가능 판정 대기' }}</span><button type="button" class="outline-button" @click="scrollToSection('analysis')">{{ demoMode ? '시연 흐름 보기' : '원본 결과 보기' }}</button><button type="button" class="outline-button" :disabled="!canDownloadReports" @click="downloadCsv(project.takeoffs)">표 파일 내려받기</button><button type="button" class="outline-button" :disabled="!canDownloadReports" @click="printReport(project.name, project.takeoffs, project.settings)">산출표 인쇄</button><button type="button" class="primary-button" :disabled="!canDownloadReports" @click="printReport(project.name, project.takeoffs, project.settings)">인쇄용 산출표</button></div></div>
+            <button type="button" class="back-button" @click="scrollToSection('analysis')">← 도면 확인으로 돌아가기</button>
+            <div v-if="!demoMode && !canCalculateMaterials" class="workflow-gate-card takeoff-gate">
+              <span class="gate-icon">!</span>
+              <div><strong>길이와 높이가 확인된 벽체가 아직 없습니다.</strong><p>평면도 치수와 입면도·단면도의 높이를 확인한 뒤 다시 계산하세요.</p></div>
             </div>
-            <div v-if="project.workflow.modelBuilt" class="takeoff-top-grid">
+            <div v-else class="takeoff-top-grid">
               <div class="settings-card panel-card">
                 <div class="panel-heading"><div><span class="panel-kicker">한 번만 입력</span><h3>판넬·부자재 기준</h3></div><span class="single-input-note">이 프로젝트의 공통 기준</span></div>
                 <div class="settings-grid" :aria-describedby="settingsError ? 'material-settings-error' : undefined">
@@ -2662,23 +2770,31 @@ onMounted(() => {
               </div>
             </div>
 
-            <div v-if="project.workflow.modelBuilt" class="formula-strip"><span>계산 방법</span><p>길이 × 높이 − 문과 창호 → 판넬 배치 → 여유율 → 피스·실란트·코너재·마감재</p><small>전체 면적만 나누지 않고 벽체별 실제 규격을 반영합니다.</small></div>
+            <div v-if="canCalculateMaterials" class="formula-strip"><span>계산 방법</span><p>길이 × 높이 − 문과 창호 → 판넬 배치 → 여유율 → 피스·실란트·코너재·마감재</p><small>전체 면적만 나누지 않고 벽체별 실제 규격을 반영합니다.</small></div>
             <div v-if="project.workflow.takeoffCalculated" class="takeoff-table panel-card">
               <div class="panel-heading"><div><span class="panel-kicker">발주 표</span><h3>벽체별 발주 산출표</h3></div><span class="table-note">{{ project.takeoffs.length }}개 벽체 · {{ project.takeoffs.filter((row) => row.reviewStatus !== '확정').length }}개 검토 대상</span></div>
               <div class="table-scroll"><table class="data-table purchase-table"><thead><tr><th>구역</th><th>벽체 번호</th><th>도면 근거</th><th>가로 길이</th><th>높이</th><th>개구부 면적</th><th>순 벽체 면적</th><th>판넬 규격</th><th>기본</th><th>여유 포함</th><th>고정 피스</th><th>실란트</th><th>코너재</th><th>마감재</th><th>절단 잔재</th><th>신뢰도</th><th>검토 상태</th></tr></thead><tbody><tr v-for="row in project.takeoffs" :key="row.wallId" :class="{ blocked: row.reviewStatus === '높이 정보 없음' }" @click="selectWall(row.wallId)"><td><span class="zone-color" :style="{ backgroundColor: project.walls.find((wall) => wall.id === row.wallId)?.color }" />{{ row.zone }}</td><td><button type="button" class="table-row-button" :aria-label="`${row.zone} ${row.wallNumber} 3차원 상세 보기`" @click.stop="selectWall(row.wallId)">{{ row.wallNumber }}</button></td><td class="evidence-cell">{{ row.evidenceLabel }}</td><td>{{ formatMm(row.lengthMm) }}</td><td>{{ formatMm(row.heightMm) }}</td><td>{{ row.openingAreaM2.toFixed(2) }}㎡</td><td>{{ row.netAreaM2 === null ? '—' : `${row.netAreaM2.toFixed(2)}㎡` }}</td><td class="spec-cell">{{ row.panelSpec }}</td><td>{{ row.basePanels ?? '—' }}</td><td><b>{{ row.panelsWithWaste ?? '—' }}</b></td><td>{{ row.fasteners ?? '—' }}</td><td>{{ row.sealantCartridges ?? '—' }}</td><td>{{ row.cornerPieces ?? '—' }}</td><td>{{ row.finishPieces ?? '—' }}</td><td>{{ row.offcutM === null ? '—' : `${row.offcutM.toFixed(2)}미터` }}</td><td><span :class="['confidence-text', row.confidence]">{{ CONFIDENCE_LABELS[row.confidence] }}</span></td><td><span :class="['review-pill', takeoffStatusClass(row.reviewStatus)]">{{ row.reviewStatus }}</span></td></tr><tr v-if="!project.takeoffs.length"><td colspan="17" class="empty-table">높이와 벽체 길이가 확인된 뒤 발주 산출표가 만들어집니다.</td></tr></tbody></table></div>
               <div v-if="project.missingItems.length" class="missing-list"><strong>자동 산출을 막는 확인 항목</strong><span v-for="item in project.missingItems" :key="item">{{ item }}</span></div>
             </div>
-            <div v-else-if="project.workflow.modelBuilt" class="workflow-action-card takeoff-action">
+            <div v-else-if="canCalculateMaterials" class="workflow-action-card takeoff-action">
               <div><span class="panel-kicker">계산 준비</span><h3>프로젝트 자재 기준을 확인하고 계산하세요.</h3><p>시공 방향·유효 폭·표준 길이·여유율을 확인한 뒤 벽체별 수량을 계산합니다.</p></div>
               <button type="button" class="primary-button" @click="calculateMaterials">자재 수량 계산</button>
             </div>
             <div v-if="project.workflow.takeoffCalculated" class="workflow-action-card optimization-entry-card">
-              <div><span class="panel-kicker">다음 단계</span><h3>설계는 그대로 두고 절단·폐기 비용을 비교하세요.</h3><p>자재 카탈로그를 입력하면 원자재 규격, 절단 순서, 현장 내 자투리 사용 여부를 계산합니다.</p></div>
-              <button type="button" class="primary-button" @click="scrollToSection('optimization')">절단 최적화 열기</button>
+              <div><span class="panel-kicker">다음 단계</span><h3>{{ demoMode ? '예시 절단 배치와 자투리까지 확인하세요.' : '설계는 그대로 두고 절단·폐기 비용을 비교하세요.' }}</h3><p>{{ demoMode ? '권장 원자재 규격과 절단 순서가 어떻게 표시되는지 보여드립니다.' : '자재 카탈로그를 입력하면 원자재 규격, 절단 순서, 현장 내 자투리 사용 여부를 계산합니다.' }}</p></div>
+              <button type="button" class="primary-button" @click="scrollToSection('optimization')">{{ demoMode ? '시연 절단 계획 보기' : '절단 최적화 열기' }}</button>
             </div>
           </section>
 
-          <section v-if="activeSection === 'optimization'" id="optimization" class="section-block optimization-section">
+          <section v-if="demoMode && activeSection === 'optimization'" id="optimization" class="section-block optimization-section demo-optimization">
+            <div class="section-heading"><div><p class="eyebrow">넷째 단계 · 시연 절단 계획</p><h2>예시 절단 최적화</h2><p>발주한 자재를 어떤 순서로 잘라 자투리를 줄이는지 보여주는 예시입니다.</p></div><span class="actual-result-badge">시연용 화면</span></div>
+            <button type="button" class="back-button" @click="scrollToSection('takeoff')">← 예시 발주표로 돌아가기</button>
+            <section class="demo-cut-summary"><div><small>권장 원자재</small><b>6,000mm 판넬 32장</b><span>가로 1,000mm · 75T</span></div><div><small>예상 사용</small><b>30장</b><span>외벽 4면 기준</span></div><div><small>재사용 자투리</small><b>2장 분량</b><span>1,200mm 이상 보관</span></div></section>
+            <section class="demo-cut-plan panel-card"><div class="panel-heading"><div><span class="panel-kicker">절단 순서 예시</span><h3>원자재 1장씩 이렇게 사용합니다</h3></div><span class="orderability-badge ready">예시 완료</span></div><div class="demo-cut-rows"><div><b>1번 판넬 · 6,000mm</b><span class="cut-piece used">2,800</span><span class="cut-piece used">2,800</span><span class="cut-piece scrap">400 자투리</span></div><div><b>2번 판넬 · 6,000mm</b><span class="cut-piece used">2,800</span><span class="cut-piece used">2,800</span><span class="cut-piece scrap">400 자투리</span></div><div><b>마지막 판넬 · 6,000mm</b><span class="cut-piece used wide">2,800</span><span class="cut-piece scrap wide">3,200 재사용</span></div></div><p>실제 기능에서는 도면 치수와 선택한 자재 규격을 이용해 이 표를 자동으로 만듭니다.</p></section>
+            <div class="demo-opinion-row"><div><b>발주표와 절단 계획까지 한 화면에서 확인하는 방식입니다.</b><small>이 흐름이 편한지 아버님께 물어보세요.</small></div><div><button type="button" class="primary-button" @click="recordDemoOpinion('interested')">이렇게 쓰고 싶어요</button><button type="button" class="outline-button" @click="recordDemoOpinion('simpler')">더 간단해야 해요</button></div></div>
+          </section>
+
+          <section v-if="!demoMode && activeSection === 'optimization'" id="optimization" class="section-block optimization-section">
             <div class="section-heading">
               <div><p class="eyebrow">다섯째 단계 · 현장 절단 최적화</p><h2>설계는 그대로, 낭비와 비용 비교</h2><p>벽 길이·높이·개구부·구역은 도면 값 그대로 고정하고, 원자재 규격·절단 순서·현재 현장 자투리 사용 순서만 비교합니다.</p></div>
               <div class="section-heading-actions"><span :class="['orderability-badge', { ready: project.optimization.status === 'calculated' }]">{{ optimizationStatusLabel }}</span></div>
@@ -2886,7 +3002,7 @@ onMounted(() => {
             </section>
           </section>
 
-          <section v-if="costFiles.length && activeSection === 'analysis'" class="cost-section panel-card">
+          <section v-show="costFiles.length && activeSection === 'analysis' && !demoMode" class="cost-section panel-card">
             <div class="panel-heading"><div><span class="panel-kicker">참고 자료</span><h3>공사비 집계표 비용 분석</h3></div><span class="cost-exclusion">3차원·자재 산출 제외</span></div>
             <p class="cost-note">{{ project.costSummary.privacyNote }}</p>
             <div class="cost-total"><span>추출 합계</span><strong>{{ formatAmount(project.costSummary.totalAmount) }}</strong></div>
